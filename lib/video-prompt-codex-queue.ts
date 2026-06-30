@@ -1,0 +1,344 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import path from "node:path";
+
+export type VideoPromptCodexJobStatus = "pending" | "running" | "completed" | "failed";
+
+export type CreateVideoPromptCodexJobInput = {
+  projectId?: string;
+  versionId?: string;
+  script: string;
+  contentType?: string;
+  style?: string;
+  duration?: string;
+};
+
+export type VideoPromptCodexJob = {
+  id: string;
+  projectId: string | null;
+  versionId: string | null;
+  script: string;
+  contentType: string;
+  style: string;
+  duration: string;
+  prompt: string;
+  status: VideoPromptCodexJobStatus;
+  outputFileName: string;
+  outputPath: string;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+};
+
+type QueueOptions = {
+  rootDir?: string;
+};
+
+type ClaimOptions = QueueOptions & {
+  order?: "oldest" | "newest";
+  runningTimeoutMs?: number;
+};
+
+const TASK_ROOT = ".tmp-video-prompt-codex";
+const JOB_DIR = "jobs";
+const RESULT_DIR = "results";
+
+export class VideoPromptCodexQueueError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VideoPromptCodexQueueError";
+  }
+}
+
+export async function createVideoPromptCodexJob(
+  input: CreateVideoPromptCodexJobInput,
+  options: QueueOptions = {},
+) {
+  validateCreateInput(input);
+
+  const rootDir = resolveRootDir(options);
+  const now = new Date().toISOString();
+  const jobId = createId("video-prompt-job");
+  const outputFileName = `${jobId}.json`;
+  const outputPath = path.join(resultDir(rootDir), outputFileName);
+  const job: VideoPromptCodexJob = {
+    id: jobId,
+    projectId: input.projectId || null,
+    versionId: input.versionId || null,
+    script: input.script,
+    contentType: input.contentType || "短剧 / 通用",
+    style: input.style || "自动匹配文案气质",
+    duration: input.duration || "15秒",
+    prompt: buildVideoPromptCodexPrompt(input, outputPath),
+    status: "pending",
+    outputFileName,
+    outputPath,
+    result: null,
+    error: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await ensureQueueDirs(rootDir);
+  await writeJob(rootDir, job);
+  return job;
+}
+
+export async function getVideoPromptCodexJob(jobId: string, options: QueueOptions = {}) {
+  const rootDir = resolveRootDir(options);
+  const job = await readJob(rootDir, jobId);
+  return syncAndSaveJob(rootDir, job);
+}
+
+export async function claimNextVideoPromptCodexJob(options: ClaimOptions = {}) {
+  const rootDir = resolveRootDir(options);
+  const jobs = await listJobs(rootDir);
+  const syncedJobs = await Promise.all(jobs.map((job) => syncAndSaveJob(rootDir, job)));
+  const recoverableJobs = syncedJobs.map((job) => recoverStaleRunningJob(job, options.runningTimeoutMs));
+  await Promise.all(
+    recoverableJobs.map((job, index) =>
+      job === syncedJobs[index] ? Promise.resolve() : writeJob(rootDir, applyJobStatus(job)),
+    ),
+  );
+
+  const direction = options.order === "oldest" ? 1 : -1;
+  const next = recoverableJobs
+    .filter((job) => job.status === "pending")
+    .sort((left, right) => direction * (Date.parse(left.createdAt) - Date.parse(right.createdAt)))[0];
+  if (!next) return null;
+
+  const now = new Date().toISOString();
+  const job: VideoPromptCodexJob = {
+    ...next,
+    status: "running",
+    startedAt: now,
+    updatedAt: now,
+    error: null,
+  };
+  await writeJob(rootDir, job);
+  return job;
+}
+
+export async function completeVideoPromptCodexJob(jobId: string, options: QueueOptions = {}) {
+  const rootDir = resolveRootDir(options);
+  const job = await readJob(rootDir, jobId);
+  const result = await readOutputJson(job.outputPath);
+  const now = new Date().toISOString();
+  const updated: VideoPromptCodexJob = {
+    ...job,
+    status: "completed",
+    result,
+    error: null,
+    completedAt: now,
+    updatedAt: now,
+  };
+  await writeJob(rootDir, updated);
+  return updated;
+}
+
+export async function failVideoPromptCodexJob(
+  jobId: string,
+  message: string | undefined,
+  options: QueueOptions = {},
+) {
+  const rootDir = resolveRootDir(options);
+  const job = await readJob(rootDir, jobId);
+  const updated = applyJobStatus({
+    ...job,
+    status: "failed",
+    error: message || "Codex video prompt generation failed",
+    updatedAt: new Date().toISOString(),
+  });
+  await writeJob(rootDir, updated);
+  return updated;
+}
+
+function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outputPath: string) {
+  return [
+    "You are handling a Local Director local video prompt generation task.",
+    "",
+    "Generate strict JSON only. The JSON must match the Local Director AnalysisResult contract.",
+    "Do not open a browser. Do not ask the user to copy or paste. Do not call network providers.",
+    "",
+    "Required top-level fields:",
+    "- title",
+    "- contentType",
+    "- duration",
+    "- style",
+    "- diagnosis",
+    "- optimizedScript",
+    "- workflow.fullVideoPrompt",
+    "- workflow.fullNegativePrompt",
+    "- storyboard",
+    "",
+    "Storyboard requirements:",
+    "- Create a coherent shot list for the requested duration.",
+    "- For a normal 15秒 request, return 5 shots unless the script clearly needs fewer.",
+    "- Every shot must include shotNumber, timeRange, scene, visual, shotType, cameraMovement, emotion, transition, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt.",
+    "",
+    `Script: ${input.script}`,
+    `Content type: ${input.contentType || "短剧 / 通用"}`,
+    `Style: ${input.style || "自动匹配文案气质"}`,
+    `Duration: ${input.duration || "15秒"}`,
+    `Output path: ${outputPath}`,
+    "",
+    "Completion requirements:",
+    "1. Write the final JSON object to the exact output path.",
+    "2. Create the output directory first if it does not exist.",
+    "3. Ensure the file is valid JSON and includes optimizedScript plus workflow.fullVideoPrompt.",
+    "4. Reply with one line only: DONE.",
+  ].join("\n");
+}
+
+async function syncAndSaveJob(rootDir: string, job: VideoPromptCodexJob) {
+  const synced = await syncJobFromOutputFile(job);
+  const finalized = applyJobStatus(synced);
+  if (JSON.stringify(finalized) !== JSON.stringify(job)) {
+    await writeJob(rootDir, finalized);
+  }
+  return finalized;
+}
+
+async function syncJobFromOutputFile(job: VideoPromptCodexJob) {
+  if (job.status === "completed") return job;
+  if (!(await isValidOutputJson(job.outputPath))) return job;
+
+  return {
+    ...job,
+    status: "completed" as const,
+    result: await readOutputJson(job.outputPath),
+    error: null,
+    completedAt: job.completedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function recoverStaleRunningJob(job: VideoPromptCodexJob, runningTimeoutMs: number | undefined) {
+  if (!runningTimeoutMs || runningTimeoutMs <= 0 || job.status !== "running") return job;
+
+  const startedAtMs = Date.parse(job.startedAt || job.updatedAt || job.createdAt);
+  if (!Number.isFinite(startedAtMs) || Date.now() - startedAtMs < runningTimeoutMs) return job;
+
+  return {
+    ...job,
+    status: "pending" as const,
+    startedAt: undefined,
+    error: "Previous Codex run exceeded the video prompt task timeout and was returned to the queue",
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyJobStatus(job: VideoPromptCodexJob): VideoPromptCodexJob {
+  if (job.status === "completed") return { ...job, error: null };
+  if (job.status === "running") return { ...job, error: null };
+  if (job.status === "failed") return job;
+  return { ...job, status: "pending", error: null };
+}
+
+async function listJobs(rootDir: string) {
+  await ensureQueueDirs(rootDir);
+  const entries = await readdir(jobDir(rootDir), { withFileTypes: true });
+  const jobs = await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map((entry) => readJob(rootDir, entry.name.replace(/\.json$/, ""))),
+  );
+  return jobs.sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+}
+
+async function readJob(rootDir: string, jobId: string): Promise<VideoPromptCodexJob> {
+  try {
+    return JSON.parse(await readFile(jobPath(rootDir, jobId), "utf8")) as VideoPromptCodexJob;
+  } catch (error) {
+    throw new VideoPromptCodexQueueError(
+      (error as NodeJS.ErrnoException).code === "ENOENT" ? "Video prompt Codex job not found" : "Video prompt Codex job could not be read",
+    );
+  }
+}
+
+async function writeJob(rootDir: string, job: VideoPromptCodexJob) {
+  await ensureQueueDirs(rootDir);
+  await writeFile(jobPath(rootDir, job.id), `${JSON.stringify(job, null, 2)}\n`, "utf8");
+}
+
+async function ensureQueueDirs(rootDir: string) {
+  await mkdir(jobDir(rootDir), { recursive: true });
+  await mkdir(resultDir(rootDir), { recursive: true });
+}
+
+async function readOutputJson(filePath: string) {
+  try {
+    const result = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+    validateAnalysisResultShape(result);
+    return result;
+  } catch (error) {
+    throw new VideoPromptCodexQueueError(
+      error instanceof VideoPromptCodexQueueError
+        ? error.message
+        : `Codex did not produce valid video prompt JSON: ${filePath}`,
+    );
+  }
+}
+
+async function isValidOutputJson(filePath: string) {
+  try {
+    const fileStat = await stat(filePath);
+    if (!fileStat.isFile() || fileStat.size <= 0) return false;
+    await readOutputJson(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validateAnalysisResultShape(result: Record<string, unknown>) {
+  const workflow = result.workflow && typeof result.workflow === "object"
+    ? (result.workflow as Record<string, unknown>)
+    : {};
+  if (typeof result.optimizedScript !== "string" || !result.optimizedScript.trim()) {
+    throw new VideoPromptCodexQueueError("Video prompt JSON is missing optimizedScript");
+  }
+  if (typeof workflow.fullVideoPrompt !== "string" || !workflow.fullVideoPrompt.trim()) {
+    throw new VideoPromptCodexQueueError("Video prompt JSON is missing workflow.fullVideoPrompt");
+  }
+  if (!Array.isArray(result.storyboard) || result.storyboard.length < 1) {
+    throw new VideoPromptCodexQueueError("Video prompt JSON is missing storyboard");
+  }
+}
+
+function validateCreateInput(input: CreateVideoPromptCodexJobInput) {
+  const script = String(input.script || "").trim();
+  if (script.length < 5) {
+    throw new VideoPromptCodexQueueError("Script must contain at least 5 characters");
+  }
+  if (script.length > 50_000) {
+    throw new VideoPromptCodexQueueError("Script is too long for one Codex video prompt job");
+  }
+}
+
+function resolveRootDir(options: QueueOptions) {
+  return options.rootDir || process.cwd();
+}
+
+function jobDir(rootDir: string) {
+  return path.join(rootDir, TASK_ROOT, JOB_DIR);
+}
+
+function resultDir(rootDir: string) {
+  return path.join(rootDir, TASK_ROOT, RESULT_DIR);
+}
+
+function jobPath(rootDir: string, jobId: string) {
+  return path.join(jobDir(rootDir), `${fileSegment(jobId)}.json`);
+}
+
+function createId(prefix: string) {
+  return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`;
+}
+
+function fileSegment(value: string) {
+  return path.basename(String(value || "").replace(/[\\/:*?"<>|]+/g, "-"));
+}

@@ -19,6 +19,7 @@
     "docker:up": "docker compose up -d postgres redis",
     "local:start": "powershell -ExecutionPolicy Bypass -File scripts/start-localdirector.ps1",
     "storyboard:codex-worker": "node scripts/storyboard-codex-worker.mjs",
+    "video-prompt:codex-worker": "node scripts/video-prompt-codex-worker.mjs",
     "lint": "next lint",
     "test": "node --test test/*.test.mjs",
     "typecheck": "tsc --noEmit",

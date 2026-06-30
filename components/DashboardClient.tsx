@@ -45,6 +45,13 @@ type StoryboardCodexJob = {
   panels: StoryboardCodexPanel[];
 };
 
+type VideoPromptCodexJob = {
+  id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  result?: AnalysisResult | null;
+  error?: string | null;
+};
+
 type BatchPromptSection = {
   segment: PromptSegment;
   result: AnalysisResult;
@@ -443,6 +450,91 @@ export function DashboardClient() {
     inputDurationSeconds: number,
     projectId: string | undefined = resumeProjectId || undefined,
     versionId: string | undefined = resumeVersionId || undefined,
+  ) {
+    return requestAnalysisWithProviderFallback(inputScript, inputDurationSeconds, projectId, versionId);
+  }
+
+  async function createVideoPromptCodexJob(
+    inputScript: string,
+    inputDurationSeconds: number,
+    projectId: string | undefined,
+    versionId: string | undefined,
+  ) {
+    const res = await fetch("/api/video-prompt/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        script: inputScript,
+        duration: `${inputDurationSeconds}秒`,
+        projectId: projectId || undefined,
+        versionId: versionId || undefined,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.error || "Codex 视频提示词任务创建失败");
+    }
+    return data.job as VideoPromptCodexJob;
+  }
+
+  async function pollVideoPromptCodexJob(jobId: string) {
+    const startedAt = Date.now();
+    const timeoutMs = 20 * 60_000;
+    let lastStatus = "";
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const res = await fetch(`/api/video-prompt/jobs/${jobId}`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || "Codex 视频提示词任务读取失败");
+      }
+
+      const currentJob = data.job as VideoPromptCodexJob;
+      if (currentJob.status !== lastStatus) {
+        lastStatus = currentJob.status;
+        setGenerationProgress(
+          currentJob.status === "running"
+            ? "Codex 正在本地生成视频提示词..."
+            : `Codex 视频提示词任务状态：${currentJob.status}`,
+        );
+      }
+      if (currentJob.status === "completed") return currentJob;
+      if (currentJob.status === "failed") {
+        throw new Error(currentJob.error || "Codex 视频提示词任务失败");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+    }
+
+    throw new Error("Codex 视频提示词任务等待超时，请确认 video-prompt:codex-worker 正在运行。");
+  }
+
+  async function requestAnalysisWithProviderFallback(
+    inputScript: string,
+    inputDurationSeconds: number,
+    projectId: string | undefined,
+    versionId: string | undefined,
+  ) {
+    try {
+      const job = await createVideoPromptCodexJob(inputScript, inputDurationSeconds, projectId, versionId);
+      setGenerationProgress("已创建 Codex 视频提示词任务，请确认 video-prompt:codex-worker 正在运行。");
+      const completedJob = await pollVideoPromptCodexJob(job.id);
+      if (!completedJob.result) {
+        throw new Error("Codex 视频提示词任务完成但没有生成结果");
+      }
+      setResult(completedJob.result as AnalysisResult);
+      return completedJob.result as AnalysisResult;
+    } catch (err) {
+      console.warn("video-prompt codex job unavailable, falling back to /api/analyze", err);
+      setGenerationProgress("Codex 视频提示词任务不可用，正在回退到在线模型生成。");
+      return requestAnalysisViaProvider(inputScript, inputDurationSeconds, projectId, versionId);
+    }
+  }
+
+  async function requestAnalysisViaProvider(
+    inputScript: string,
+    inputDurationSeconds: number,
+    projectId: string | undefined,
+    versionId: string | undefined,
   ) {
     const res = await fetch("/api/analyze", {
       method: "POST",
