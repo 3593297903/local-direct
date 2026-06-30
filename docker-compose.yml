@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: localdirector-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: localdirector
+      POSTGRES_USER: localdirector
+      POSTGRES_PASSWORD: localdirector_dev
+    ports:
+      - "55432:5432"
+    volumes:
+      - localdirector_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U localdirector -d localdirector"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: localdirector-redis
+    restart: unless-stopped
+    ports:
+      - "56379:6379"
+    volumes:
+      - localdirector_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  localdirector_postgres:
+  localdirector_redis:

@@ -1,0 +1,8 @@
+ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "promptPreferences" JSONB;
+ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "storyBible" JSONB;
+ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "contextSummary" TEXT;
+ALTER TABLE "ProjectVersion" ADD COLUMN IF NOT EXISTS "episodeSummary" TEXT;
+ALTER TABLE "ProjectVersion" ADD COLUMN IF NOT EXISTS "endingState" TEXT;
+ALTER TABLE "ProjectVersion" ADD COLUMN IF NOT EXISTS "characterState" TEXT;
+ALTER TABLE "ProjectVersion" ADD COLUMN IF NOT EXISTS "memoryJson" JSONB;
+ALTER TABLE "ProjectVersion" ADD COLUMN IF NOT EXISTS "contextSnapshot" JSONB;

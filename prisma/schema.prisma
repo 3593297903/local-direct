@@ -1,0 +1,418 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum UserPlan {
+  FREE
+  PRO
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum MemoryItemType {
+  CHARACTER
+  RELATIONSHIP
+  OBJECT
+  SCENE
+  EVENT
+  CLUE
+  STYLE
+  WORLD_RULE
+  QUALITY_CHECK
+}
+
+enum StoryLoopStatus {
+  OPEN
+  RESOLVED
+  DROPPED
+}
+
+enum KnowledgeType {
+  TRANSITION
+  SHOT
+  CAMERA_MOVEMENT
+  STYLE
+  STORYBOARD_FORMULA
+}
+
+enum JobType {
+  ANALYZE_SCRIPT
+  STORYBOARD_IMAGE
+  LONG_SCRIPT_DOCX
+  VIDEO_GENERATION
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELED
+}
+
+enum MediaAssetType {
+  IMAGE
+  GIF
+  VIDEO
+  THUMBNAIL
+  DOCUMENT
+}
+
+enum VisualAssetType {
+  SHOT_STORYBOARD
+  CHARACTER_TURNAROUND
+  SCENE_KEYART
+  PROP_SHEET
+}
+
+enum VisualAssetStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model User {
+  id           String        @id @default(uuid()) @db.Uuid
+  email        String?       @unique
+  phone        String?       @unique
+  passwordHash String?
+  role         UserRole      @default(USER)
+  plan         UserPlan      @default(FREE)
+  credits      Int           @default(0)
+  dailyLimit   Int           @default(3)
+  promptPreferences Json?
+  status       UserStatus    @default(ACTIVE)
+  lastLoginAt  DateTime?
+  loginCount   Int           @default(0)
+  note         String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  projects     Project[]
+  favorites    Favorite[]
+  usageEvents  UsageEvent[]
+  jobs         Job[]
+  verificationCodes VerificationCode[]
+  memoryItems  MemoryItem[]
+  characterProfiles CharacterProfile[]
+  storyLoops   StoryLoop[]
+  visualAssets VisualAsset[]
+}
+
+model VerificationCode {
+  id        String   @id @default(uuid()) @db.Uuid
+  target    String
+  channel   String
+  codeHash  String
+  purpose   String
+  expiresAt DateTime
+  usedAt    DateTime?
+  userId    String?  @db.Uuid
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+
+  @@index([target, channel, purpose, expiresAt])
+}
+
+model Project {
+  id              String           @id @default(uuid()) @db.Uuid
+  userId          String           @db.Uuid
+  title           String
+  originalScript  String
+  optimizedScript String?
+  contentType     String?
+  style           String?
+  duration        String?
+  status          String           @default("draft")
+  storyBible      Json?
+  contextSummary  String?
+  stateVector     Json?
+  openLoops       Json?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  versions        ProjectVersion[]
+  shots           StoryboardShot[]
+  jobs            Job[]
+  memoryItems     MemoryItem[]
+  characterProfiles CharacterProfile[]
+  storyLoops      StoryLoop[]
+  visualAssets    VisualAsset[]
+
+  @@index([userId, createdAt])
+}
+
+model ProjectVersion {
+  id                    String           @id @default(uuid()) @db.Uuid
+  projectId             String           @db.Uuid
+  versionNumber         Int
+  title                 String
+  originalScript        String
+  optimizedScript       String?
+  contentType           String?
+  style                 String?
+  duration              String?
+  status                String           @default("draft")
+  storyboardImageUrl    String?
+  storyboardImagePrompt String?
+  videoPromptText       String?
+  fullVideoPrompt       String?
+  episodeSummary        String?
+  endingState           String?
+  characterState        String?
+  memoryJson            Json?
+  contextSnapshot       Json?
+  stateVector           Json?
+  openLoops             Json?
+  qualityCheck          Json?
+  createdAt             DateTime         @default(now())
+  project               Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  shots                 StoryboardShot[]
+  memoryItems           MemoryItem[]
+  visualAssets          VisualAsset[]
+
+  @@unique([projectId, versionNumber])
+  @@index([projectId, createdAt])
+}
+
+model MemoryItem {
+  id         String         @id @default(uuid()) @db.Uuid
+  userId     String         @db.Uuid
+  projectId  String         @db.Uuid
+  versionId  String?        @db.Uuid
+  type       MemoryItemType
+  title      String?
+  content    String
+  keywords   Json?
+  importance Float          @default(0.5)
+  recency    Float          @default(0)
+  metadata   Json?
+  embedding  Json?
+  embeddingVector Unsupported("vector")?
+  isEnabled  Boolean        @default(true)
+  source     String?
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project    Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  version    ProjectVersion? @relation(fields: [versionId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([projectId, type])
+  @@index([projectId, isEnabled])
+  @@index([versionId])
+}
+
+model CharacterProfile {
+  id                String   @id @default(uuid()) @db.Uuid
+  userId            String   @db.Uuid
+  projectId         String   @db.Uuid
+  name              String
+  aliases           String[] @default([])
+  role              String?
+  appearance        String?
+  personality       String?
+  relationshipState String?
+  visualLock        String?
+  referenceImageUrl String?
+  importance        Float    @default(0.5)
+  locked            Boolean  @default(false)
+  firstSeenVersionId String? @db.Uuid
+  lastSeenVersionId  String? @db.Uuid
+  metadata          Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project           Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, name])
+  @@index([userId, projectId])
+  @@index([projectId, importance])
+}
+
+model StoryLoop {
+  id                 String          @id @default(uuid()) @db.Uuid
+  userId             String          @db.Uuid
+  projectId          String          @db.Uuid
+  createdVersionId   String?         @db.Uuid
+  resolvedVersionId  String?         @db.Uuid
+  title              String
+  description        String?
+  status             StoryLoopStatus @default(OPEN)
+  importance         Float           @default(0.6)
+  evidence           Json?
+  metadata           Json?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project            Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, title])
+  @@index([userId, projectId])
+  @@index([projectId, status])
+  @@index([projectId, importance])
+}
+
+model StoryboardShot {
+  id               String   @id @default(uuid()) @db.Uuid
+  projectId        String   @db.Uuid
+  versionId        String   @db.Uuid
+  shotNumber       Int
+  scene            String?
+  visual           String?
+  shotType         String?
+  cameraMovement   String?
+  emotion          String?
+  transition       String?
+  firstFramePrompt String?
+  videoPrompt      String?
+  lastFramePrompt  String?
+  negativePrompt   String?
+  createdAt        DateTime @default(now())
+  project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  version          ProjectVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  visualAssets     VisualAsset[]
+
+  @@unique([versionId, shotNumber])
+  @@index([projectId])
+}
+
+model VisualAsset {
+  id         String            @id @default(uuid()) @db.Uuid
+  userId     String            @db.Uuid
+  projectId  String            @db.Uuid
+  versionId  String?           @db.Uuid
+  shotId     String?           @db.Uuid
+  shotNumber Int?
+  type       VisualAssetType
+  name       String
+  prompt     String?
+  imageUrl   String?
+  status     VisualAssetStatus @default(COMPLETED)
+  error      String?
+  metadata   Json?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project    Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  version    ProjectVersion?   @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  shot       StoryboardShot?   @relation(fields: [shotId], references: [id], onDelete: SetNull)
+
+  @@index([userId, projectId])
+  @@index([projectId, versionId])
+  @@index([versionId, shotNumber])
+  @@index([shotId, type])
+}
+
+model LibraryItem {
+  id              String         @id
+  type            KnowledgeType
+  category        String
+  name            String
+  description     String
+  prompt          String
+  tags            String[]       @default([])
+  genre           String?
+  order           Int            @default(0)
+  stability       Int            @default(90)
+  useCase         String?
+  avoid           String?
+  previewUrl      String?
+  previewMimeType String?
+  posterUrl       String?
+  previewType     String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  mediaAssets     MediaAsset[]
+  favorites       Favorite[]
+
+  @@index([type, order])
+  @@index([genre])
+}
+
+model MediaAsset {
+  id            String         @id @default(uuid()) @db.Uuid
+  libraryItemId String?
+  assetType     MediaAssetType
+  url           String
+  storagePath   String?
+  mimeType      String?
+  sizeBytes     Int?
+  createdAt     DateTime       @default(now())
+  libraryItem   LibraryItem?   @relation(fields: [libraryItemId], references: [id], onDelete: Cascade)
+
+  @@index([libraryItemId])
+}
+
+model Favorite {
+  id            String      @id @default(uuid()) @db.Uuid
+  userId        String      @db.Uuid
+  libraryItemId String
+  createdAt     DateTime    @default(now())
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  libraryItem   LibraryItem @relation(fields: [libraryItemId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, libraryItemId])
+}
+
+model Job {
+  id          String     @id @default(uuid()) @db.Uuid
+  type        JobType
+  status      JobStatus  @default(PENDING)
+  userId      String?    @db.Uuid
+  projectId   String?    @db.Uuid
+  input       Json
+  output      Json?
+  error       String?
+  attempts    Int        @default(0)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  completedAt DateTime?
+  user        User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  project     Project?   @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  logs        JobLog[]
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+}
+
+model JobLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  jobId     String   @db.Uuid
+  level     String
+  message   String
+  meta      Json?
+  createdAt DateTime @default(now())
+  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId, createdAt])
+}
+
+model UsageEvent {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String?  @db.Uuid
+  eventType    String
+  provider     String?
+  model        String?
+  inputChars   Int      @default(0)
+  outputChars  Int      @default(0)
+  costEstimate Decimal  @default(0)
+  createdAt    DateTime @default(now())
+  user         User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([eventType, createdAt])
+}
