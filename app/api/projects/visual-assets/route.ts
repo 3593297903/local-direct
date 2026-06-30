@@ -9,10 +9,15 @@ const VisualAssetSchema = z.object({
   name: z.string().min(1),
   shotId: z.string().uuid().nullable().optional(),
   shotNumber: z.number().int().positive().nullable().optional(),
+  entityId: z.string().uuid().nullable().optional(),
+  variantKey: z.string().nullable().optional(),
   prompt: z.string().nullable().optional(),
   imageUrl: z.string().nullable().optional(),
   status: z.enum(["PENDING", "RUNNING", "COMPLETED", "FAILED"]).nullable().optional(),
   error: z.string().nullable().optional(),
+  isPrimary: z.boolean().nullable().optional(),
+  locked: z.boolean().nullable().optional(),
+  referenceWeight: z.number().nullable().optional(),
   metadata: z.record(z.string(), z.unknown()).nullable().optional(),
 });
 

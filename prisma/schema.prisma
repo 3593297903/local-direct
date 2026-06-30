@@ -85,6 +85,27 @@ enum VisualAssetStatus {
   FAILED
 }
 
+enum VisualEntityType {
+  CHARACTER
+  SCENE
+  PROP
+  STYLE
+}
+
+enum VisualEntityStatus {
+  CANDIDATE
+  APPROVED
+  LOCKED
+  ARCHIVED
+}
+
+enum ShotVisualReferenceRole {
+  SUBJECT
+  BACKGROUND
+  PROP
+  STYLE
+}
+
 model User {
   id           String        @id @default(uuid()) @db.Uuid
   email        String?       @unique
@@ -110,6 +131,8 @@ model User {
   characterProfiles CharacterProfile[]
   storyLoops   StoryLoop[]
   visualAssets VisualAsset[]
+  visualEntities ProjectVisualEntity[]
+  shotVisualReferences ShotVisualReference[]
 }
 
 model VerificationCode {
@@ -151,6 +174,8 @@ model Project {
   characterProfiles CharacterProfile[]
   storyLoops      StoryLoop[]
   visualAssets    VisualAsset[]
+  visualEntities  ProjectVisualEntity[]
+  shotVisualReferences ShotVisualReference[]
 
   @@index([userId, createdAt])
 }
@@ -183,6 +208,7 @@ model ProjectVersion {
   shots                 StoryboardShot[]
   memoryItems           MemoryItem[]
   visualAssets          VisualAsset[]
+  shotVisualReferences  ShotVisualReference[]
 
   @@unique([projectId, versionNumber])
   @@index([projectId, createdAt])
@@ -285,9 +311,62 @@ model StoryboardShot {
   project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   version          ProjectVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
   visualAssets     VisualAsset[]
+  visualReferences ShotVisualReference[]
 
   @@unique([versionId, shotNumber])
   @@index([projectId])
+}
+
+model ProjectVisualEntity {
+  id              String             @id @default(uuid()) @db.Uuid
+  userId          String             @db.Uuid
+  projectId       String             @db.Uuid
+  type            VisualEntityType
+  key             String
+  name            String
+  aliases         String[]           @default([])
+  canonicalPrompt String?
+  visualLock      String?
+  negativeLock    String?
+  status          VisualEntityStatus @default(CANDIDATE)
+  primaryAssetId  String?            @db.Uuid
+  metadata        Json?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  user            User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project         Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  primaryAsset    VisualAsset?       @relation("VisualEntityPrimaryAsset", fields: [primaryAssetId], references: [id], onDelete: SetNull)
+  visualAssets    VisualAsset[]      @relation("VisualEntityAssets")
+  shotReferences  ShotVisualReference[]
+
+  @@unique([projectId, key])
+  @@index([userId, projectId])
+  @@index([projectId, type])
+  @@index([projectId, status])
+}
+
+model ShotVisualReference {
+  id        String                  @id @default(uuid()) @db.Uuid
+  userId    String                  @db.Uuid
+  projectId String                  @db.Uuid
+  versionId String                  @db.Uuid
+  shotId    String                  @db.Uuid
+  entityId  String                  @db.Uuid
+  role      ShotVisualReferenceRole @default(SUBJECT)
+  order     Int                     @default(0)
+  metadata  Json?
+  createdAt DateTime                @default(now())
+  updatedAt DateTime                @updatedAt
+  user      User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project   Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  version   ProjectVersion          @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  shot      StoryboardShot          @relation(fields: [shotId], references: [id], onDelete: Cascade)
+  entity    ProjectVisualEntity     @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@unique([shotId, entityId, role])
+  @@index([projectId, versionId])
+  @@index([shotId])
+  @@index([entityId])
 }
 
 model VisualAsset {
@@ -297,12 +376,17 @@ model VisualAsset {
   versionId  String?           @db.Uuid
   shotId     String?           @db.Uuid
   shotNumber Int?
+  entityId   String?           @db.Uuid
   type       VisualAssetType
   name       String
+  variantKey String?
   prompt     String?
   imageUrl   String?
   status     VisualAssetStatus @default(COMPLETED)
   error      String?
+  isPrimary  Boolean           @default(false)
+  locked     Boolean           @default(false)
+  referenceWeight Float        @default(1)
   metadata   Json?
   createdAt  DateTime          @default(now())
   updatedAt  DateTime          @updatedAt
@@ -310,11 +394,15 @@ model VisualAsset {
   project    Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
   version    ProjectVersion?   @relation(fields: [versionId], references: [id], onDelete: Cascade)
   shot       StoryboardShot?   @relation(fields: [shotId], references: [id], onDelete: SetNull)
+  entity     ProjectVisualEntity? @relation("VisualEntityAssets", fields: [entityId], references: [id], onDelete: SetNull)
+  primaryForEntities ProjectVisualEntity[] @relation("VisualEntityPrimaryAsset")
 
   @@index([userId, projectId])
   @@index([projectId, versionId])
   @@index([versionId, shotNumber])
   @@index([shotId, type])
+  @@index([entityId, type])
+  @@index([projectId, type])
 }
 
 model LibraryItem {

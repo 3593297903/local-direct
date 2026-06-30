@@ -1,10 +1,20 @@
 import { BadRequestException, Injectable } from "@nestjs/common";
-import { MemoryItemType, StoryLoopStatus, VisualAssetStatus, VisualAssetType } from "@prisma/client";
+import {
+  MemoryItemType,
+  ShotVisualReferenceRole,
+  StoryLoopStatus,
+  VisualAssetStatus,
+  VisualAssetType,
+  VisualEntityStatus,
+  VisualEntityType,
+} from "@prisma/client";
 import type { Prisma, Project } from "@prisma/client";
 import { PrismaService } from "../../prisma/prisma.service";
 import type {
   CreateProjectDto,
   SaveStoryboardImageDto,
+  SaveProjectVisualEntitiesDto,
+  SaveShotVisualReferencesDto,
   SaveVisualAssetsDto,
   UpdateCharacterProfileDto,
   UpdateMemoryItemDto,
@@ -13,6 +23,20 @@ import type {
 } from "./projects.dto";
 
 type JsonRecord = Record<string, unknown>;
+
+type ProjectVisualEntityInput = {
+  id?: string;
+  type: string;
+  key?: string;
+  name: string;
+  aliases?: string[];
+  canonicalPrompt?: string;
+  visualLock?: string;
+  negativeLock?: string;
+  status?: string;
+  primaryAssetId?: string;
+  metadata?: Record<string, unknown>;
+};
 
 const DEFAULT_PROMPT_PREFERENCES: JsonRecord = {
   language: "zh-CN",
@@ -27,6 +51,15 @@ function cleanText(value: unknown, maxLength = 500) {
   if (typeof value !== "string") return undefined;
   const text = value.replace(/\s+/g, " ").trim();
   return text ? text.slice(0, maxLength) : undefined;
+}
+
+function visualEntityKey(value: unknown, fallback: unknown) {
+  const source = cleanText(value, 120) || cleanText(fallback, 120) || "visual-entity";
+  return source
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "visual-entity";
 }
 
 function compactText(value: unknown) {
@@ -473,6 +506,101 @@ function deriveCharacterProfiles(input: CreateProjectDto, narrativeMemory: JsonR
     .filter((character) => character.name);
 }
 
+function deriveProjectVisualEntities(
+  input: CreateProjectDto,
+  narrativeMemory: JsonRecord,
+  memory: ReturnType<typeof deriveEpisodeMemory>,
+) {
+  const memoryJson = pickRecord(memory.memoryJson);
+  const entities: ProjectVisualEntityInput[] = [];
+  const seen = new Set<string>();
+
+  function addEntity(entity: ProjectVisualEntityInput) {
+    const name = cleanText(entity.name, 160);
+    if (!name) return;
+    const key = visualEntityKey(entity.key, name);
+    const uniqueKey = `${entity.type}:${key}`;
+    if (seen.has(uniqueKey)) return;
+    seen.add(uniqueKey);
+    entities.push({
+      ...entity,
+      key,
+      name,
+      status: entity.status || VisualEntityStatus.CANDIDATE,
+    });
+  }
+
+  for (const character of asRecords(narrativeMemory.characters, 20)) {
+    const name = cleanText(character.name, 120) || cleanText(character.title, 120);
+    if (!name) continue;
+    addEntity({
+      type: VisualEntityType.CHARACTER,
+      key: cleanText(character.key, 120) || name,
+      name,
+      aliases: asStringArray(character.aliases, 12),
+      canonicalPrompt: cleanText(character.appearance || character.description || character.personality, 1200),
+      visualLock: cleanText(character.visualLock || character.consistencyLock || character.appearance, 1600),
+      negativeLock: cleanText(character.negativeLock || character.avoid, 1200),
+      status: character.locked ? VisualEntityStatus.LOCKED : VisualEntityStatus.CANDIDATE,
+      metadata: {
+        source: "narrativeMemory.characters",
+        role: cleanText(character.role, 120),
+        sourceTitle: input.title,
+      },
+    });
+  }
+
+  for (const scene of asStringArray(memoryJson.scenes, 12)) {
+    addEntity({
+      type: VisualEntityType.SCENE,
+      key: scene,
+      name: scene,
+      canonicalPrompt: scene,
+      visualLock: [scene, input.style, input.contentType].filter(Boolean).join(" · "),
+      negativeLock: "不要改变项目核心空间布局、时代质感、主色和材质方向。",
+      status: VisualEntityStatus.CANDIDATE,
+      metadata: {
+        source: "memoryJson.scenes",
+        sourceTitle: input.title,
+      },
+    });
+  }
+
+  for (const focus of asStringArray(memoryJson.visualFocus, 16)) {
+    addEntity({
+      type: VisualEntityType.PROP,
+      key: focus,
+      name: focus,
+      canonicalPrompt: focus,
+      visualLock: [focus, input.style].filter(Boolean).join(" · "),
+      negativeLock: "不要改变道具外观、比例、功能和在镜头中的识别特征。",
+      status: VisualEntityStatus.CANDIDATE,
+      metadata: {
+        source: "memoryJson.visualFocus",
+        sourceTitle: input.title,
+      },
+    });
+  }
+
+  if (cleanText(input.style, 240)) {
+    addEntity({
+      type: VisualEntityType.STYLE,
+      key: "project-style",
+      name: "项目风格锁定",
+      canonicalPrompt: [input.style, input.contentType, input.duration].filter(Boolean).join(" · "),
+      visualLock: cleanText(input.style, 1200),
+      negativeLock: "不要偏离项目既定风格、色彩、镜头语气和画面质感。",
+      status: VisualEntityStatus.CANDIDATE,
+      metadata: {
+        source: "project.style",
+        sourceTitle: input.title,
+      },
+    });
+  }
+
+  return entities.slice(0, 80);
+}
+
 function deriveStoryLoops(input: CreateProjectDto, narrativeMemory: JsonRecord) {
   const openLoopRecords = asRecords(narrativeMemory.storyLoops, 20);
   const openLoopStrings = asStringArray(narrativeMemory.openLoops, 20);
@@ -768,12 +896,17 @@ function mapVisualAssetDetail(asset: {
   versionId: string | null;
   shotId: string | null;
   shotNumber: number | null;
+  entityId?: string | null;
   type: VisualAssetType;
   name: string;
+  variantKey?: string | null;
   prompt: string | null;
   imageUrl: string | null;
   status: VisualAssetStatus;
   error: string | null;
+  isPrimary?: boolean;
+  locked?: boolean;
+  referenceWeight?: number;
   metadata: Prisma.JsonValue | null;
   createdAt: Date;
   updatedAt: Date;
@@ -784,15 +917,80 @@ function mapVisualAssetDetail(asset: {
     versionId: asset.versionId,
     shotId: asset.shotId,
     shotNumber: asset.shotNumber,
+    entityId: asset.entityId || null,
     type: asset.type,
     name: asset.name,
+    variantKey: asset.variantKey || null,
     prompt: asset.prompt,
     imageUrl: asset.imageUrl,
     status: asset.status,
     error: asset.error,
+    isPrimary: Boolean(asset.isPrimary),
+    locked: Boolean(asset.locked),
+    referenceWeight: asset.referenceWeight ?? 1,
     metadata: asset.metadata,
     createdAt: asset.createdAt.toISOString(),
     updatedAt: asset.updatedAt.toISOString(),
+  };
+}
+
+function mapProjectVisualEntityDetail(entity: {
+  id: string;
+  projectId: string;
+  type: VisualEntityType;
+  key: string;
+  name: string;
+  aliases: string[];
+  canonicalPrompt: string | null;
+  visualLock: string | null;
+  negativeLock: string | null;
+  status: VisualEntityStatus;
+  primaryAssetId: string | null;
+  metadata: Prisma.JsonValue | null;
+  createdAt: Date;
+  updatedAt: Date;
+}) {
+  return {
+    id: entity.id,
+    projectId: entity.projectId,
+    type: entity.type,
+    key: entity.key,
+    name: entity.name,
+    aliases: entity.aliases,
+    canonicalPrompt: entity.canonicalPrompt,
+    visualLock: entity.visualLock,
+    negativeLock: entity.negativeLock,
+    status: entity.status,
+    primaryAssetId: entity.primaryAssetId,
+    metadata: entity.metadata,
+    createdAt: entity.createdAt.toISOString(),
+    updatedAt: entity.updatedAt.toISOString(),
+  };
+}
+
+function mapShotVisualReferenceDetail(reference: {
+  id: string;
+  projectId: string;
+  versionId: string;
+  shotId: string;
+  entityId: string;
+  role: ShotVisualReferenceRole;
+  order: number;
+  metadata: Prisma.JsonValue | null;
+  createdAt: Date;
+  updatedAt: Date;
+}) {
+  return {
+    id: reference.id,
+    projectId: reference.projectId,
+    versionId: reference.versionId,
+    shotId: reference.shotId,
+    entityId: reference.entityId,
+    role: reference.role,
+    order: reference.order,
+    metadata: reference.metadata,
+    createdAt: reference.createdAt.toISOString(),
+    updatedAt: reference.updatedAt.toISOString(),
   };
 }
 
@@ -899,6 +1097,96 @@ async function upsertStoryLoops(
       },
     });
   }
+}
+
+async function upsertProjectVisualEntities(
+  prisma: Prisma.TransactionClient,
+  options: {
+    userId: string;
+    projectId: string;
+    visualEntities: ProjectVisualEntityInput[];
+  },
+) {
+  const visualEntities = Array.isArray(options.visualEntities) ? options.visualEntities.slice(0, 80) : [];
+  if (!visualEntities.length) return [];
+
+  const project = await prisma.project.findFirst({
+    where: { id: options.projectId, userId: options.userId },
+    select: { id: true },
+  });
+  if (!project) throw new BadRequestException("Project not found");
+
+  const savedEntities = [];
+  for (const entity of visualEntities) {
+    const type = entity.type && entity.type in VisualEntityType
+      ? VisualEntityType[entity.type as keyof typeof VisualEntityType]
+      : undefined;
+    if (!type) throw new BadRequestException("Unsupported visual entity type");
+
+    const status = entity.status && entity.status in VisualEntityStatus
+      ? VisualEntityStatus[entity.status as keyof typeof VisualEntityStatus]
+      : VisualEntityStatus.CANDIDATE;
+    const name = cleanText(entity.name, 160);
+    if (!name) throw new BadRequestException("Visual entity name is required");
+    const key = visualEntityKey(entity.key, name);
+    const primaryAssetId = entity.primaryAssetId
+      ? await prisma.visualAsset.findFirst({
+        where: { id: entity.primaryAssetId, projectId: options.projectId, userId: options.userId },
+        select: { id: true },
+      }).then((asset) => asset?.id || null)
+      : null;
+    const aliases = Array.isArray(entity.aliases)
+      ? entity.aliases.map((alias) => cleanText(alias, 80)).filter(Boolean) as string[]
+      : [];
+
+    const savedEntity = await prisma.projectVisualEntity.upsert({
+      where: { projectId_key: { projectId: options.projectId, key } },
+      create: {
+        userId: options.userId,
+        projectId: options.projectId,
+        type,
+        key,
+        name,
+        aliases,
+        canonicalPrompt: cleanText(entity.canonicalPrompt, 5000),
+        visualLock: cleanText(entity.visualLock, 5000),
+        negativeLock: cleanText(entity.negativeLock, 5000),
+        status,
+        primaryAssetId,
+        metadata: toJson(entity.metadata),
+      },
+      update: {
+        type,
+        name,
+        aliases,
+        canonicalPrompt: cleanText(entity.canonicalPrompt, 5000),
+        visualLock: cleanText(entity.visualLock, 5000),
+        negativeLock: cleanText(entity.negativeLock, 5000),
+        status,
+        primaryAssetId,
+        metadata: toJson(entity.metadata),
+      },
+      select: {
+        id: true,
+        projectId: true,
+        type: true,
+        key: true,
+        name: true,
+        aliases: true,
+        canonicalPrompt: true,
+        visualLock: true,
+        negativeLock: true,
+        status: true,
+        primaryAssetId: true,
+        metadata: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+    savedEntities.push(savedEntity);
+  }
+
+  return savedEntities.map(mapProjectVisualEntityDetail);
 }
 
 @Injectable()
@@ -1039,6 +1327,25 @@ export class ProjectsService {
             createdAt: true,
           },
         },
+        visualEntities: {
+          orderBy: [{ type: "asc" }, { createdAt: "asc" }],
+          select: {
+            id: true,
+            projectId: true,
+            type: true,
+            key: true,
+            name: true,
+            aliases: true,
+            canonicalPrompt: true,
+            visualLock: true,
+            negativeLock: true,
+            status: true,
+            primaryAssetId: true,
+            metadata: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        },
         versions: {
           orderBy: { versionNumber: "desc" },
           select: {
@@ -1088,12 +1395,32 @@ export class ProjectsService {
                 versionId: true,
                 shotId: true,
                 shotNumber: true,
+                entityId: true,
                 type: true,
                 name: true,
+                variantKey: true,
                 prompt: true,
                 imageUrl: true,
                 status: true,
                 error: true,
+                isPrimary: true,
+                locked: true,
+                referenceWeight: true,
+                metadata: true,
+                createdAt: true,
+                updatedAt: true,
+              },
+            },
+            shotVisualReferences: {
+              orderBy: [{ order: "asc" }, { createdAt: "asc" }],
+              select: {
+                id: true,
+                projectId: true,
+                versionId: true,
+                shotId: true,
+                entityId: true,
+                role: true,
+                order: true,
                 metadata: true,
                 createdAt: true,
                 updatedAt: true,
@@ -1154,6 +1481,7 @@ export class ProjectsService {
         source: memory.source,
         createdAt: memory.createdAt.toISOString(),
       })),
+      visualEntities: project.visualEntities.map(mapProjectVisualEntityDetail),
       createdAt: project.createdAt.toISOString(),
       updatedAt: project.updatedAt.toISOString(),
       versions: project.versions.map((version) => ({
@@ -1180,6 +1508,7 @@ export class ProjectsService {
         createdAt: version.createdAt.toISOString(),
         shots: version.shots.map(mapShotDetail),
         visualAssets: version.visualAssets.map(mapVisualAssetDetail),
+        shotVisualReferences: version.shotVisualReferences.map(mapShotVisualReferenceDetail),
       })),
     };
   }
@@ -1425,6 +1754,7 @@ export class ProjectsService {
       const storyBible = mergeStoryBible(project.storyBible, input, episodeMemory);
       const characterProfiles = deriveCharacterProfiles(input, narrativeMemory);
       const storyLoops = deriveStoryLoops(input, narrativeMemory);
+      const visualEntities = deriveProjectVisualEntities(input, narrativeMemory, episodeMemory);
       storyBible.characters = appendUnique(storyBible.characters, characterProfiles.map((character) => character.name), 50);
       storyBible.openLoops = narrativeMemory.openLoops;
       const contextSummary = cleanText(input.contextSummary, 500) || buildContextSummary(storyBible, episodeMemory);
@@ -1495,6 +1825,7 @@ export class ProjectsService {
           await prisma.memoryItem.createMany({ data: memoryItems });
         }
         await upsertCharacterProfiles(prisma, { userId, projectId: project.id, versionId: version.id, characters: characterProfiles });
+        await upsertProjectVisualEntities(prisma, { userId, projectId: project.id, visualEntities });
         await upsertStoryLoops(prisma, { userId, projectId: project.id, versionId: version.id, loops: storyLoops });
 
         await prisma.project.update({
@@ -1565,6 +1896,7 @@ export class ProjectsService {
         await prisma.memoryItem.createMany({ data: memoryItems });
       }
       await upsertCharacterProfiles(prisma, { userId, projectId: project.id, versionId: version.id, characters: characterProfiles });
+      await upsertProjectVisualEntities(prisma, { userId, projectId: project.id, visualEntities });
       await upsertStoryLoops(prisma, { userId, projectId: project.id, versionId: version.id, loops: storyLoops });
 
       await prisma.project.update({
@@ -1767,6 +2099,12 @@ export class ProjectsService {
           : shotId
             ? shotById.get(shotId) || null
             : null;
+        const entityId = asset.entityId
+          ? await prisma.projectVisualEntity.findFirst({
+            where: { id: asset.entityId, projectId, userId },
+            select: { id: true },
+          }).then((entity) => entity?.id || null)
+          : null;
         const name = cleanText(asset.name, 160) || (type === VisualAssetType.SHOT_STORYBOARD ? "镜头分镜图" : "视觉资产");
 
         await prisma.visualAsset.deleteMany({
@@ -1777,6 +2115,7 @@ export class ProjectsService {
             type,
             name,
             shotNumber,
+            entityId,
           },
         });
 
@@ -1787,12 +2126,17 @@ export class ProjectsService {
             versionId: version.id,
             shotId,
             shotNumber,
+            entityId,
             type,
             name,
+            variantKey: cleanText(asset.variantKey, 120),
             prompt: cleanText(asset.prompt, 5000),
             imageUrl: cleanText(asset.imageUrl, 1200),
             status,
             error: cleanText(asset.error, 1200),
+            isPrimary: Boolean(asset.isPrimary),
+            locked: Boolean(asset.locked),
+            referenceWeight: typeof asset.referenceWeight === "number" ? asset.referenceWeight : 1,
             metadata: toJson(asset.metadata),
           },
           select: {
@@ -1801,12 +2145,17 @@ export class ProjectsService {
             versionId: true,
             shotId: true,
             shotNumber: true,
+            entityId: true,
             type: true,
             name: true,
+            variantKey: true,
             prompt: true,
             imageUrl: true,
             status: true,
             error: true,
+            isPrimary: true,
+            locked: true,
+            referenceWeight: true,
             metadata: true,
             createdAt: true,
             updatedAt: true,
@@ -1819,6 +2168,100 @@ export class ProjectsService {
     });
   }
 
+  async upsertProjectVisualEntities(userId: string, projectId: string, input: SaveProjectVisualEntitiesDto) {
+    if (!userId) throw new BadRequestException("Authenticated user id is required");
+    return upsertProjectVisualEntities(this.prisma, {
+      userId,
+      projectId,
+      visualEntities: input.visualEntities || [],
+    });
+  }
+
+  async upsertShotVisualReferences(
+    userId: string,
+    projectId: string,
+    versionId: string,
+    input: SaveShotVisualReferencesDto,
+  ) {
+    if (!userId) throw new BadRequestException("Authenticated user id is required");
+    const visualReferences = Array.isArray(input.visualReferences) ? input.visualReferences.slice(0, 160) : [];
+    if (!visualReferences.length) return [];
+
+    return this.prisma.$transaction(async (prisma) => {
+      const version = await prisma.projectVersion.findFirst({
+        where: {
+          id: versionId,
+          projectId,
+          project: { userId },
+        },
+        select: {
+          id: true,
+          shots: { select: { id: true, shotNumber: true } },
+        },
+      });
+      if (!version) throw new BadRequestException("Project version not found");
+
+      const shotByNumber = new Map(version.shots.map((shot) => [shot.shotNumber, shot.id]));
+      const shotIds = new Set(version.shots.map((shot) => shot.id));
+      const savedReferences = [];
+
+      for (const reference of visualReferences) {
+        const shotId = reference.shotId && shotIds.has(reference.shotId)
+          ? reference.shotId
+          : reference.shotNumber !== undefined
+            ? shotByNumber.get(reference.shotNumber) || null
+            : null;
+        if (!shotId) throw new BadRequestException("Referenced shot was not found in this version");
+
+        const entity = await prisma.projectVisualEntity.findFirst({
+          where: { id: reference.entityId, projectId, userId },
+          select: { id: true },
+        });
+        if (!entity) throw new BadRequestException("Referenced visual entity was not found in this project");
+
+        const role = reference.role && reference.role in ShotVisualReferenceRole
+          ? ShotVisualReferenceRole[reference.role as keyof typeof ShotVisualReferenceRole]
+          : ShotVisualReferenceRole.SUBJECT;
+
+        await prisma.shotVisualReference.deleteMany({
+          where: {
+            shotId,
+            entityId: entity.id,
+            role,
+          },
+        });
+
+        const savedReference = await prisma.shotVisualReference.create({
+          data: {
+            userId,
+            projectId,
+            versionId,
+            shotId,
+            entityId: entity.id,
+            role,
+            order: typeof reference.order === "number" ? reference.order : 0,
+            metadata: toJson(reference.metadata),
+          },
+          select: {
+            id: true,
+            projectId: true,
+            versionId: true,
+            shotId: true,
+            entityId: true,
+            role: true,
+            order: true,
+            metadata: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        });
+        savedReferences.push(savedReference);
+      }
+
+      return savedReferences.map(mapShotVisualReferenceDetail);
+    });
+  }
+
   async saveVisualAssets(userId: string, projectId: string, versionId: string, input: SaveVisualAssetsDto) {
     const visualAssets = await this.upsertVisualAssets(userId, projectId, versionId, input);
     return {
@@ -1826,6 +2269,30 @@ export class ProjectsService {
       projectId,
       versionId,
       visualAssets,
+    };
+  }
+
+  async saveProjectVisualEntities(userId: string, projectId: string, input: SaveProjectVisualEntitiesDto) {
+    const visualEntities = await this.upsertProjectVisualEntities(userId, projectId, input);
+    return {
+      saved: true,
+      projectId,
+      visualEntities,
+    };
+  }
+
+  async saveShotVisualReferences(
+    userId: string,
+    projectId: string,
+    versionId: string,
+    input: SaveShotVisualReferencesDto,
+  ) {
+    const visualReferences = await this.upsertShotVisualReferences(userId, projectId, versionId, input);
+    return {
+      saved: true,
+      projectId,
+      versionId,
+      visualReferences,
     };
   }
 }

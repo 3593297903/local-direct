@@ -169,6 +169,14 @@ export class SaveVisualAssetDto {
   shotNumber?: number;
 
   @IsOptional()
+  @IsUUID()
+  entityId?: string;
+
+  @IsOptional()
+  @IsString()
+  variantKey?: string;
+
+  @IsOptional()
   @IsString()
   prompt?: string;
 
@@ -185,6 +193,18 @@ export class SaveVisualAssetDto {
   error?: string;
 
   @IsOptional()
+  @IsBoolean()
+  isPrimary?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  locked?: boolean;
+
+  @IsOptional()
+  @IsNumber()
+  referenceWeight?: number;
+
+  @IsOptional()
   @IsObject()
   metadata?: Record<string, unknown>;
 }
@@ -194,6 +214,90 @@ export class SaveVisualAssetsDto {
   @ValidateNested({ each: true })
   @Type(() => SaveVisualAssetDto)
   visualAssets!: SaveVisualAssetDto[];
+}
+
+export class SaveProjectVisualEntityDto {
+  @IsOptional()
+  @IsUUID()
+  id?: string;
+
+  @IsIn(["CHARACTER", "SCENE", "PROP", "STYLE"])
+  type!: string;
+
+  @IsOptional()
+  @IsString()
+  key?: string;
+
+  @IsString()
+  name!: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  aliases?: string[];
+
+  @IsOptional()
+  @IsString()
+  canonicalPrompt?: string;
+
+  @IsOptional()
+  @IsString()
+  visualLock?: string;
+
+  @IsOptional()
+  @IsString()
+  negativeLock?: string;
+
+  @IsOptional()
+  @IsIn(["CANDIDATE", "APPROVED", "LOCKED", "ARCHIVED"])
+  status?: string;
+
+  @IsOptional()
+  @IsUUID()
+  primaryAssetId?: string;
+
+  @IsOptional()
+  @IsObject()
+  metadata?: Record<string, unknown>;
+}
+
+export class SaveProjectVisualEntitiesDto {
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => SaveProjectVisualEntityDto)
+  visualEntities!: SaveProjectVisualEntityDto[];
+}
+
+export class SaveShotVisualReferenceDto {
+  @IsOptional()
+  @IsUUID()
+  shotId?: string;
+
+  @IsOptional()
+  @IsNumber()
+  shotNumber?: number;
+
+  @IsUUID()
+  entityId!: string;
+
+  @IsOptional()
+  @IsIn(["SUBJECT", "BACKGROUND", "PROP", "STYLE"])
+  role?: string;
+
+  @IsOptional()
+  @IsNumber()
+  order?: number;
+
+  @IsOptional()
+  @IsObject()
+  metadata?: Record<string, unknown>;
+}
+
+export class SaveShotVisualReferencesDto {
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => SaveShotVisualReferenceDto)
+  visualReferences!: SaveShotVisualReferenceDto[];
 }
 
 export class BuildProjectContextDto {

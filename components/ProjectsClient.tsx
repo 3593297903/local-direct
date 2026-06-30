@@ -46,12 +46,47 @@ type VisualAsset = {
   versionId?: string | null;
   shotId?: string | null;
   shotNumber?: number | null;
+  entityId?: string | null;
   type: "SHOT_STORYBOARD" | "CHARACTER_TURNAROUND" | "SCENE_KEYART" | "PROP_SHEET" | string;
   name: string;
+  variantKey?: string | null;
   prompt?: string | null;
   imageUrl?: string | null;
   status?: string | null;
   error?: string | null;
+  isPrimary?: boolean;
+  locked?: boolean;
+  referenceWeight?: number | null;
+  metadata?: Record<string, unknown> | null;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type ProjectVisualEntity = {
+  id: string;
+  projectId?: string | null;
+  type: "CHARACTER" | "SCENE" | "PROP" | "STYLE" | string;
+  key: string;
+  name: string;
+  aliases?: string[];
+  canonicalPrompt?: string | null;
+  visualLock?: string | null;
+  negativeLock?: string | null;
+  status?: "CANDIDATE" | "APPROVED" | "LOCKED" | "ARCHIVED" | string;
+  primaryAssetId?: string | null;
+  metadata?: Record<string, unknown> | null;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type ShotVisualReference = {
+  id: string;
+  projectId?: string | null;
+  versionId?: string | null;
+  shotId: string;
+  entityId: string;
+  role?: "SUBJECT" | "BACKGROUND" | "PROP" | "STYLE" | string;
+  order?: number | null;
   metadata?: Record<string, unknown> | null;
   createdAt?: string;
   updatedAt?: string;
@@ -74,6 +109,7 @@ type ProjectVersion = {
   createdAt: string;
   shots: ProjectShot[];
   visualAssets?: VisualAsset[];
+  shotVisualReferences?: ShotVisualReference[];
 };
 
 type CharacterProfile = {
@@ -125,6 +161,7 @@ type ProjectDetail = {
   characterProfiles?: CharacterProfile[];
   storyLoops?: StoryLoop[];
   memoryItems?: MemoryItem[];
+  visualEntities?: ProjectVisualEntity[];
   createdAt: string;
   updatedAt: string;
   versions: ProjectVersion[];
@@ -201,6 +238,31 @@ function getShotAssets(version: ProjectVersion, shot: ProjectShot, type?: Visual
   });
 }
 
+function getProjectVisualEntities(project: ProjectDetail | null, type?: ProjectVisualEntity["type"]) {
+  return (project?.visualEntities || []).filter((entity) => !type || entity.type === type);
+}
+
+function getVisualEntityById(project: ProjectDetail | null, entityId: string) {
+  return (project?.visualEntities || []).find((entity) => entity.id === entityId) || null;
+}
+
+function getShotVisualReferences(project: ProjectDetail | null, version: ProjectVersion, shot: ProjectShot) {
+  return (version.shotVisualReferences || [])
+    .filter((reference) => reference.shotId === shot.id)
+    .map((reference) => ({
+      ...reference,
+      entity: getVisualEntityById(project, reference.entityId),
+    }))
+    .filter((reference) => reference.entity);
+}
+
+function getVisualEntityStatusLabel(status?: string | null) {
+  if (status === "LOCKED") return "已锁定";
+  if (status === "APPROVED") return "已批准";
+  if (status === "ARCHIVED") return "已归档";
+  return "候选";
+}
+
 export function ProjectsClient() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
@@ -223,6 +285,19 @@ export function ProjectsClient() {
   const selectedStoryboardAssets = useMemo(
     () => (selectedVersion?.visualAssets || []).filter((asset) => asset.type === "SHOT_STORYBOARD" && asset.imageUrl),
     [selectedVersion],
+  );
+
+  const visualBibleSections = useMemo(
+    () => [
+      { type: "CHARACTER", label: "角色", empty: "暂无固定角色" },
+      { type: "SCENE", label: "场景", empty: "暂无固定场景" },
+      { type: "PROP", label: "道具", empty: "暂无固定道具" },
+      { type: "STYLE", label: "风格锁定", empty: "暂无风格锁定" },
+    ].map((section) => ({
+      ...section,
+      entities: getProjectVisualEntities(project, section.type),
+    })),
+    [project],
   );
 
   useEffect(() => {
@@ -692,6 +767,60 @@ export function ProjectsClient() {
                 ))}
               </div>
 
+              <section className="rounded-2xl border border-cyan-300/14 bg-slate-950/32 p-4">
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs uppercase tracking-wide text-cyan-200/70">Project Visual Bible</div>
+                    <h3 className="mt-1 text-lg font-black text-white">项目视觉圣经</h3>
+                  </div>
+                  <div className="text-xs text-slate-500">
+                    角色、场景、道具在项目内固定，镜头只引用这些资产。
+                  </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  {visualBibleSections.map((section) => (
+                    <div key={section.type} className="rounded-xl border border-white/10 bg-slate-950/55 p-3">
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <div className="text-sm font-bold text-white">{section.label}</div>
+                        <span className="rounded-full border border-cyan-200/15 px-2 py-0.5 text-[11px] text-cyan-100/70">
+                          {section.entities.length}
+                        </span>
+                      </div>
+
+                      <div className="space-y-2">
+                        {section.entities.map((entity) => (
+                          <div key={entity.id} className="rounded-lg border border-white/10 bg-white/[0.03] p-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="truncate font-semibold text-white">{entity.name}</div>
+                                <div className="mt-1 text-xs text-slate-500">
+                                  @{entity.key} · {getVisualEntityStatusLabel(entity.status)}
+                                </div>
+                              </div>
+                              {entity.status === "LOCKED" && (
+                                <span className="shrink-0 rounded-full border border-cyan-200/20 bg-cyan-300/10 px-2 py-0.5 text-[11px] font-semibold text-cyan-50">
+                                  已锁定
+                                </span>
+                              )}
+                            </div>
+                            <p className="mt-2 line-clamp-3 text-xs leading-5 text-slate-400">
+                              {entity.visualLock || entity.canonicalPrompt || entity.negativeLock || "等待生成或确认视觉锁定。"}
+                            </p>
+                          </div>
+                        ))}
+
+                        {!section.entities.length && (
+                          <div className="rounded-lg border border-dashed border-cyan-300/12 bg-black/20 p-3 text-xs leading-5 text-slate-500">
+                            {section.empty}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
               <div className="grid gap-4 lg:grid-cols-2">
                 <div className="projects-content-card rounded-2xl p-4">
                   <div className="mb-3 flex items-center gap-2 text-sm font-bold text-white">
@@ -894,6 +1023,7 @@ export function ProjectsClient() {
                   <tbody>
                     {selectedVersion.shots.map((shot) => {
                       const storyboardAssets = getShotAssets(selectedVersion, shot, "SHOT_STORYBOARD");
+                      const fixedReferences = getShotVisualReferences(project, selectedVersion, shot);
                       return (
                         <Fragment key={shot.id}>
                           <tr className="border-t border-cyan-300/10 align-top text-slate-300">
@@ -910,6 +1040,25 @@ export function ProjectsClient() {
                               镜头资产
                             </td>
                             <td className="p-3" colSpan={5}>
+                              <div className="mb-3 rounded-xl border border-cyan-300/12 bg-black/20 p-3">
+                                <div className="mb-2 text-xs font-bold text-cyan-100">引用固定资产</div>
+                                {fixedReferences.length ? (
+                                  <div className="flex flex-wrap gap-2">
+                                    {fixedReferences.map((reference) => (
+                                      <span
+                                        key={reference.id}
+                                        className="rounded-full border border-cyan-200/15 bg-cyan-300/[0.08] px-2.5 py-1 text-xs text-cyan-50"
+                                      >
+                                        @{reference.entity?.key} · {reference.entity?.name} · {reference.role || "SUBJECT"}
+                                      </span>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <div className="text-xs text-slate-500">
+                                    暂未绑定固定角色、场景或道具；后续生成镜头图时建议先绑定项目视觉圣经资产。
+                                  </div>
+                                )}
+                              </div>
                               <div className="grid gap-3 md:grid-cols-4">
                                 <div className="rounded-xl border border-cyan-300/14 bg-slate-950/65 p-3">
                                   <div className="mb-2 flex items-center justify-between gap-2">

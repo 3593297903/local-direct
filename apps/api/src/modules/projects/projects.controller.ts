@@ -4,7 +4,9 @@ import { JwtAuthGuard } from "../auth/jwt-auth.guard";
 import {
   BuildProjectContextDto,
   CreateProjectDto,
+  SaveProjectVisualEntitiesDto,
   SaveStoryboardImageDto,
+  SaveShotVisualReferencesDto,
   SaveVisualAssetsDto,
   UpdateCharacterProfileDto,
   UpdateMemoryItemDto,
@@ -124,6 +126,27 @@ export class ProjectsController {
     @Body() body: SaveVisualAssetsDto,
   ) {
     const result = await this.projectsService.saveVisualAssets(request.user.id, projectId, versionId, body);
+    return ok(result);
+  }
+
+  @Post(":projectId/visual-entities")
+  async saveProjectVisualEntities(
+    @Req() request: { user: { id: string } },
+    @Param("projectId") projectId: string,
+    @Body() body: SaveProjectVisualEntitiesDto,
+  ) {
+    const result = await this.projectsService.saveProjectVisualEntities(request.user.id, projectId, body);
+    return ok(result);
+  }
+
+  @Post(":projectId/versions/:versionId/visual-references")
+  async saveShotVisualReferences(
+    @Req() request: { user: { id: string } },
+    @Param("projectId") projectId: string,
+    @Param("versionId") versionId: string,
+    @Body() body: SaveShotVisualReferencesDto,
+  ) {
+    const result = await this.projectsService.saveShotVisualReferences(request.user.id, projectId, versionId, body);
     return ok(result);
   }
 }

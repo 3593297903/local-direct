@@ -41,6 +41,8 @@ type NestResponseData = Record<string, unknown> & {
   versionId: string | undefined;
   versionNumber: number | undefined;
   storyboardImageUrl: string | undefined;
+  visualEntities: unknown[] | undefined;
+  visualReferences: unknown[] | undefined;
 };
 
 type NestResponse = Record<string, unknown> & {
@@ -630,6 +632,74 @@ export async function saveVisualAssetsToNest(
     return {
       saved: false,
       reason: formatUpstreamError(payload, "Visual asset save failed"),
+    };
+  }
+
+  return getNestResponseData(payload) || { saved: true };
+}
+
+export async function saveProjectVisualEntitiesToNest(
+  request: NextRequest,
+  input: {
+    projectId: string;
+    visualEntities: Array<Record<string, unknown> & {
+      type: string;
+      name: string;
+    }>;
+  },
+) {
+  const token = getBearerToken(request);
+  if (!token) return { saved: false, reason: "Unauthorized" };
+
+  const upstream = await fetch(`${getNestApiBaseUrl()}/projects/${input.projectId}/visual-entities`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ visualEntities: input.visualEntities }),
+    cache: "no-store",
+  });
+  const payload = await readJson(upstream);
+
+  if (!upstream.ok || !payload || !payload.ok) {
+    return {
+      saved: false,
+      reason: formatUpstreamError(payload, "Project visual entity save failed"),
+    };
+  }
+
+  return getNestResponseData(payload) || { saved: true };
+}
+
+export async function saveShotVisualReferencesToNest(
+  request: NextRequest,
+  input: {
+    projectId: string;
+    versionId: string;
+    visualReferences: Array<Record<string, unknown> & {
+      entityId: string;
+    }>;
+  },
+) {
+  const token = getBearerToken(request);
+  if (!token) return { saved: false, reason: "Unauthorized" };
+
+  const upstream = await fetch(`${getNestApiBaseUrl()}/projects/${input.projectId}/versions/${input.versionId}/visual-references`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ visualReferences: input.visualReferences }),
+    cache: "no-store",
+  });
+  const payload = await readJson(upstream);
+
+  if (!upstream.ok || !payload || !payload.ok) {
+    return {
+      saved: false,
+      reason: formatUpstreamError(payload, "Shot visual reference save failed"),
     };
   }
 
