@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import type { AnalysisResult } from "@/types";
 import {
   BookOpen,
   Boxes,
@@ -16,6 +17,7 @@ import {
   Loader2,
   Package,
   RefreshCw,
+  ShieldCheck,
   Trash2,
   UserRound,
 } from "lucide-react";
@@ -36,6 +38,7 @@ type ProjectSummary = {
 type ProjectShot = {
   id: string;
   shotNumber: number;
+  timeRange?: string | null;
   scene?: string | null;
   visual?: string | null;
   shotType?: string | null;
@@ -211,6 +214,29 @@ type StoryboardCodexJob = {
   error: string | null;
 };
 
+type PromptSafetyOptimizationResult = {
+  targetModel: string;
+  status: "PASSED" | "OPTIMIZED" | "BLOCKED_NEEDS_USER_EDIT";
+  riskLevel: "NONE" | "LOW" | "MEDIUM" | "HIGH";
+  findings: Array<{
+    field: string;
+    shotNumber?: number;
+    original: string;
+    reason: string;
+    replacement?: string;
+    severity?: "low" | "medium" | "high";
+  }>;
+  changeSummary: string[];
+  optimizedResult: AnalysisResult;
+};
+
+type PromptSafetyCodexJob = {
+  id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  result?: PromptSafetyOptimizationResult | null;
+  error?: string | null;
+};
+
 function formatDate(value?: string) {
   if (!value) return "-";
   return new Intl.DateTimeFormat("zh-CN", {
@@ -273,6 +299,98 @@ function buildPromptText(version: ProjectVersion) {
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+function buildAnalysisResultPromptText(result: AnalysisResult) {
+  const workflow = result.workflow;
+  const shotLines = result.storyboard
+    .map((shot) =>
+      [
+        `${shot.shotNumber}. ${shot.scene || "镜头"} ${shot.timeRange || ""}`.trim(),
+        `画面：${shot.visual || "-"}`,
+        `景别：${shot.shotType || "-"}`,
+        `机位/构图：${shot.composition || "-"}`,
+        `运镜：${shot.cameraMovement || "-"}`,
+        `光影：${shot.lighting || "-"}`,
+        `声音：${shot.sound || "-"}`,
+        `台词：${shot.dialogue || "-"}`,
+        `镜头目的：${shot.shotPurpose || "-"}`,
+        `视频提示词：${shot.videoPrompt || "-"}`,
+      ].join("\n"),
+    )
+    .join("\n\n");
+
+  return [
+    `核心主题\n\n${workflow?.coreTheme || result.title}`,
+    `完整视频提示词\n\n${workflow?.fullVideoPrompt || result.optimizedScript}`,
+    workflow?.fullNegativePrompt ? `完整负向提示词\n\n${workflow.fullNegativePrompt}` : "",
+    `镜头表\n\n${shotLines}`,
+  ].filter(Boolean).join("\n\n");
+}
+
+function parseDurationSeconds(value?: string | null) {
+  const match = String(value || "").match(/(\d+(?:\.\d+)?)/);
+  const seconds = match ? Number.parseFloat(match[1]) : 15;
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 15;
+}
+
+function formatShotSecond(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1).replace(/\.0$/, "");
+}
+
+function buildShotTimeRange(index: number, totalShots: number, duration?: string | null) {
+  const safeTotal = Math.max(1, totalShots);
+  const totalSeconds = parseDurationSeconds(duration);
+  const start = (totalSeconds * index) / safeTotal;
+  const end = (totalSeconds * (index + 1)) / safeTotal;
+  return `${formatShotSecond(start)}-${formatShotSecond(end)}秒`;
+}
+
+function buildAnalysisResultFromProjectVersion(project: ProjectDetail, version: ProjectVersion): AnalysisResult {
+  const duration = version.duration || project.duration || "15秒";
+  const storyboard = version.shots.map((shot, index) => ({
+    shotNumber: shot.shotNumber,
+    timeRange: shot.timeRange || buildShotTimeRange(index, version.shots.length, duration),
+    scene: shot.scene || "镜头",
+    visual: shot.visual || shot.videoPrompt || "画面按本集剧情推进。",
+    shotType: shot.shotType || "中景",
+    composition: shot.composition || "保持电影级构图，主体清晰，空间关系明确。",
+    cameraMovement: shot.cameraMovement || "稳定轻微推进",
+    lighting: shot.lighting || "自然电影光影，色调与本集风格一致。",
+    sound: shot.sound || "真实环境声",
+    dialogue: shot.dialogue || "无台词",
+    emotion: shot.emotion || "克制",
+    transition: shot.transition || "自然切换",
+    shotPurpose: shot.shotPurpose || "推动本集剧情信息。",
+    firstFramePrompt: shot.firstFramePrompt || shot.visual || shot.videoPrompt || "镜头起始画面。",
+    videoPrompt: shot.videoPrompt || shot.visual || "本镜头视频提示词。",
+    lastFramePrompt: shot.lastFramePrompt || shot.visual || shot.videoPrompt || "镜头结束画面。",
+    negativePrompt: shot.negativePrompt || "no gore, no explicit injury detail, no unreadable text",
+  }));
+  const fullVideoPrompt = version.fullVideoPrompt || buildPromptText(version);
+
+  return {
+    title: version.title || project.title,
+    contentType: version.contentType || project.contentType || "短剧 / 通用",
+    duration,
+    style: version.style || project.style || "电影级写实",
+    diagnosis: [],
+    optimizedScript: version.optimizedScript || version.originalScript,
+    workflow: {
+      sourceAnalysis: version.originalScript,
+      coreTheme: version.optimizedScript || version.originalScript,
+      videoParameterLock: `总时长：${version.duration || project.duration || "15秒"}\n画幅：16:9\n风格：${version.style || project.style || "电影级写实"}`,
+      screenplay: version.optimizedScript || version.originalScript,
+      filmScript: fullVideoPrompt,
+      fullVideoPrompt,
+      fullNegativePrompt: storyboard.map((shot) => shot.negativePrompt).filter(Boolean).join("\n"),
+      concisePrompt: version.optimizedScript || version.originalScript,
+    },
+    storyboard,
+    recommendedItems: [],
+    editingNotes: [],
+    qualityCheck: version.qualityCheck || {},
+  };
 }
 
 function getShotAssets(version: ProjectVersion, shot: ProjectShot, type?: VisualAsset["type"]) {
@@ -379,6 +497,9 @@ export function ProjectsClient() {
   const [storyboardGeneratingShotNumbers, setStoryboardGeneratingShotNumbers] = useState<number[]>([]);
   const [storyboardGenerationMessage, setStoryboardGenerationMessage] = useState("");
   const [storyboardGenerationError, setStoryboardGenerationError] = useState("");
+  const [promptSafetyLoading, setPromptSafetyLoading] = useState(false);
+  const [promptSafetyMessage, setPromptSafetyMessage] = useState("");
+  const [promptSafetyError, setPromptSafetyError] = useState("");
 
   const selectedVersion = useMemo(() => {
     if (!project) return null;
@@ -714,6 +835,99 @@ export function ProjectsClient() {
   async function regenerateShotStoryboard(shot: ProjectShot) {
     if (!selectedVersion) return;
     await runProjectStoryboardGeneration(selectedVersion, [shot]);
+  }
+
+  async function createPromptSafetyCodexJob(
+    sourceResult: AnalysisResult,
+    promptText: string,
+    projectId: string | undefined,
+    versionId: string | undefined,
+  ) {
+    const res = await fetch("/api/prompt-safety/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: projectId || undefined,
+        versionId: versionId || undefined,
+        targetModel: "SEEDANCE_2_0",
+        promptText,
+        sourceResult,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) throw new Error(data?.error || "Seedance 合规优化任务创建失败");
+    return data.job as PromptSafetyCodexJob;
+  }
+
+  async function pollPromptSafetyCodexJob(jobId: string) {
+    const startedAt = Date.now();
+    const timeoutMs = 20 * 60_000;
+    let lastStatus = "";
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const res = await fetch(`/api/prompt-safety/jobs/${jobId}`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Seedance 合规优化任务读取失败");
+
+      const currentJob = data.job as PromptSafetyCodexJob;
+      if (currentJob.status !== lastStatus) {
+        lastStatus = currentJob.status;
+        setPromptSafetyMessage(
+          currentJob.status === "running"
+            ? "Codex 正在本地优化本集 Seedance 2.0 合规提示词..."
+            : `Seedance 合规优化任务状态：${currentJob.status}`,
+        );
+      }
+      if (currentJob.status === "completed") return currentJob;
+      if (currentJob.status === "failed") throw new Error(currentJob.error || "Seedance 合规优化任务失败");
+      await new Promise((resolve) => window.setTimeout(resolve, 2500));
+    }
+
+    throw new Error("Seedance 合规优化任务等待超时，请确认 prompt-safety:codex-worker 正在运行。");
+  }
+
+  async function runProjectPromptSafetyOptimization() {
+    if (!project || !selectedVersion) return;
+    setPromptSafetyLoading(true);
+    setPromptSafetyError("");
+    setPromptSafetyMessage("已创建本集 Seedance 合规优化准备任务，请确认 prompt-safety:codex-worker 正在运行。");
+
+    try {
+      const sourceResult = buildAnalysisResultFromProjectVersion(project, selectedVersion);
+      const job = await createPromptSafetyCodexJob(sourceResult, buildPromptText(selectedVersion), project.id, selectedVersion.id);
+      const completedJob = await pollPromptSafetyCodexJob(job.id);
+      const safetyResult = completedJob.result;
+      const optimizedResult = safetyResult?.optimizedResult;
+      if (!safetyResult || !optimizedResult) throw new Error("Seedance 合规优化完成但没有返回优化结果");
+      if (safetyResult.status === "BLOCKED_NEEDS_USER_EDIT") {
+        const reason = safetyResult.findings.map((finding) => finding.reason).filter(Boolean).join("；");
+        throw new Error(reason || "当前本集提示词无法自动合规改写，需要先调整文案");
+      }
+
+      const optimizedPromptText = buildAnalysisResultPromptText(optimizedResult);
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: project.id,
+          versionId: selectedVersion.id,
+          originalScript: selectedVersion.originalScript,
+          result: optimizedResult,
+          fullVideoPrompt: optimizedPromptText,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Seedance 合规优化结果保存失败");
+
+      await reloadSelectedProject(project.id, selectedVersion.id);
+      setPromptSafetyMessage(
+        `Seedance 合规优化完成并已应用到本集：${safetyResult.findings.length} 处风险记录，${safetyResult.changeSummary.length} 条修改说明。`,
+      );
+    } catch (err) {
+      setPromptSafetyError(err instanceof Error ? err.message : "Seedance 合规优化失败");
+    } finally {
+      setPromptSafetyLoading(false);
+    }
   }
 
   function toggleProjectChecked(projectId: string) {
@@ -1062,6 +1276,14 @@ export function ProjectsClient() {
                     {isStoryboardGenerating ? "正在生成分镜图" : getEpisodeStoryboardActionLabel(selectedVersion)}
                   </button>
                   <button
+                    onClick={runProjectPromptSafetyOptimization}
+                    disabled={promptSafetyLoading}
+                    className="projects-action-button disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {promptSafetyLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                    {promptSafetyLoading ? "正在合规优化" : "Seedance 合规优化"}
+                  </button>
+                  <button
                     onClick={deleteSelectedEpisode}
                     disabled={deletingEpisode}
                     className="projects-action-button projects-action-danger disabled:cursor-not-allowed disabled:opacity-60"
@@ -1095,6 +1317,18 @@ export function ProjectsClient() {
                   }`}
                 >
                   {storyboardGenerationError || storyboardGenerationMessage}
+                </div>
+              )}
+
+              {(promptSafetyMessage || promptSafetyError) && (
+                <div
+                  className={`rounded-2xl border px-4 py-3 text-sm ${
+                    promptSafetyError
+                      ? "border-red-400/25 bg-red-500/10 text-red-100"
+                      : "border-emerald-300/18 bg-emerald-400/10 text-emerald-50"
+                  }`}
+                >
+                  {promptSafetyError || promptSafetyMessage}
                 </div>
               )}
 

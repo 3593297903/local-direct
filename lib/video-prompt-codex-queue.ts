@@ -144,7 +144,7 @@ export async function claimNextVideoPromptCodexJob(options: ClaimOptions = {}) {
 export async function completeVideoPromptCodexJob(jobId: string, options: QueueOptions = {}) {
   const rootDir = resolveRootDir(options);
   const job = await readJob(rootDir, jobId);
-  const result = await readOutputJson(job.outputPath);
+  const result = await readOutputJson(job.outputPath, job.script);
   const now = new Date().toISOString();
   const updated: VideoPromptCodexJob = {
     ...job,
@@ -203,6 +203,12 @@ function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outp
     "- dialogue must contain the line spoken in the shot, or the exact string \"无\" when there is no dialogue.",
     "- shotPurpose must explain why this shot exists in the sequence.",
     "",
+    "File writing requirements:",
+    "- Write the JSON file as UTF-8.",
+    "- Prefer Node.js fs.writeFileSync(outputPath, JSON.stringify(result, null, 2), \"utf8\").",
+    "- Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
+    "- After writing, read the file back as UTF-8 and confirm Chinese characters are preserved, not replaced by question marks.",
+    "",
     `Script: ${input.script}`,
     `Content type: ${input.contentType || "短剧 / 通用"}`,
     `Style: ${input.style || "自动匹配文案气质"}`,
@@ -228,12 +234,12 @@ async function syncAndSaveJob(rootDir: string, job: VideoPromptCodexJob) {
 
 async function syncJobFromOutputFile(job: VideoPromptCodexJob) {
   if (job.status === "completed") return job;
-  if (!(await isValidOutputJson(job.outputPath))) return job;
+  if (!(await isValidOutputJson(job.outputPath, job.script))) return job;
 
   return {
     ...job,
     status: "completed" as const,
-    result: await readOutputJson(job.outputPath),
+    result: await readOutputJson(job.outputPath, job.script),
     error: null,
     completedAt: job.completedAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -293,10 +299,11 @@ async function ensureQueueDirs(rootDir: string) {
   await mkdir(resultDir(rootDir), { recursive: true });
 }
 
-async function readOutputJson(filePath: string) {
+async function readOutputJson(filePath: string, sourceText = "") {
   try {
     const result = JSON.parse(stripJsonBom(await readFile(filePath, "utf8"))) as Record<string, unknown>;
     validateAnalysisResultShape(result);
+    validateVideoPromptEncodingQuality(result, sourceText);
     return result;
   } catch (error) {
     throw new VideoPromptCodexQueueError(
@@ -311,11 +318,40 @@ function stripJsonBom(value: string) {
   return value.charCodeAt(0) === 0xfeff ? value.slice(1) : value;
 }
 
-async function isValidOutputJson(filePath: string) {
+function validateVideoPromptEncodingQuality(result: Record<string, unknown>, sourceText: string) {
+  const sourceCjkCount = countCjkCharacters(sourceText);
+  if (sourceCjkCount < 3) return;
+
+  const serialized = JSON.stringify(result);
+  const questionMarkCount = countQuestionMarks(serialized);
+  const replacementCharCount = countReplacementCharacters(serialized);
+  const resultCjkCount = countCjkCharacters(serialized);
+
+  if (replacementCharCount > 0) {
+    throw new VideoPromptCodexQueueError("Video prompt JSON encoding appears damaged: replacement characters were found");
+  }
+  if (questionMarkCount >= 20 && questionMarkCount > Math.max(60, resultCjkCount * 2)) {
+    throw new VideoPromptCodexQueueError("Video prompt JSON encoding appears damaged: excessive question marks in Chinese output");
+  }
+}
+
+function countCjkCharacters(value: string) {
+  return (value.match(/[\u3400-\u9fff\uf900-\ufaff]/g) || []).length;
+}
+
+function countQuestionMarks(value: string) {
+  return (value.match(/\?/g) || []).length;
+}
+
+function countReplacementCharacters(value: string) {
+  return (value.match(/\ufffd/g) || []).length;
+}
+
+async function isValidOutputJson(filePath: string, sourceText = "") {
   try {
     const fileStat = await stat(filePath);
     if (!fileStat.isFile() || fileStat.size <= 0) return false;
-    await readOutputJson(filePath);
+    await readOutputJson(filePath, sourceText);
     return true;
   } catch {
     return false;

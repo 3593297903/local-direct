@@ -99,6 +99,9 @@ test("creates, claims, and completes a local Codex video prompt job", async () =
     assert.match(job.prompt, /sound/);
     assert.match(job.prompt, /dialogue/);
     assert.match(job.prompt, /shotPurpose/);
+    assert.match(job.prompt, /Write the JSON file as UTF-8/i);
+    assert.match(job.prompt, /Node\.js fs\.writeFileSync/i);
+    assert.match(job.prompt, /Do not use PowerShell Set-Content/i);
     assert.doesNotMatch(job.prompt, /external API/i);
     assert.match(job.outputPath, /tmp-video-prompt-codex[\\/]results[\\/]video-prompt-job-/);
     assert.equal(job.result, null);
@@ -177,6 +180,57 @@ test("completes a Codex video prompt job when the output JSON starts with UTF-8 
     const completed = await completeVideoPromptCodexJob(job.id, { rootDir });
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.storyboard.length, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("rejects mojibake question-mark output for Chinese video prompt jobs", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptCodexJob(
+      {
+        script: "\u7b2c1\u6bb5\uff5c\u5e8f\u8a00\uff1a\u5b69\u5b50\u5199\u4e0b\u7684\u57ce\u5e02\u3002\u5c0f\u5b66\u6559\u5ba4\u91cc\uff0c\u8001\u5e08\u8bfb\u5230\u4e00\u7bc7\u4f5c\u6587\u3002",
+        duration: "15\u79d2",
+      },
+      { rootDir },
+    );
+
+    const claimed = await claimNextVideoPromptCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    const damaged = sampleAnalysisResult();
+    damaged.title = "?1????????????";
+    damaged.contentType = "?? / ??";
+    damaged.duration = "15?";
+    damaged.style = "????????????????????????";
+    damaged.diagnosis = ["??????????????????????????????"];
+    damaged.optimizedScript = "?".repeat(240);
+    damaged.workflow.fullVideoPrompt = "?".repeat(280);
+    damaged.workflow.fullNegativePrompt = "?".repeat(80);
+    damaged.storyboard[0].scene = "????";
+    damaged.storyboard[0].visual = "?".repeat(160);
+    damaged.storyboard[0].shotType = "????";
+    damaged.storyboard[0].composition = "?".repeat(80);
+    damaged.storyboard[0].cameraMovement = "????";
+    damaged.storyboard[0].lighting = "?".repeat(80);
+    damaged.storyboard[0].sound = "?".repeat(80);
+    damaged.storyboard[0].dialogue = "?";
+    damaged.storyboard[0].emotion = "??";
+    damaged.storyboard[0].transition = "??";
+    damaged.storyboard[0].shotPurpose = "?".repeat(80);
+    damaged.storyboard[0].firstFramePrompt = "?".repeat(80);
+    damaged.storyboard[0].videoPrompt = "?".repeat(120);
+    damaged.storyboard[0].lastFramePrompt = "?".repeat(80);
+    damaged.storyboard[0].negativePrompt = "?".repeat(80);
+
+    mkdirSync(path.dirname(claimed.outputPath), { recursive: true });
+    writeFileSync(claimed.outputPath, JSON.stringify(damaged, null, 2), "utf8");
+
+    await assert.rejects(
+      () => completeVideoPromptCodexJob(job.id, { rootDir }),
+      /encoding|question mark|mojibake/i,
+    );
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

@@ -7,7 +7,7 @@ import { Drawer } from "@/components/Drawer";
 import { PreviewAnimation } from "@/components/PreviewAnimation";
 import { splitLongScriptIntoPromptSegments, type PromptSegment } from "@/lib/long-script";
 import { matchShotReferences, ShotReferenceMatches } from "@/lib/reference-matcher";
-import { Clock, Download, FileText, Film, ImageIcon, Loader2, Maximize2, ScanLine, Send, SlidersHorizontal, X } from "lucide-react";
+import { Clock, Download, FileText, Film, ImageIcon, Loader2, Maximize2, ScanLine, Send, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
 
 type StoryboardImageState = {
   sheetUrl: string;
@@ -55,6 +55,29 @@ type VideoPromptCodexJob = {
   id: string;
   status: "pending" | "running" | "completed" | "failed";
   result?: AnalysisResult | null;
+  error?: string | null;
+};
+
+type PromptSafetyOptimizationResult = {
+  targetModel: string;
+  status: "PASSED" | "OPTIMIZED" | "BLOCKED_NEEDS_USER_EDIT";
+  riskLevel: "NONE" | "LOW" | "MEDIUM" | "HIGH";
+  findings: Array<{
+    field: string;
+    shotNumber?: number;
+    original: string;
+    reason: string;
+    replacement?: string;
+    severity?: "low" | "medium" | "high";
+  }>;
+  changeSummary: string[];
+  optimizedResult: AnalysisResult;
+};
+
+type PromptSafetyCodexJob = {
+  id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  result?: PromptSafetyOptimizationResult | null;
   error?: string | null;
 };
 
@@ -243,6 +266,9 @@ export function DashboardClient() {
   const [generationProgress, setGenerationProgress] = useState("");
   const [error, setError] = useState("");
   const [imageError, setImageError] = useState("");
+  const [promptSafetyLoading, setPromptSafetyLoading] = useState(false);
+  const [promptSafetyMessage, setPromptSafetyMessage] = useState("");
+  const [promptSafetyError, setPromptSafetyError] = useState("");
   const [libraryError, setLibraryError] = useState("");
 
   useEffect(() => {
@@ -417,6 +443,95 @@ export function DashboardClient() {
     return data.result as AnalysisResult;
   }
 
+  async function createPromptSafetyCodexJob(
+    sourceResult: AnalysisResult,
+    promptText: string,
+    projectId: string | undefined,
+    versionId: string | undefined,
+  ) {
+    const res = await fetch("/api/prompt-safety/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: projectId || undefined,
+        versionId: versionId || undefined,
+        targetModel: "SEEDANCE_2_0",
+        promptText,
+        sourceResult,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.error || "Seedance 合规优化任务创建失败");
+    }
+    return data.job as PromptSafetyCodexJob;
+  }
+
+  async function pollPromptSafetyCodexJob(jobId: string) {
+    const startedAt = Date.now();
+    const timeoutMs = 20 * 60_000;
+    let lastStatus = "";
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const res = await fetch(`/api/prompt-safety/jobs/${jobId}`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || "Seedance 合规优化任务读取失败");
+      }
+
+      const currentJob = data.job as PromptSafetyCodexJob;
+      if (currentJob.status !== lastStatus) {
+        lastStatus = currentJob.status;
+        setPromptSafetyMessage(
+          currentJob.status === "running"
+            ? "Codex 正在本地优化 Seedance 2.0 合规提示词..."
+            : `Seedance 合规优化任务状态：${currentJob.status}`,
+        );
+      }
+      if (currentJob.status === "completed") return currentJob;
+      if (currentJob.status === "failed") throw new Error(currentJob.error || "Seedance 合规优化任务失败");
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+    }
+
+    throw new Error("Seedance 合规优化任务等待超时，请确认 prompt-safety:codex-worker 正在运行。");
+  }
+
+  async function runSeedancePromptSafetyOptimization() {
+    if (!result) return;
+    setPromptSafetyLoading(true);
+    setPromptSafetyError("");
+    setPromptSafetyMessage("已创建 Seedance 合规优化准备任务，请确认 prompt-safety:codex-worker 正在运行。");
+
+    try {
+      const promptText = buildVideoGenerationPromptText(result);
+      const job = await createPromptSafetyCodexJob(result, promptText, projectSave?.projectId, projectSave?.versionId);
+      const completedJob = await pollPromptSafetyCodexJob(job.id);
+      const safetyResult = completedJob.result;
+      const optimizedResult = safetyResult?.optimizedResult;
+      if (!safetyResult || !optimizedResult) {
+        throw new Error("Seedance 合规优化完成但没有返回优化结果");
+      }
+      if (safetyResult.status === "BLOCKED_NEEDS_USER_EDIT") {
+        const reason = safetyResult.findings.map((finding) => finding.reason).filter(Boolean).join("；");
+        throw new Error(reason || "当前提示词无法自动合规改写，需要先调整原始文案");
+      }
+
+      const optimizedPromptText = buildVideoGenerationPromptText(optimizedResult);
+      setResult(optimizedResult);
+      if (projectSave?.projectId && projectSave?.versionId) {
+        const save = await saveAnalysisProject(script, optimizedResult, optimizedPromptText, projectSave.projectId, projectSave.versionId);
+        setProjectSave(save);
+      }
+      setPromptSafetyMessage(
+        `Seedance 合规优化完成：${safetyResult.findings.length} 处风险记录，${safetyResult.changeSummary.length} 条修改说明。`,
+      );
+    } catch (err) {
+      setPromptSafetyError(err instanceof Error ? err.message : "Seedance 合规优化失败");
+    } finally {
+      setPromptSafetyLoading(false);
+    }
+  }
+
   async function saveAnalysisProject(
     originalScript: string,
     analysisResult: AnalysisResult,
@@ -494,6 +609,8 @@ export function DashboardClient() {
     setLoading(true);
     setError("");
     setImageError("");
+    setPromptSafetyError("");
+    setPromptSafetyMessage("");
     setStoryboardImage(null);
     setSelectedShot(null);
     setReferenceShot(null);
@@ -902,11 +1019,30 @@ export function DashboardClient() {
                 <Download className="h-4 w-4" />
                 下载 DOCX
               </button>
+              <button
+                onClick={runSeedancePromptSafetyOptimization}
+                disabled={promptSafetyLoading || !result}
+                className="inline-flex items-center gap-2 rounded-xl border border-emerald-300/20 bg-emerald-300/10 px-4 py-2 text-sm font-semibold text-emerald-50 transition hover:bg-emerald-300/16 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {promptSafetyLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                {promptSafetyLoading ? "正在合规优化" : "Seedance 合规优化"}
+              </button>
               <CopyButton text={JSON.stringify(result, null, 2)} label="复制全部 JSON" />
             </div>
           </div>
 
           {imageError && <p className="mb-4 rounded-xl border border-red-400/20 bg-red-500/10 p-3 text-sm text-red-100">{imageError}</p>}
+          {(promptSafetyMessage || promptSafetyError) && (
+            <p
+              className={`mb-4 rounded-xl border p-3 text-sm ${
+                promptSafetyError
+                  ? "border-red-400/20 bg-red-500/10 text-red-100"
+                  : "border-emerald-300/18 bg-emerald-400/10 text-emerald-50"
+              }`}
+            >
+              {promptSafetyError || promptSafetyMessage}
+            </p>
+          )}
 
           {Boolean(batchResults.length) && (
             <div className="mb-6 rounded-2xl border border-violet-300/16 bg-violet-500/8 p-4">

@@ -4,14 +4,14 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 
 const rootDir = process.cwd();
-const apiBaseUrl = (process.env.VIDEO_PROMPT_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
-const pollMs = positiveInteger(process.env.VIDEO_PROMPT_CODEX_POLL_MS, 2500);
-const idleLogMs = positiveInteger(process.env.VIDEO_PROMPT_CODEX_IDLE_LOG_MS, 30_000);
-const taskTimeoutMs = positiveInteger(process.env.VIDEO_PROMPT_CODEX_TASK_TIMEOUT_MS, 20 * 60_000);
-const workerToken = process.env.VIDEO_PROMPT_CODEX_WORKER_TOKEN || "";
-const messageDir = path.join(rootDir, ".tmp-video-prompt-codex", "codex-messages");
+const apiBaseUrl = (process.env.PROMPT_SAFETY_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
+const pollMs = positiveInteger(process.env.PROMPT_SAFETY_CODEX_POLL_MS, 2500);
+const idleLogMs = positiveInteger(process.env.PROMPT_SAFETY_CODEX_IDLE_LOG_MS, 30_000);
+const taskTimeoutMs = positiveInteger(process.env.PROMPT_SAFETY_CODEX_TASK_TIMEOUT_MS, 20 * 60_000);
+const workerToken = process.env.PROMPT_SAFETY_CODEX_WORKER_TOKEN || "";
+const messageDir = path.join(rootDir, ".tmp-prompt-safety-codex", "codex-messages");
 
-console.log("Local Director video prompt Codex worker started.");
+console.log("Local Director prompt safety Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
 console.log(`Poll interval: ${pollMs}ms`);
 console.log(`Task timeout: ${taskTimeoutMs}ms`);
@@ -35,32 +35,32 @@ while (true) {
 }
 
 async function processTask(task) {
-  console.log(`Claimed video prompt job ${task.id}.`);
+  console.log(`Claimed prompt safety job ${task.id}.`);
   try {
     await runCodex(task);
-    await assertOutputJson(task.outputPath, task);
+    await assertOutputJson(task.outputPath);
     await completeTask(task);
-    console.log(`Completed video prompt job ${task.id}: ${task.outputPath}`);
+    console.log(`Completed prompt safety job ${task.id}: ${task.outputPath}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await failTask(task, message).catch((failError) => {
-      console.error(`Could not report failed video prompt job ${task.id}:`, failError);
+      console.error(`Could not report failed prompt safety job ${task.id}:`, failError);
     });
-    console.error(`Video prompt job ${task.id} failed: ${message}`);
+    console.error(`Prompt safety job ${task.id} failed: ${message}`);
   }
 }
 
 async function claimTask() {
-  const data = await postJson("/api/video-prompt/jobs/claim", {});
+  const data = await postJson("/api/prompt-safety/jobs/claim", {});
   return data.task || null;
 }
 
 async function completeTask(task) {
-  await postJson(`/api/video-prompt/jobs/${encodeURIComponent(task.id)}/complete`, {});
+  await postJson(`/api/prompt-safety/jobs/${encodeURIComponent(task.id)}/complete`, {});
 }
 
 async function failTask(task, message) {
-  await postJson(`/api/video-prompt/jobs/${encodeURIComponent(task.id)}/fail`, { message });
+  await postJson(`/api/prompt-safety/jobs/${encodeURIComponent(task.id)}/fail`, { message });
 }
 
 async function postJson(pathname, body) {
@@ -68,31 +68,33 @@ async function postJson(pathname, body) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      ...(workerToken ? { "x-video-prompt-codex-token": workerToken } : {}),
+      ...(workerToken ? { "x-prompt-safety-codex-token": workerToken } : {}),
     },
     body: JSON.stringify(body),
   });
   const data = await response.json().catch(() => null);
   if (!response.ok || !data?.ok) {
-    throw new Error(data?.error || `Video prompt Codex worker request failed: ${response.status}`);
+    throw new Error(data?.error || `Prompt safety Codex worker request failed: ${response.status}`);
   }
   return data;
 }
 
 function buildCodexPrompt(task) {
   return [
-    "You are running Local Director video prompt generation from a local Codex CLI worker.",
-    "Return strict JSON by writing a Local Director AnalysisResult object to the output path.",
+    "You are running Local Director Seedance 2.0 prompt safety optimization from a local Codex CLI worker.",
+    "Return strict JSON by writing a prompt safety optimization object to the output path.",
     "Do not call network providers. Do not open a browser. Do not ask the user for follow-up input.",
-    "Write the JSON file as UTF-8. Prefer Node.js fs.writeFileSync(outputPath, JSON.stringify(result, null, 2), \"utf8\").",
-    "Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
-    "After writing, read the file back as UTF-8 and confirm Chinese characters are preserved, not replaced by question marks.",
+    "Do not evade moderation. Return strict word-level replacement patches only.",
     "",
-    "The JSON must include optimizedScript, workflow.fullVideoPrompt, and storyboard.",
+    "The JSON must include targetModel, status, riskLevel, findings, changeSummary, and patches.",
+    "Return patches only. Do not rewrite the full optimizedResult in the worker output.",
+    "Each patch must include path, original, replacement, riskType, strategy, and severity when known.",
+    "Each replacement must be the closest compliant word or short phrase, with no sentence expansion or explanation.",
+    "The API will apply patches to the locked sourceResult and validate the final optimizedResult structure.",
     `Task ID: ${task.id}`,
     `Output path: ${task.outputPath}`,
     "",
-    "AnalysisResult generation instructions:",
+    "Prompt safety optimization instructions:",
     task.prompt,
     "",
     "After writing and validating the JSON file, reply with exactly one line: DONE.",
@@ -115,7 +117,7 @@ async function runCodex(task) {
     "-",
   ];
 
-  console.log(`Running codex exec for video prompt job ${task.id}.`);
+  console.log(`Running codex exec for prompt safety job ${task.id}.`);
   await new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: rootDir,
@@ -149,50 +151,25 @@ function codexMessagePath(task) {
   return path.join(messageDir, `${safeFileName(task.id)}.txt`);
 }
 
-async function assertOutputJson(filePath, task) {
+async function assertOutputJson(filePath) {
   const fileStat = await fsp.stat(filePath);
   if (!fileStat.isFile() || fileStat.size <= 0) {
     throw new Error(`Codex did not produce a valid JSON file: ${filePath}`);
   }
-  const raw = stripJsonBom(await fsp.readFile(filePath, "utf8"));
-  const result = JSON.parse(raw);
+  const result = JSON.parse(stripJsonBom(await fsp.readFile(filePath, "utf8")));
   if (!result || typeof result !== "object") throw new Error("Codex output JSON is not an object");
-  if (typeof result.optimizedScript !== "string") throw new Error("Codex output JSON is missing optimizedScript");
-  if (!result.workflow || typeof result.workflow.fullVideoPrompt !== "string") {
-    throw new Error("Codex output JSON is missing workflow.fullVideoPrompt");
-  }
-  if (!Array.isArray(result.storyboard) || result.storyboard.length < 1) {
-    throw new Error("Codex output JSON is missing storyboard");
-  }
-  assertNoEncodingDamage(raw, `${task?.script || ""}\n${task?.prompt || ""}`);
-}
-
-function assertNoEncodingDamage(outputText, sourceText) {
-  const sourceCjkCount = countCjkCharacters(sourceText);
-  if (sourceCjkCount < 3) return;
-
-  const questionMarkCount = countQuestionMarks(outputText);
-  const replacementCharCount = countReplacementCharacters(outputText);
-  const outputCjkCount = countCjkCharacters(outputText);
-
-  if (replacementCharCount > 0) {
-    throw new Error("Codex output encoding appears damaged: replacement characters were found");
-  }
-  if (questionMarkCount >= 20 && questionMarkCount > Math.max(60, outputCjkCount * 2)) {
-    throw new Error("Codex output encoding appears damaged: excessive question marks in Chinese output");
-  }
-}
-
-function countCjkCharacters(value) {
-  return (String(value || "").match(/[\u3400-\u9fff\uf900-\ufaff]/g) || []).length;
-}
-
-function countQuestionMarks(value) {
-  return (String(value || "").match(/\?/g) || []).length;
-}
-
-function countReplacementCharacters(value) {
-  return (String(value || "").match(/\ufffd/g) || []).length;
+  if (typeof result.targetModel !== "string") throw new Error("Codex output JSON is missing targetModel");
+  if (!Array.isArray(result.findings)) throw new Error("Codex output JSON is missing findings");
+  if (!Array.isArray(result.changeSummary)) throw new Error("Codex output JSON is missing changeSummary");
+  if (!Array.isArray(result.patches)) throw new Error("Codex output JSON is missing patches");
+  result.patches.forEach((patch, index) => {
+    if (!patch || typeof patch !== "object") throw new Error(`Codex output patch ${index} is not an object`);
+    if (typeof patch.path !== "string" || !patch.path.trim()) throw new Error(`Codex output patch ${index} is missing path`);
+    if (typeof patch.original !== "string" || !patch.original.trim()) throw new Error(`Codex output patch ${index} is missing original`);
+    if (typeof patch.replacement !== "string" || !patch.replacement.trim()) {
+      throw new Error(`Codex output patch ${index} is missing replacement`);
+    }
+  });
 }
 
 function resolveCodexCommand() {
@@ -231,7 +208,7 @@ function logIdle() {
   const now = Date.now();
   if (now - lastIdleLogAt < idleLogMs) return;
   lastIdleLogAt = now;
-  console.log("No pending video prompt Codex jobs.");
+  console.log("No pending prompt safety Codex jobs.");
 }
 
 function positiveInteger(value, fallback) {

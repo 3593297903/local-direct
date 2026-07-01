@@ -20,6 +20,7 @@
     "local:start": "powershell -ExecutionPolicy Bypass -File scripts/start-localdirector.ps1",
     "storyboard:codex-worker": "node scripts/storyboard-codex-worker.mjs",
     "video-prompt:codex-worker": "node scripts/video-prompt-codex-worker.mjs",
+    "prompt-safety:codex-worker": "node scripts/prompt-safety-codex-worker.mjs",
     "lint": "next lint",
     "test": "node --test test/*.test.mjs",
     "typecheck": "tsc --noEmit",
