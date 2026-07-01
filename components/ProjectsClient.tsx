@@ -182,6 +182,34 @@ type ProjectDetail = {
   versions: ProjectVersion[];
 };
 
+type StoryboardCodexPanelTask = {
+  id: string;
+  jobId: string;
+  shotNumber: number;
+  batchIndex: number;
+  batchTotal: number;
+  prompt: string;
+  size: string;
+  quality: string;
+  status: "pending" | "running" | "completed" | "failed";
+  imageUrl: string | null;
+  error: string | null;
+  attempts?: number;
+  sourceImagePath?: string | null;
+  outputHash?: string | null;
+  imageFingerprint?: string | null;
+  codexLogPath?: string | null;
+  duplicateOfPanelId?: string | null;
+};
+
+type StoryboardCodexJob = {
+  id: string;
+  prompt: string;
+  status: "pending" | "running" | "completed" | "failed";
+  panels: StoryboardCodexPanelTask[];
+  error: string | null;
+};
+
 function formatDate(value?: string) {
   if (!value) return "-";
   return new Intl.DateTimeFormat("zh-CN", {
@@ -253,6 +281,48 @@ function getShotAssets(version: ProjectVersion, shot: ProjectShot, type?: Visual
   });
 }
 
+function getStoryboardAssetShotNumbers(version: ProjectVersion) {
+  return new Set(
+    (version.visualAssets || [])
+      .filter((asset) => asset.type === "SHOT_STORYBOARD" && asset.imageUrl && typeof asset.shotNumber === "number")
+      .map((asset) => Number(asset.shotNumber)),
+  );
+}
+
+function getEpisodeStoryboardActionLabel(version: ProjectVersion) {
+  const generatedCount = getStoryboardAssetShotNumbers(version).size;
+  if (generatedCount <= 0) return "生成本集镜头分镜图";
+  if (generatedCount < version.shots.length) return "补齐本集镜头分镜图";
+  return "重新生成本集分镜图";
+}
+
+function getEpisodeStoryboardTargetShots(version: ProjectVersion) {
+  const generatedShotNumbers = getStoryboardAssetShotNumbers(version);
+  if (generatedShotNumbers.size > 0 && generatedShotNumbers.size < version.shots.length) {
+    return version.shots.filter((shot) => !generatedShotNumbers.has(shot.shotNumber));
+  }
+  return version.shots;
+}
+
+function mapProjectShotToStoryboardJobShot(shot: ProjectShot) {
+  return {
+    shotNumber: shot.shotNumber,
+    scene: shot.scene || undefined,
+    visual: shot.visual || undefined,
+    shotType: shot.shotType || undefined,
+    composition: shot.composition || undefined,
+    cameraMovement: shot.cameraMovement || undefined,
+    lighting: shot.lighting || undefined,
+    sound: shot.sound || undefined,
+    dialogue: shot.dialogue || undefined,
+    emotion: shot.emotion || undefined,
+    transition: shot.transition || undefined,
+    shotPurpose: shot.shotPurpose || undefined,
+    videoPrompt: shot.videoPrompt || undefined,
+    negativePrompt: shot.negativePrompt || undefined,
+  };
+}
+
 function getProjectVisualAssets(project: ProjectDetail | null) {
   return (project?.versions || []).flatMap((version) => version.visualAssets || []);
 }
@@ -292,6 +362,9 @@ export function ProjectsClient() {
   const [deletingEpisode, setDeletingEpisode] = useState(false);
   const [projectDetailView, setProjectDetailView] = useState<ProjectDetailView>("episodes");
   const [activeAssetType, setActiveAssetType] = useState<AssetLibraryType>("CHARACTER");
+  const [storyboardGeneratingShotNumbers, setStoryboardGeneratingShotNumbers] = useState<number[]>([]);
+  const [storyboardGenerationMessage, setStoryboardGenerationMessage] = useState("");
+  const [storyboardGenerationError, setStoryboardGenerationError] = useState("");
 
   const selectedVersion = useMemo(() => {
     if (!project) return null;
@@ -317,6 +390,11 @@ export function ProjectsClient() {
 
   const activeAssetLibrarySection =
     projectAssetLibrarySections.find((section) => section.type === activeAssetType) || projectAssetLibrarySections[0];
+  const storyboardGeneratingShotSet = useMemo(
+    () => new Set(storyboardGeneratingShotNumbers),
+    [storyboardGeneratingShotNumbers],
+  );
+  const isStoryboardGenerating = storyboardGeneratingShotNumbers.length > 0;
 
   useEffect(() => {
     let active = true;
@@ -344,7 +422,7 @@ export function ProjectsClient() {
     };
   }, []);
 
-  async function reloadSelectedProject(projectId = selectedProjectId) {
+  async function reloadSelectedProject(projectId = selectedProjectId, preferredVersionId = selectedVersionId) {
     if (!projectId) {
       setProject(null);
       setProjectDetailError("");
@@ -357,8 +435,12 @@ export function ProjectsClient() {
       const res = await fetch(`/api/projects/${projectId}`, { cache: "no-store" });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.ok) throw new Error(data?.error || "项目详情加载失败");
-      setProject(data.project || null);
-      setSelectedVersionId(data.project?.versions?.[0]?.id || "");
+      const nextProject = data.project || null;
+      const versions = Array.isArray(nextProject?.versions) ? nextProject.versions : [];
+      setProject(nextProject);
+      setSelectedVersionId(
+        versions.find((version: ProjectVersion) => version.id === preferredVersionId)?.id || versions[0]?.id || "",
+      );
     } catch (err) {
       setProject(null);
       setProjectDetailError(getFriendlyProjectError(err instanceof Error ? err.message : "项目详情加载失败"));
@@ -446,6 +528,145 @@ export function ProjectsClient() {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
+  }
+
+  function storyboardCodexPanels(job: StoryboardCodexJob) {
+    return Object.fromEntries(
+      job.panels
+        .filter((panel) => typeof panel.imageUrl === "string" && panel.imageUrl.length > 0)
+        .map((panel) => [panel.shotNumber, panel.imageUrl as string]),
+    ) as Record<number, string>;
+  }
+
+  function calculateProjectStoryboardCodexTimeoutMs(job: StoryboardCodexJob) {
+    return Math.max(30 * 60_000, job.panels.length * 8 * 60_000);
+  }
+
+  async function createProjectStoryboardCodexJob(version: ProjectVersion, shots: ProjectShot[]) {
+    if (!project) throw new Error("项目详情未加载完成");
+    if (!shots.length) throw new Error("本集没有可生成的镜头");
+
+    const res = await fetch("/api/storyboard-image/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: project.id,
+        versionId: version.id,
+        title: `${project.title} 第${version.versionNumber}集`,
+        style: `${version.style || project.style || "电影级分镜"}，16:9 彩色电影级分镜图，电影光影，写实概念美术`,
+        storyboard: shots.map(mapProjectShotToStoryboardJobShot),
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) throw new Error(data?.error || "Codex 分镜图任务创建失败");
+    return data.job as StoryboardCodexJob;
+  }
+
+  async function pollProjectStoryboardCodexJob(jobId: string) {
+    const startedAt = Date.now();
+    let timeoutMs = 30 * 60_000;
+    const pollMs = 2500;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const res = await fetch(`/api/storyboard-image/jobs/${jobId}`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Codex 分镜图任务查询失败");
+
+      const job = data.job as StoryboardCodexJob;
+      timeoutMs = calculateProjectStoryboardCodexTimeoutMs(job);
+      const completed = job.panels.filter((panel) => panel.status === "completed").length;
+      const running = job.panels.filter((panel) => panel.status === "running").length;
+      setStoryboardGenerationMessage(
+        running
+          ? `镜头分镜图生成中：${completed}/${job.panels.length} 已完成，${running} 张处理中。`
+          : `镜头分镜图排队中：${completed}/${job.panels.length} 已完成。`,
+      );
+
+      if (job.status === "completed") return job;
+      if (job.status === "failed") throw new Error(job.error || "Codex 分镜图任务失败");
+      await new Promise((resolve) => window.setTimeout(resolve, pollMs));
+    }
+
+    throw new Error("Codex 分镜图任务等待超时，请确认 storyboard:codex-worker 正在运行。");
+  }
+
+  async function saveProjectStoryboardVisualAssets(job: StoryboardCodexJob) {
+    if (!project || !selectedVersion) return [];
+
+    const visualAssets = job.panels
+      .filter((panel) => panel.status === "completed" && typeof panel.imageUrl === "string" && panel.imageUrl.length > 0)
+      .map((panel) => ({
+        type: "SHOT_STORYBOARD",
+        name: `镜头 ${panel.shotNumber} 分镜图`,
+        shotNumber: panel.shotNumber,
+        variantKey: `shot-${panel.shotNumber}-storyboard-primary`,
+        prompt: panel.prompt || job.prompt || "",
+        imageUrl: panel.imageUrl,
+        status: "COMPLETED",
+        isPrimary: true,
+        metadata: {
+          source: "codex-imagegen",
+          generatedFrom: "projects-page",
+          jobId: job.id,
+          panelId: panel.id,
+          batchIndex: panel.batchIndex,
+          batchTotal: panel.batchTotal,
+          size: panel.size,
+          quality: panel.quality,
+          attempts: panel.attempts,
+          sourceImagePath: panel.sourceImagePath,
+          outputHash: panel.outputHash,
+          imageFingerprint: panel.imageFingerprint,
+          codexLogPath: panel.codexLogPath,
+          duplicateOfPanelId: panel.duplicateOfPanelId,
+        },
+      }));
+
+    if (!visualAssets.length) return [];
+
+    const res = await fetch("/api/projects/visual-assets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: project.id,
+        versionId: selectedVersion.id,
+        visualAssets,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) throw new Error(data?.error || "镜头分镜图保存失败");
+    return data.save?.visualAssets || [];
+  }
+
+  async function runProjectStoryboardGeneration(version: ProjectVersion, shots: ProjectShot[]) {
+    if (!project) return;
+    setStoryboardGeneratingShotNumbers(shots.map((shot) => shot.shotNumber));
+    setStoryboardGenerationError("");
+    setStoryboardGenerationMessage(`已创建 ${shots.length} 张镜头分镜图任务，请确认 storyboard:codex-worker 正在运行。`);
+
+    try {
+      const job = await createProjectStoryboardCodexJob(version, shots);
+      const completedJob = await pollProjectStoryboardCodexJob(job.id);
+      const panels = storyboardCodexPanels(completedJob);
+      if (!Object.keys(panels).length) throw new Error("Codex 分镜图任务完成但没有生成镜头图片");
+      await saveProjectStoryboardVisualAssets(completedJob);
+      await reloadSelectedProject(project.id, selectedVersion?.id || version.id);
+      setStoryboardGenerationMessage("镜头分镜图生成完成，已保存到本集镜头表。");
+    } catch (err) {
+      setStoryboardGenerationError(err instanceof Error ? err.message : "镜头分镜图生成失败");
+    } finally {
+      setStoryboardGeneratingShotNumbers([]);
+    }
+  }
+
+  async function generateEpisodeStoryboards() {
+    if (!selectedVersion) return;
+    await runProjectStoryboardGeneration(selectedVersion, getEpisodeStoryboardTargetShots(selectedVersion));
+  }
+
+  async function regenerateShotStoryboard(shot: ProjectShot) {
+    if (!selectedVersion) return;
+    await runProjectStoryboardGeneration(selectedVersion, [shot]);
   }
 
   function toggleProjectChecked(projectId: string) {
@@ -786,6 +1007,14 @@ export function ProjectsClient() {
                     新建一集
                   </button>
                   <button
+                    onClick={generateEpisodeStoryboards}
+                    disabled={isStoryboardGenerating || !selectedVersion.shots.length}
+                    className="projects-action-button disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {isStoryboardGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
+                    {isStoryboardGenerating ? "正在生成分镜图" : getEpisodeStoryboardActionLabel(selectedVersion)}
+                  </button>
+                  <button
                     onClick={deleteSelectedEpisode}
                     disabled={deletingEpisode}
                     className="projects-action-button projects-action-danger disabled:cursor-not-allowed disabled:opacity-60"
@@ -809,6 +1038,18 @@ export function ProjectsClient() {
                   </button>
                 </div>
               </div>
+
+              {(storyboardGenerationMessage || storyboardGenerationError) && (
+                <div
+                  className={`rounded-2xl border px-4 py-3 text-sm ${
+                    storyboardGenerationError
+                      ? "border-red-400/25 bg-red-500/10 text-red-100"
+                      : "border-cyan-300/16 bg-cyan-300/[0.07] text-cyan-50"
+                  }`}
+                >
+                  {storyboardGenerationError || storyboardGenerationMessage}
+                </div>
+              )}
 
               {projectDetailView === "episodes" && (
                 <>
@@ -1020,28 +1261,46 @@ export function ProjectsClient() {
                   <tbody>
                     {selectedVersion.shots.map((shot) => {
                       const storyboardAssets = getShotAssets(selectedVersion, shot, "SHOT_STORYBOARD");
+                      const isShotGenerating = storyboardGeneratingShotSet.has(shot.shotNumber);
                       return (
                           <tr key={shot.id} className="border-t border-cyan-300/10 align-top text-slate-300">
                             <td className="p-3 font-bold text-cyan-100">{shot.shotNumber}</td>
                             <td className="max-w-[280px] p-3">{shot.visual || shot.scene || "-"}</td>
                             <td className="w-48 p-3">
                               {storyboardAssets[0]?.imageUrl ? (
-                                <a
-                                  href={storyboardAssets[0].imageUrl}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="block w-44 overflow-hidden rounded-xl border border-cyan-300/16 bg-slate-950 transition hover:border-cyan-200/45"
-                                >
-                                  <img
-                                    src={storyboardAssets[0].imageUrl}
-                                    alt={`镜头 ${shot.shotNumber} 分镜图`}
-                                    className="aspect-video w-full object-cover"
-                                  />
-                                </a>
+                                <div className="w-44 space-y-2">
+                                  <a
+                                    href={storyboardAssets[0].imageUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="block overflow-hidden rounded-xl border border-cyan-300/16 bg-slate-950 transition hover:border-cyan-200/45"
+                                  >
+                                    <img
+                                      src={storyboardAssets[0].imageUrl}
+                                      alt={`镜头 ${shot.shotNumber} 分镜图`}
+                                      className="aspect-video w-full object-cover"
+                                    />
+                                  </a>
+                                  <button
+                                    type="button"
+                                    onClick={() => regenerateShotStoryboard(shot)}
+                                    disabled={isStoryboardGenerating}
+                                    className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-cyan-300/18 bg-cyan-300/[0.08] px-2 py-1.5 text-xs font-semibold text-cyan-50 transition hover:bg-cyan-300/[0.14] disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    {isShotGenerating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                                    {isShotGenerating ? "生成中" : "重新生成"}
+                                  </button>
+                                </div>
                               ) : (
-                                <span className="inline-flex w-44 items-center justify-center rounded-xl border border-dashed border-cyan-300/18 bg-slate-950/60 px-3 py-7 text-center text-xs text-slate-500">
-                                  生成后显示
-                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => regenerateShotStoryboard(shot)}
+                                  disabled={isStoryboardGenerating}
+                                  className="inline-flex w-44 items-center justify-center gap-2 rounded-xl border border-dashed border-cyan-300/18 bg-slate-950/60 px-3 py-7 text-center text-xs font-semibold text-slate-400 transition hover:border-cyan-200/35 hover:text-cyan-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  {isShotGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
+                                  {isShotGenerating ? "生成中" : "生成本镜头"}
+                                </button>
                               )}
                             </td>
                             <td className="p-3 text-slate-400">{shot.shotType || "-"}</td>

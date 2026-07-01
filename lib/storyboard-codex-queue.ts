@@ -10,9 +10,14 @@ export type StoryboardCodexShotInput = {
   scene?: string;
   visual?: string;
   shotType?: string;
+  composition?: string;
   cameraMovement?: string;
+  lighting?: string;
+  sound?: string;
+  dialogue?: string;
   emotion?: string;
   transition?: string;
+  shotPurpose?: string;
   videoPrompt?: string;
   negativePrompt?: string;
 };
@@ -348,9 +353,13 @@ function buildStoryboardPanelPrompt(
     `Shot number: ${shot.shotNumber}`,
     `Scene/backdrop: ${shot.scene || "current scene from the script"}`,
     `Subject/action: ${shot.visual || shot.videoPrompt || "the key story action in this shot"}`,
+    `Camera position/composition: ${shot.composition || "cinematic 16:9 composition with clear subject placement"}`,
     `Shot size and camera: ${shot.shotType || "cinematic shot"} / ${shot.cameraMovement || "camera movement implied by framing"}`,
+    `Lighting/color tone: ${shot.lighting || "cinematic film lighting based on the story mood"}`,
+    `Sound/dialogue context: ${shot.sound || "natural scene ambience"} / ${shot.dialogue || "no dialogue"}`,
     `Mood: ${shot.emotion || "cinematic tension"}`,
     `Transition intent: ${shot.transition || "natural cut"}`,
+    `Shot purpose: ${shot.shotPurpose || "advance the story and preserve visual continuity"}`,
     `Video prompt reference: ${shot.videoPrompt || ""}`,
     "",
     "Generate the image based directly on the shot video prompt, using the scene, action, shot size, camera movement, mood, and transition notes only as production guidance.",
