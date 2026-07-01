@@ -4,13 +4,23 @@
 
 **Goal:** Add a workbench episode-count selector and a local batch episode generation flow that can generate up to 30 saved, memory-linked project episodes.
 
-**Architecture:** Keep the existing single-episode generation path unchanged for count `1`. For count `2-30`, create a file-backed `EpisodeBatchJob`, process it through a local worker, generate episodes sequentially through the existing `/api/video-prompt/jobs` and `/api/projects` paths, and refresh project memory between each saved episode.
+**Architecture:** Keep the existing single-episode generation path unchanged for count `1`. For count `2-30`, phase 1 uses the browser-authenticated Dashboard flow to generate and save episodes sequentially. Each episode is saved before the next one starts, so the next `/api/analyze` or `/api/video-prompt/jobs` request can read the latest project memory through the current user's auth cookie.
+
+**Implementation note:** The earlier worker-queue design is still a phase-2 option, but it should not save projects until there is a dedicated internal service-token persistence path. The current `/api/projects` and director-context calls intentionally depend on the user's Nest auth cookie; storing that cookie in a local queue file would be brittle and unsafe.
 
 **Tech Stack:** Next.js API routes, React client state, TypeScript file queues, local Node worker scripts, existing Nest project persistence and director context APIs.
 
 ---
 
-## File Map
+## Phase 1 File Map
+
+- Modify `components/DashboardClient.tsx`: add the episode-count control, keep count `1` on the existing single-episode path, and run count `2-30` as browser-authenticated sequential generation and save.
+- Add `test/episode-batch-dashboard.test.mjs`: guards the Dashboard control and sequential memory-linked save loop.
+- Update this plan and `docs/superpowers/specs/2026-07-01-batch-episode-generation-design.md`: document why the worker queue is deferred.
+
+## Deferred Phase 2 File Map
+
+The worker queue shape below is kept as the next step after an internal service-token project-save interface exists.
 
 - Create `lib/episode-batch-queue.ts`: owns batch job validation, JSON persistence, status transitions, append-version tracking, cancel/retry helpers, and root path resolution.
 - Create `app/api/episode-batch/jobs/route.ts`: creates a batch job.

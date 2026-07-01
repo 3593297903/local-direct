@@ -95,6 +95,9 @@ type BatchPromptSection = {
 };
 
 type DurationMode = "auto" | "fixed";
+type BatchResultKind = "segments" | "episodes";
+
+const MAX_EPISODE_BATCH_COUNT = 30;
 
 const particleColors = [
   "rgba(129, 140, 248, 0.45)",
@@ -243,6 +246,28 @@ ${shot.lighting ? `光影：${shot.lighting}` : ""}
   ].filter(Boolean).join("\n\n");
 }
 
+function clampEpisodeCount(value: number) {
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(MAX_EPISODE_BATCH_COUNT, Math.max(1, Math.round(value)));
+}
+
+function buildBatchEpisodeScript(baseScript: string, episodeIndex: number, episodeCount: number) {
+  const source = baseScript.trim();
+  return [
+    source,
+    "",
+    "批量剧集生成要求：",
+    `这是同一个项目连续生成任务中的第 ${episodeIndex} / ${episodeCount} 集。`,
+    "请只生成当前这一集的完整视频提示词，不要输出其他集。",
+    "如果后端提供了项目记忆，请承接上一集结尾、人物状态、线索、世界观和视觉风格。",
+    episodeIndex === 1
+      ? "本集需要建立核心设定、主要人物关系和本轮剧情钩子。"
+      : episodeIndex === episodeCount
+        ? "本集需要承接前集并完成本轮情绪收束，结尾可以保留下一轮钩子。"
+        : "本集需要承接前集并推进新的行动、线索或人物关系变化。",
+  ].join("\n");
+}
+
 export function DashboardClient() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [script, setScript] = useState("一个男人在雨夜收到一张旧照片，发现照片里的人竟然是多年后死去的自己。他沿着照片背后的地址，走进一栋废弃大楼。");
@@ -262,9 +287,12 @@ export function DashboardClient() {
   const [imageLoading, setImageLoading] = useState(false);
   const [uploadingText, setUploadingText] = useState(false);
   const [batchGenerating, setBatchGenerating] = useState(false);
+  const [batchResultKind, setBatchResultKind] = useState<BatchResultKind>("segments");
   const [durationMode, setDurationMode] = useState<DurationMode>("auto");
   const [durationSeconds, setDurationSeconds] = useState(15);
   const [durationPickerOpen, setDurationPickerOpen] = useState(false);
+  const [episodeCount, setEpisodeCount] = useState(1);
+  const [episodeCountPickerOpen, setEpisodeCountPickerOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState("");
   const [generationProgress, setGenerationProgress] = useState("");
   const [error, setError] = useState("");
@@ -330,6 +358,10 @@ export function DashboardClient() {
 
   function selectedDurationValue() {
     return durationMode === "auto" ? "auto" : `${durationSeconds}秒`;
+  }
+
+  function updateEpisodeCount(value: number) {
+    setEpisodeCount(clampEpisodeCount(value));
   }
 
   async function requestAnalysis(inputScript: string, inputDuration: string) {
@@ -571,6 +603,47 @@ export function DashboardClient() {
     }
   }
 
+  async function runBatchEpisodeGeneration() {
+    const completed: BatchPromptSection[] = [];
+    let activeProjectId = resumeProjectId || "";
+    let latestSave: ProjectSaveState | null = null;
+    setBatchGenerating(true);
+    setBatchResultKind("episodes");
+
+    for (let episodeIndex = 1; episodeIndex <= episodeCount; episodeIndex += 1) {
+      const episodeScript = buildBatchEpisodeScript(script, episodeIndex, episodeCount);
+      setGenerationProgress(`正在生成第 ${episodeIndex} / ${episodeCount} 集...`);
+
+      const episodeResult = await requestAnalysisWithContext(episodeScript, selectedDurationValue(), activeProjectId || undefined, undefined);
+      const fullVideoPrompt = buildVideoGenerationPromptText(episodeResult);
+      const save = await saveAnalysisProject(episodeScript, episodeResult, fullVideoPrompt, activeProjectId || undefined, undefined);
+      if (!save.saved || !save.projectId || !save.versionId) {
+        throw new Error(`第 ${episodeIndex} 集已生成，但项目保存失败：${save.reason || "未返回保存结果"}`);
+      }
+
+      activeProjectId = save.projectId;
+      latestSave = save;
+      setProjectSave(save);
+      setResumeProjectId(save.projectId);
+      setResumeVersionId(save.versionId);
+
+      completed.push({
+        segment: { index: episodeIndex, text: episodeScript },
+        result: episodeResult,
+        promptText: fullVideoPrompt,
+      });
+      setBatchResults([...completed]);
+      setResult(episodeResult);
+    }
+
+    if (latestSave?.versionId) {
+      setResumeVersionId(latestSave.versionId);
+      creatingNewEpisodeRef.current = false;
+      setCreatingNewEpisode(false);
+    }
+    setGenerationProgress(`已生成 ${completed.length} 集，并按顺序保存到同一个项目。`);
+  }
+
   async function handlePromptFileUpload(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -624,6 +697,7 @@ export function DashboardClient() {
     setSelectedLibraryItem(null);
     setProjectSave(null);
     setDurationPickerOpen(false);
+    setEpisodeCountPickerOpen(false);
     setBatchResults([]);
 
     try {
@@ -632,6 +706,7 @@ export function DashboardClient() {
         const completed: BatchPromptSection[] = [];
         let activeProjectId = resumeProjectId || "";
         setBatchGenerating(true);
+        setBatchResultKind("segments");
 
         for (const segment of segments) {
           setGenerationProgress(`正在生成第 ${segment.index} / ${segments.length} 段...`);
@@ -653,6 +728,11 @@ export function DashboardClient() {
         }
 
         setGenerationProgress(`已生成 ${completed.length} 段，每段视频提示词均控制在 15s 内。`);
+        return;
+      }
+
+      if (episodeCount > 1) {
+        await runBatchEpisodeGeneration();
         return;
       }
 
@@ -681,9 +761,10 @@ export function DashboardClient() {
   }
 
   async function downloadPromptDocx() {
+    const batchUnitLabel = batchResultKind === "episodes" ? "集" : "段";
     const sections = batchResults.length
       ? batchResults.map((item) => ({
-          heading: `第 ${item.segment.index} 段｜${item.result.title}｜${item.result.duration}`,
+          heading: `第 ${item.segment.index} ${batchUnitLabel}｜${item.result.title}｜${item.result.duration}`,
           originalText: item.segment.text,
           promptText: item.promptText,
         }))
@@ -1008,6 +1089,59 @@ export function DashboardClient() {
                   </div>
                 )}
               </span>
+              <span className="relative inline-flex">
+                <button
+                  type="button"
+                  className="prompt-duration-pill"
+                  aria-label="生成集数"
+                  aria-expanded={episodeCountPickerOpen}
+                  disabled={uploadingText || loading || batchGenerating}
+                  onClick={() => setEpisodeCountPickerOpen((open) => !open)}
+                >
+                  <Film className="h-3.5 w-3.5" />
+                  {episodeCount} 集
+                </button>
+                {episodeCountPickerOpen && (
+                  <div className="duration-popover" role="dialog" aria-label="选择生成集数">
+                    <div className="mb-3 flex items-center justify-between gap-4">
+                      <span className="text-sm font-semibold text-slate-300">生成集数</span>
+                      <span className="text-sm font-bold text-slate-200">{episodeCount} 集</span>
+                    </div>
+                    <div className="grid grid-cols-5 gap-2">
+                      {[1, 3, 5, 10, 30].map((count) => (
+                        <button
+                          key={count}
+                          type="button"
+                          className={`rounded-lg border px-2 py-2 text-xs font-semibold transition ${
+                            episodeCount === count
+                              ? "border-cyan-200/60 bg-cyan-300/16 text-cyan-50"
+                              : "border-white/10 bg-white/[0.03] text-slate-400 hover:text-slate-100"
+                          }`}
+                          onClick={() => updateEpisodeCount(count)}
+                        >
+                          {count}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="mt-3 text-[11px] leading-5 text-slate-500">
+                      批量生成会按顺序逐集保存到同一个项目，后一集会读取前面已保存的项目记忆。
+                    </p>
+                    <input
+                      type="range"
+                      min="1"
+                      max="30"
+                      step="1"
+                      value={episodeCount}
+                      onChange={(e) => updateEpisodeCount(Number(e.target.value))}
+                      className="duration-slider mt-3"
+                    />
+                    <div className="mt-2 flex justify-between text-[11px] text-slate-500">
+                      <span>1 集</span>
+                      <span>30 集</span>
+                    </div>
+                  </div>
+                )}
+              </span>
               <span className="ml-auto text-xs text-slate-500">{script.length}/50000</span>
               <button
                 onClick={analyze}
@@ -1086,8 +1220,12 @@ export function DashboardClient() {
             <div className="mb-6 rounded-2xl border border-violet-300/16 bg-violet-500/8 p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h3 className="font-bold text-white">批量提示词生成</h3>
-                  <p className="mt-1 text-sm text-slate-400">已生成 {batchResults.length} 段，每段按 15s 以内的视频提示词模板输出。</p>
+                  <h3 className="font-bold text-white">{batchResultKind === "episodes" ? "批量剧集生成" : "批量提示词生成"}</h3>
+                  <p className="mt-1 text-sm text-slate-400">
+                    {batchResultKind === "episodes"
+                      ? `已生成 ${batchResults.length} 集，并按顺序保存到同一个项目。`
+                      : `已生成 ${batchResults.length} 段，每段按 15s 以内的视频提示词模板输出。`}
+                  </p>
                 </div>
                 <button
                   onClick={downloadPromptDocx}
