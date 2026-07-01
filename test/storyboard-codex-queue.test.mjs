@@ -16,6 +16,7 @@ const {
   claimNextStoryboardCodexPanel,
   completeStoryboardCodexPanel,
   createStoryboardCodexJob,
+  failStoryboardCodexPanel,
   getStoryboardCodexJob,
 } = require("../lib/storyboard-codex-queue.ts");
 
@@ -206,6 +207,59 @@ test("complete returns duplicate storyboard panel outputs to pending for retry",
     assert.equal(retriedPanel.status, "pending");
     assert.match(retriedPanel.error, /duplicate/i);
     assert.equal(existsSync(secondPanel.outputPath), false);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("failed storyboard panel attempts are retried before becoming a final job failure", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    mkdirSync(rootDir, { recursive: true });
+    const job = await createStoryboardCodexJob(
+      {
+        projectId: "77777777-7777-4777-8777-777777777777",
+        versionId: "88888888-8888-4888-8888-888888888888",
+        title: "缃戠粶娉㈠姩閲嶈瘯",
+        style: "涓撲笟鐢靛奖鍒嗛暅",
+        storyboard: sampleStoryboard.slice(0, 1),
+      },
+      { rootDir },
+    );
+
+    const firstClaim = await claimNextStoryboardCodexPanel({ rootDir, order: "oldest" });
+    assert.ok(firstClaim, "expected first claim");
+    assert.equal(firstClaim.attempts, 1);
+
+    const firstFailure = await failStoryboardCodexPanel(job.id, firstClaim.id, "temporary Codex network error", {
+      rootDir,
+    });
+    assert.equal(firstFailure.status, "pending");
+    assert.equal(firstFailure.panels[0].status, "pending");
+    assert.match(firstFailure.panels[0].error, /queued for retry/i);
+
+    const secondClaim = await claimNextStoryboardCodexPanel({ rootDir, order: "oldest" });
+    assert.ok(secondClaim, "expected retry claim");
+    assert.equal(secondClaim.id, firstClaim.id);
+    assert.equal(secondClaim.attempts, 2);
+
+    const secondFailure = await failStoryboardCodexPanel(job.id, secondClaim.id, "temporary Codex network error", {
+      rootDir,
+    });
+    assert.equal(secondFailure.status, "pending");
+    assert.equal(secondFailure.panels[0].status, "pending");
+
+    const thirdClaim = await claimNextStoryboardCodexPanel({ rootDir, order: "oldest" });
+    assert.ok(thirdClaim, "expected final retry claim");
+    assert.equal(thirdClaim.id, firstClaim.id);
+    assert.equal(thirdClaim.attempts, 3);
+
+    const finalFailure = await failStoryboardCodexPanel(job.id, thirdClaim.id, "temporary Codex network error", {
+      rootDir,
+    });
+    assert.equal(finalFailure.status, "failed");
+    assert.equal(finalFailure.panels[0].status, "failed");
+    assert.match(finalFailure.panels[0].error, /maximum retry attempts reached/i);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

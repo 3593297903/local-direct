@@ -87,3 +87,26 @@ test("projects detail keeps episode selection in a fixed scrollable dock", () =>
   assert.match(styles, /max-height:\s*15rem/);
   assert.match(styles, /overflow-y:\s*auto/);
 });
+
+test("projects detail layout keeps wide tables and long prompts inside the viewport", () => {
+  const client = readFileSync("components/ProjectsClient.tsx", "utf8");
+
+  assert.match(client, /xl:grid-cols-\[360px_minmax\(0,1fr\)\]/);
+  assert.match(client, /projects-detail-panel min-w-0/);
+  assert.match(client, /max-w-full overflow-x-auto/);
+  assert.match(client, /break-words/);
+});
+
+test("projects list uses an internal vertical scroller instead of stretching the page", () => {
+  const client = readFileSync("components/ProjectsClient.tsx", "utf8");
+  const styles = readFileSync("app/globals.css", "utf8");
+
+  assert.match(client, /projects-list-panel min-w-0/);
+  assert.match(client, /projects-list-scroll/);
+  assert.match(styles, /\.projects-list-panel\s*\{/);
+  assert.match(styles, /max-height:\s*calc\(100vh - 10rem\)/);
+  assert.match(styles, /flex-direction:\s*column/);
+  assert.match(styles, /\.projects-list-scroll\s*\{/);
+  assert.match(styles, /overflow-y:\s*auto/);
+  assert.match(styles, /overscroll-behavior:\s*contain/);
+});

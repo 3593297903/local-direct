@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 
 const SHOW_DIRECTOR_MEMORY = false;
+const STORYBOARD_FAILED_GRACE_POLLS = 5;
 
 type ProjectSummary = {
   id: string;
@@ -347,6 +348,19 @@ function getVisualEntityStatusLabel(status?: string | null) {
   return "候选";
 }
 
+function getRetryingStoryboardPanelCount(job: StoryboardCodexJob) {
+  return job.panels.filter((panel) => panel.status === "pending" && Boolean(panel.error)).length;
+}
+
+function getFailedStoryboardPanelMessage(job: StoryboardCodexJob) {
+  const failedPanels = job.panels.filter((panel) => panel.status === "failed");
+  if (!failedPanels.length) return job.error || "Codex 分镜图任务失败";
+
+  return failedPanels
+    .map((panel) => `镜头 ${panel.shotNumber} 生成失败：${panel.error || job.error || "未知错误"}`)
+    .join("；");
+}
+
 export function ProjectsClient() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
@@ -562,10 +576,11 @@ export function ProjectsClient() {
     return data.job as StoryboardCodexJob;
   }
 
-  async function pollProjectStoryboardCodexJob(jobId: string) {
+  async function pollProjectStoryboardCodexJob(jobId: string, savedPanelIds = new Set<string>()) {
     const startedAt = Date.now();
     let timeoutMs = 30 * 60_000;
     const pollMs = 2500;
+    let failedPollCount = 0;
 
     while (Date.now() - startedAt < timeoutMs) {
       const res = await fetch(`/api/storyboard-image/jobs/${jobId}`, { cache: "no-store" });
@@ -574,27 +589,49 @@ export function ProjectsClient() {
 
       const job = data.job as StoryboardCodexJob;
       timeoutMs = calculateProjectStoryboardCodexTimeoutMs(job);
+      const savedNow = await saveProjectStoryboardVisualAssets(job, savedPanelIds);
+      if (savedNow.length && project?.id) {
+        await reloadSelectedProject(project.id, selectedVersion?.id);
+      }
+
       const completed = job.panels.filter((panel) => panel.status === "completed").length;
       const running = job.panels.filter((panel) => panel.status === "running").length;
+      const retrying = getRetryingStoryboardPanelCount(job);
+      const failed = job.panels.filter((panel) => panel.status === "failed").length;
       setStoryboardGenerationMessage(
         running
           ? `镜头分镜图生成中：${completed}/${job.panels.length} 已完成，${running} 张处理中。`
-          : `镜头分镜图排队中：${completed}/${job.panels.length} 已完成。`,
+          : retrying
+            ? `镜头分镜图生成中：${completed}/${job.panels.length} 已完成，${retrying} 张正在自动重试。`
+            : failed
+              ? `镜头分镜图状态确认中：${completed}/${job.panels.length} 已完成，${failed} 张暂时失败。`
+              : `镜头分镜图排队中：${completed}/${job.panels.length} 已完成。`,
       );
 
       if (job.status === "completed") return job;
-      if (job.status === "failed") throw new Error(job.error || "Codex 分镜图任务失败");
+      if (job.status === "failed") {
+        failedPollCount += 1;
+        if (failedPollCount >= STORYBOARD_FAILED_GRACE_POLLS) {
+          throw new Error(getFailedStoryboardPanelMessage(job));
+        }
+      } else {
+        failedPollCount = 0;
+      }
+
       await new Promise((resolve) => window.setTimeout(resolve, pollMs));
     }
 
     throw new Error("Codex 分镜图任务等待超时，请确认 storyboard:codex-worker 正在运行。");
   }
 
-  async function saveProjectStoryboardVisualAssets(job: StoryboardCodexJob) {
+  async function saveProjectStoryboardVisualAssets(job: StoryboardCodexJob, savedPanelIds = new Set<string>()) {
     if (!project || !selectedVersion) return [];
 
-    const visualAssets = job.panels
+    const completedPanels = job.panels
       .filter((panel) => panel.status === "completed" && typeof panel.imageUrl === "string" && panel.imageUrl.length > 0)
+      .filter((panel) => !savedPanelIds.has(panel.id));
+
+    const visualAssets = completedPanels
       .map((panel) => ({
         type: "SHOT_STORYBOARD",
         name: `镜头 ${panel.shotNumber} 分镜图`,
@@ -635,6 +672,8 @@ export function ProjectsClient() {
     });
     const data = await res.json().catch(() => null);
     if (!res.ok || !data?.ok) throw new Error(data?.error || "镜头分镜图保存失败");
+
+    completedPanels.forEach((panel) => savedPanelIds.add(panel.id));
     return data.save?.visualAssets || [];
   }
 
@@ -644,16 +683,24 @@ export function ProjectsClient() {
     setStoryboardGenerationError("");
     setStoryboardGenerationMessage(`已创建 ${shots.length} 张镜头分镜图任务，请确认 storyboard:codex-worker 正在运行。`);
 
+    const savedPanelIds = new Set<string>();
+
     try {
       const job = await createProjectStoryboardCodexJob(version, shots);
-      const completedJob = await pollProjectStoryboardCodexJob(job.id);
+      const completedJob = await pollProjectStoryboardCodexJob(job.id, savedPanelIds);
       const panels = storyboardCodexPanels(completedJob);
       if (!Object.keys(panels).length) throw new Error("Codex 分镜图任务完成但没有生成镜头图片");
-      await saveProjectStoryboardVisualAssets(completedJob);
+      await saveProjectStoryboardVisualAssets(completedJob, savedPanelIds);
       await reloadSelectedProject(project.id, selectedVersion?.id || version.id);
       setStoryboardGenerationMessage("镜头分镜图生成完成，已保存到本集镜头表。");
     } catch (err) {
-      setStoryboardGenerationError(err instanceof Error ? err.message : "镜头分镜图生成失败");
+      if (savedPanelIds.size > 0) {
+        await reloadSelectedProject(project.id, selectedVersion?.id || version.id).catch(() => undefined);
+      }
+      const message = err instanceof Error ? err.message : "镜头分镜图生成失败";
+      setStoryboardGenerationError(
+        savedPanelIds.size > 0 ? `${message}。已保留 ${savedPanelIds.size} 张已完成分镜图。` : message,
+      );
     } finally {
       setStoryboardGeneratingShotNumbers([]);
     }
@@ -816,8 +863,8 @@ export function ProjectsClient() {
         </div>
       )}
 
-      <div className="grid gap-5 xl:grid-cols-[360px_1fr]">
-        <section className="projects-list-panel rounded-2xl p-3">
+      <div className="grid min-w-0 gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
+        <section className="projects-list-panel min-w-0 rounded-2xl p-3">
           <div className="projects-list-toolbar mb-3 flex items-center justify-between gap-2 px-2 pt-1">
             <div className="flex min-w-0 items-center gap-2">
               <h2 className="shrink-0 font-bold text-white">项目列表</h2>
@@ -862,7 +909,7 @@ export function ProjectsClient() {
             </div>
           )}
 
-          <div className="space-y-2">
+          <div className="projects-list-scroll space-y-2 pr-1">
             {projects.map((item) => {
               const active = item.id === selectedProjectId;
               const checked = checkedProjectIds.includes(item.id);
@@ -905,7 +952,7 @@ export function ProjectsClient() {
           </div>
         </section>
 
-        <section className="projects-detail-panel min-h-[520px] rounded-2xl p-5 md:p-6">
+        <section className="projects-detail-panel min-w-0 min-h-[520px] rounded-2xl p-5 md:p-6">
           {loadingDetail && (
             <div className="flex h-80 items-center justify-center gap-3 text-sm text-slate-400">
               <Loader2 className="h-5 w-5 animate-spin text-cyan-100" />
@@ -937,7 +984,7 @@ export function ProjectsClient() {
           )}
 
           {!loadingDetail && !projectDetailError && project && selectedVersion && (
-            <div className="space-y-5">
+            <div className="min-w-0 space-y-5">
               <div className="projects-project-stepper" role="tablist" aria-label="项目工作流">
                 <button
                   type="button"
@@ -983,15 +1030,15 @@ export function ProjectsClient() {
                 </button>
               </div>
 
-              <div className="flex flex-wrap items-start justify-between gap-4">
-                <div>
+              <div className="flex min-w-0 flex-wrap items-start justify-between gap-4">
+                <div className="min-w-0">
                   <div className="text-xs uppercase tracking-wide text-cyan-200/70">Saved Project</div>
                   <h2 className="mt-1 text-2xl font-black text-white">{project.title}</h2>
                   <p className="mt-2 text-sm text-slate-500">
                     {project.contentType || "自动分类"} · {project.style || "自动风格"} · {project.duration || "-"}
                   </p>
                 </div>
-                <div className="flex flex-wrap gap-2">
+                <div className="flex min-w-0 flex-wrap gap-2">
                   <button
                     onClick={resumeEditing}
                     className="projects-action-button projects-action-primary"
@@ -1053,17 +1100,17 @@ export function ProjectsClient() {
 
               {projectDetailView === "episodes" && (
                 <>
-              <div className="grid gap-4 lg:grid-cols-2">
-                <div className="projects-content-card rounded-2xl p-4">
+              <div className="grid min-w-0 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+                <div className="projects-content-card min-w-0 rounded-2xl p-4">
                   <div className="mb-3 flex items-center gap-2 text-sm font-bold text-white">
                     <FileText className="h-4 w-4 text-cyan-100" />
                     生成文案
                   </div>
-                  <div className="max-h-56 overflow-auto whitespace-pre-wrap text-sm leading-7 text-slate-300">
+                  <div className="max-h-56 overflow-auto whitespace-pre-wrap break-words text-sm leading-7 text-slate-300">
                     {selectedVersion.optimizedScript || selectedVersion.originalScript}
                   </div>
                 </div>
-                <div className="projects-content-card projects-version-dock rounded-2xl p-4">
+                <div className="projects-content-card projects-version-dock min-w-0 rounded-2xl p-4">
                   <div className="mb-3 flex items-center justify-between gap-3 text-sm font-bold text-white">
                     <div className="flex items-center gap-2">
                       <CalendarClock className="h-4 w-4 text-cyan-100" />
@@ -1090,12 +1137,12 @@ export function ProjectsClient() {
               </div>
 
               {selectedVersion.fullVideoPrompt && (
-                <div className="projects-content-card rounded-2xl p-4">
+                <div className="projects-content-card min-w-0 rounded-2xl p-4">
                   <div className="mb-3 flex items-center gap-2 text-sm font-bold text-white">
                     <FileText className="h-4 w-4 text-cyan-100" />
                     视频生成提示词
                   </div>
-                  <div className="max-h-[560px] overflow-auto whitespace-pre-wrap text-sm leading-7 text-slate-300">
+                  <div className="max-h-[560px] overflow-auto whitespace-pre-wrap break-words text-sm leading-7 text-slate-300">
                     {selectedVersion.fullVideoPrompt}
                   </div>
                 </div>
@@ -1240,7 +1287,7 @@ export function ProjectsClient() {
                 </div>
               )}
 
-              <div className="overflow-x-auto rounded-2xl border border-slate-300/14 bg-slate-950/35">
+              <div className="max-w-full overflow-x-auto rounded-2xl border border-slate-300/14 bg-slate-950/35">
                 <table className="w-full min-w-[1680px] border-collapse text-left text-sm">
                   <thead className="bg-cyan-300/[0.06] text-xs uppercase text-cyan-100/70">
                     <tr>

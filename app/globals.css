@@ -454,6 +454,21 @@ button, a { -webkit-tap-highlight-color: transparent; }
   backdrop-filter: blur(18px);
 }
 
+.projects-list-panel {
+  display: flex;
+  max-height: calc(100vh - 10rem);
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.projects-list-scroll {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
 .projects-list-item {
   border: 1px solid rgba(148, 163, 184, 0.14);
   background: rgba(15, 23, 42, 0.38);
@@ -774,6 +789,10 @@ button, a { -webkit-tap-highlight-color: transparent; }
 }
 
 @media (max-width: 420px) {
+  .projects-list-panel {
+    max-height: min(32rem, calc(100vh - 7rem));
+  }
+
   .projects-list-toolbar {
     align-items: flex-start;
     flex-direction: column;

@@ -12,6 +12,12 @@ test("Projects page can generate and regenerate storyboard images for saved epis
   assert.match(client, /pollProjectStoryboardCodexJob/);
   assert.match(client, /saveProjectStoryboardVisualAssets/);
   assert.match(client, /getEpisodeStoryboardActionLabel/);
+  assert.match(client, /STORYBOARD_FAILED_GRACE_POLLS/);
+  assert.match(client, /failedPollCount/);
+  assert.match(client, /savedPanelIds/);
+  assert.match(client, /saveProjectStoryboardVisualAssets\(job, savedPanelIds\)/);
+  assert.match(client, /getRetryingStoryboardPanelCount/);
+  assert.doesNotMatch(client, /if \(job\.status === "failed"\) throw new Error/);
   assert.match(client, /variantKey: `shot-\$\{panel\.shotNumber\}-storyboard-primary`/);
   assert.match(client, /reloadSelectedProject\(project\.id,/);
 

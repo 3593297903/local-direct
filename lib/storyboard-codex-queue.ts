@@ -318,16 +318,25 @@ export async function failStoryboardCodexPanel(
   return withQueueLock(rootDir, async () => {
     const job = await readJob(rootDir, jobId);
     const now = new Date().toISOString();
-    const panels = job.panels.map((panel) =>
-      panel.id === panelId
-        ? {
-            ...panel,
-            status: "failed" as const,
-            error: message || "Codex storyboard panel generation failed",
-            updatedAt: now,
-          }
-        : panel,
-    );
+    const panels = job.panels.map((panel) => {
+      if (panel.id !== panelId) return panel;
+
+      const attempts = panel.attempts || 0;
+      const retryable = attempts < PANEL_MAX_ATTEMPTS;
+      const baseMessage = message || "Codex storyboard panel generation failed";
+
+      return {
+        ...panel,
+        status: retryable ? ("pending" as const) : ("failed" as const),
+        imageUrl: null,
+        error: retryable
+          ? `${baseMessage}; queued for retry (${attempts}/${PANEL_MAX_ATTEMPTS})`
+          : `${baseMessage}; maximum retry attempts reached`,
+        startedAt: undefined,
+        completedAt: undefined,
+        updatedAt: now,
+      };
+    });
     const updated = applyJobStatus({ ...job, panels, updatedAt: now });
     await writeJob(rootDir, updated);
     return updated;
