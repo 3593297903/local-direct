@@ -13,6 +13,8 @@ test("storyboard Codex worker invokes codex exec and reports panel status", () =
   assert.match(source, /\/complete/);
   assert.match(source, /\/fail/);
   assert.match(source, /assertOutputFile/);
+  assert.match(source, /normalizePngToExpectedSize/);
+  assert.match(source, /readPngDimensions/);
   assert.match(source, /STORYBOARD_CODEX_API_BASE_URL/);
 });
 
@@ -26,6 +28,13 @@ test("storyboard Codex worker runs a bounded local concurrency pool", () => {
   assert.match(source, /activeTasks/);
   assert.match(source, /processTask/);
   assert.match(source, /codex-messages/);
+  assert.match(source, /codex-logs/);
+  assert.match(source, /codexLogPath/);
+  assert.match(source, /source-manifests/);
+  assert.match(source, /extractSourceImagePathFromLog/);
+  assert.match(source, /computeImageFingerprint/);
+  assert.match(source, /sourceImagePath/);
+  assert.match(source, /imageFingerprint/);
   assert.doesNotMatch(source, /last-codex-message\.txt/);
 });
 

@@ -199,3 +199,56 @@ test("AI network fetch retry stops after one retry with a clear diagnostic error
     else process.env.AI_NETWORK_RETRY_DELAY_MS = originalDelay;
   }
 });
+
+test("AI provider non-JSON responses fail with a clear diagnostic error", async () => {
+  const { analyzeScriptDirect } = await import(moduleUrl);
+  const originalFetch = globalThis.fetch;
+  const originalProvider = process.env.AI_PROVIDER;
+  const originalAiKey = process.env.AI_API_KEY;
+  const originalKey = process.env.OPENAI_API_KEY;
+  const originalModel = process.env.AI_MODEL;
+
+  try {
+    process.env.AI_PROVIDER = "openai";
+    process.env.AI_API_KEY = "test-key";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.AI_MODEL = "test-model";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: "镜头一：测试画面，不是 JSON。",
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+
+    await assert.rejects(
+      analyzeScriptDirect({
+        script: "厨房里，早餐机自动制作吐司和咖啡。",
+        duration: "15秒",
+        requestId: "test_non_json",
+      }),
+      (error) => {
+        assert.match(error.message, /AI provider returned non-JSON/i);
+        assert.match(error.message, /test-model/);
+        assert.doesNotMatch(error.message, /Unexpected token/);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalProvider === undefined) delete process.env.AI_PROVIDER;
+    else process.env.AI_PROVIDER = originalProvider;
+    if (originalAiKey === undefined) delete process.env.AI_API_KEY;
+    else process.env.AI_API_KEY = originalAiKey;
+    if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalKey;
+    if (originalModel === undefined) delete process.env.AI_MODEL;
+    else process.env.AI_MODEL = originalModel;
+  }
+});

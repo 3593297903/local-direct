@@ -29,6 +29,24 @@ test("Nest project save returns project and version ids for later storyboard ima
   assert.match(controller, /saveStoryboardImage/);
 });
 
+test("project versions persist storyboard production fields used by the shot table", () => {
+  const schema = readFileSync("prisma/schema.prisma", "utf8");
+  const dto = readFileSync("apps/api/src/modules/projects/projects.dto.ts", "utf8");
+  const service = readFileSync("apps/api/src/modules/projects/projects.service.ts", "utf8");
+  const proxy = readFileSync("lib/nest-projects-proxy.ts", "utf8");
+  const projects = readFileSync("components/ProjectsClient.tsx", "utf8");
+
+  for (const field of ["composition", "lighting", "sound", "dialogue", "shotPurpose"]) {
+    assert.match(schema, new RegExp(`${field}\\s+String\\?`), `schema should store ${field}`);
+    assert.match(dto, new RegExp(`${field}\\?: string`), `DTO should accept ${field}`);
+    assert.match(service, new RegExp(`${field}: shot\\.${field}`), `service should persist ${field}`);
+    assert.match(service, new RegExp(`${field}: true`), `service should select ${field}`);
+    assert.match(proxy, new RegExp(`${field}: shot\\.${field}`), `Next proxy should forward ${field}`);
+    assert.match(projects, new RegExp(`${field}\\?: string \\| null`), `project page type should include ${field}`);
+    assert.match(projects, new RegExp(`shot\\.${field} \\|\\| "-"`), `project page should render ${field}`);
+  }
+});
+
 test("dashboard saves storyboard image only after it exists", () => {
   const dashboard = readFileSync("components/DashboardClient.tsx", "utf8");
 

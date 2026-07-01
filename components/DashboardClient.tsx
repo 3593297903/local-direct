@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useRef, useState, type ChangeEvent, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type CSSProperties } from "react";
 import { AnalysisResult, KnowledgeItem, StoryboardShot } from "@/types";
 import { CopyButton } from "@/components/CopyButton";
 import { Drawer } from "@/components/Drawer";
@@ -34,6 +34,12 @@ type StoryboardCodexPanel = {
   status: "pending" | "running" | "completed" | "failed";
   imageUrl?: string | null;
   error?: string | null;
+  attempts?: number;
+  sourceImagePath?: string | null;
+  outputHash?: string | null;
+  imageFingerprint?: string | null;
+  codexLogPath?: string | null;
+  duplicateOfPanelId?: string | null;
 };
 
 type StoryboardCodexJob = {
@@ -51,6 +57,13 @@ type VideoPromptCodexJob = {
   result?: AnalysisResult | null;
   error?: string | null;
 };
+
+class CodexVideoPromptJobFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexVideoPromptJobFailedError";
+  }
+}
 
 type BatchPromptSection = {
   segment: PromptSegment;
@@ -87,17 +100,6 @@ function particleStyle(particle: (typeof workspaceParticles)[number]) {
     "--particle-duration": particle.duration,
     "--particle-color": particle.color,
   } as CSSProperties;
-}
-
-function normalizeStoryboardPanels(value: unknown) {
-  if (!value || typeof value !== "object") return null;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, imageUrl]) => typeof imageUrl === "string" && imageUrl.length > 0)
-    .map(([shotNumber, imageUrl]) => [Number(shotNumber), imageUrl as string] as const)
-    .filter(([shotNumber]) => Number.isFinite(shotNumber));
-
-  if (!entries.length) return null;
-  return Object.fromEntries(entries) as Record<number, string>;
 }
 
 function calculateStoryboardCodexTimeoutMs(job: StoryboardCodexJob) {
@@ -214,145 +216,6 @@ ${shot.lighting ? `光影：${shot.lighting}` : ""}
     `技术参数\n\n${technicalParams}`,
     `镜头画面 + 时间轴 + 声音 / 台词\n${shotLines}`,
   ].filter(Boolean).join("\n\n");
-}
-
-function cropStoryboardPanels(imageUrl: string, shots: StoryboardShot[]) {
-  return new Promise<Record<number, string>>((resolve, reject) => {
-    const image = new Image();
-    image.crossOrigin = "anonymous";
-
-    image.onload = () => {
-      const sourceCanvas = document.createElement("canvas");
-      sourceCanvas.width = image.naturalWidth;
-      sourceCanvas.height = image.naturalHeight;
-      const sourceContext = sourceCanvas.getContext("2d");
-      if (!sourceContext) {
-        reject(new Error("无法读取分镜图，不能裁切到每个镜头"));
-        return;
-      }
-
-      sourceContext.drawImage(image, 0, 0);
-      const cropBoxes = detectStoryboardPanelBoxes(sourceContext, image.naturalWidth, image.naturalHeight, shots.length);
-      const panels: Record<number, string> = {};
-
-      for (let index = 0; index < shots.length; index += 1) {
-        const box = cropBoxes[index];
-        const canvas = document.createElement("canvas");
-        canvas.width = box.width;
-        canvas.height = box.height;
-        const context = canvas.getContext("2d");
-        if (!context) continue;
-
-        context.drawImage(
-          sourceCanvas,
-          box.x,
-          box.y,
-          box.width,
-          box.height,
-          0,
-          0,
-          box.width,
-          box.height
-        );
-        panels[shots[index].shotNumber] = canvas.toDataURL("image/png");
-      }
-
-      resolve(panels);
-    };
-
-    image.onerror = () => reject(new Error("分镜图加载失败，无法裁剪到每个镜头"));
-    image.src = imageUrl;
-  });
-}
-
-function detectStoryboardPanelBoxes(context: CanvasRenderingContext2D, width: number, height: number, panelCount: number) {
-  const equalBoxes = () => {
-    const panelHeight = Math.floor(height / panelCount);
-    return Array.from({ length: panelCount }, (_, index) => ({
-      x: 0,
-      y: index * panelHeight,
-      width,
-      height: index === panelCount - 1 ? height - index * panelHeight : panelHeight,
-    }));
-  };
-
-  if (panelCount <= 1) return [{ x: 0, y: 0, width, height }];
-
-  const sampleStep = Math.max(1, Math.floor(width / 260));
-  const rowScores: number[] = [];
-
-  for (let y = 0; y < height; y += 1) {
-    const row = context.getImageData(0, y, width, 1).data;
-    let darkPixels = 0;
-    let samples = 0;
-
-    for (let x = 0; x < width; x += sampleStep) {
-      const offset = x * 4;
-      const brightness = (row[offset] + row[offset + 1] + row[offset + 2]) / 3;
-      if (brightness < 28) darkPixels += 1;
-      samples += 1;
-    }
-
-    rowScores.push(darkPixels / samples);
-  }
-
-  const bands: Array<{ y: number; score: number; height: number }> = [];
-  let start = -1;
-  let scoreSum = 0;
-
-  rowScores.forEach((score, y) => {
-    if (score > 0.78) {
-      if (start < 0) start = y;
-      scoreSum += score;
-      return;
-    }
-
-    if (start >= 0) {
-      const bandHeight = y - start;
-      if (bandHeight >= 4) bands.push({ y: Math.round(start + bandHeight / 2), score: scoreSum / bandHeight, height: bandHeight });
-      start = -1;
-      scoreSum = 0;
-    }
-  });
-
-  if (start >= 0) {
-    const bandHeight = height - start;
-    if (bandHeight >= 4) bands.push({ y: Math.round(start + bandHeight / 2), score: scoreSum / bandHeight, height: bandHeight });
-  }
-
-  const internalBands = bands.filter((band) => band.y > height * 0.04 && band.y < height * 0.96);
-  const boundaries = [0];
-
-  for (let index = 1; index < panelCount; index += 1) {
-    const expected = (height / panelCount) * index;
-    const nearest = internalBands
-      .filter((band) => Math.abs(band.y - expected) < height / panelCount / 2)
-      .sort((a, b) => Math.abs(a.y - expected) - Math.abs(b.y - expected) || b.score - a.score)[0];
-
-    if (!nearest) return equalBoxes();
-    boundaries.push(nearest.y);
-  }
-
-  boundaries.push(height);
-  const sorted = [...new Set(boundaries)].sort((a, b) => a - b);
-  if (sorted.length !== panelCount + 1) return equalBoxes();
-
-  const dividerPad = Math.max(2, Math.floor(height / panelCount / 80));
-  const boxes = Array.from({ length: panelCount }, (_, index) => {
-    const rawStart = sorted[index];
-    const rawEnd = sorted[index + 1];
-    const y = index === 0 ? rawStart : Math.min(rawStart + dividerPad, rawEnd - 1);
-    const end = index === panelCount - 1 ? rawEnd : Math.max(rawEnd - dividerPad, y + 1);
-
-    return {
-      x: 0,
-      y,
-      width,
-      height: end - y,
-    };
-  });
-
-  return boxes.every((box) => box.height > height / panelCount / 3) ? boxes : equalBoxes();
 }
 
 export function DashboardClient() {
@@ -500,7 +363,7 @@ export function DashboardClient() {
       }
       if (currentJob.status === "completed") return currentJob;
       if (currentJob.status === "failed") {
-        throw new Error(currentJob.error || "Codex 视频提示词任务失败");
+        throw new CodexVideoPromptJobFailedError(currentJob.error || "Codex 视频提示词任务失败");
       }
       await new Promise((resolve) => setTimeout(resolve, 2500));
     }
@@ -519,13 +382,14 @@ export function DashboardClient() {
       setGenerationProgress("已创建 Codex 视频提示词任务，请确认 video-prompt:codex-worker 正在运行。");
       const completedJob = await pollVideoPromptCodexJob(job.id);
       if (!completedJob.result) {
-        throw new Error("Codex 视频提示词任务完成但没有生成结果");
+        throw new CodexVideoPromptJobFailedError("Codex 视频提示词任务完成但没有生成结果");
       }
       setResult(completedJob.result as AnalysisResult);
       return completedJob.result as AnalysisResult;
     } catch (err) {
-      console.warn("video-prompt codex job unavailable, falling back to /api/analyze", err);
-      setGenerationProgress("Codex 视频提示词任务不可用，正在回退到在线模型生成。");
+      if (err instanceof CodexVideoPromptJobFailedError) throw err;
+      console.warn("video-prompt codex endpoint unavailable, falling back to /api/analyze", err);
+      setGenerationProgress("本地 Codex 视频提示词入口暂不可用，正在回退到在线模型生成。");
       return requestAnalysisViaProvider(inputScript, inputDurationSeconds, projectId, versionId);
     }
   }
@@ -546,8 +410,10 @@ export function DashboardClient() {
         versionId: versionId || undefined,
       }),
     });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error);
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.error || `在线模型生成失败：${res.status}`);
+    }
     return data.result as AnalysisResult;
   }
 
@@ -788,6 +654,12 @@ export function DashboardClient() {
           batchTotal: panel.batchTotal,
           size: panel.size,
           quality: panel.quality,
+          attempts: panel.attempts,
+          sourceImagePath: panel.sourceImagePath,
+          outputHash: panel.outputHash,
+          imageFingerprint: panel.imageFingerprint,
+          codexLogPath: panel.codexLogPath,
+          duplicateOfPanelId: panel.duplicateOfPanelId,
         },
       }));
 
@@ -857,24 +729,6 @@ export function DashboardClient() {
     throw new Error("Codex 分镜图任务等待超时，请确认 storyboard:codex-worker 正在运行。");
   }
 
-  async function generateStoryboardImageDirect(storyboardResult: AnalysisResult) {
-    const res = await fetch("/api/storyboard-image", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        title: storyboardResult.title,
-        style: `${storyboardResult.style}，16:9 彩色电影级分镜图，电影光影，写实概念美术`,
-        storyboard: storyboardResult.storyboard,
-      }),
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error);
-
-    const panels = normalizeStoryboardPanels(data.panels) || await cropStoryboardPanels(data.imageUrl, storyboardResult.storyboard);
-    const savedStoryboardImageUrl = await saveStoryboardImageReference(data.imageUrl, data.prompt);
-    setStoryboardImage({ sheetUrl: savedStoryboardImageUrl || data.imageUrl, prompt: data.prompt, panels });
-  }
-
   async function generateStoryboardImage() {
     if (!result) return;
 
@@ -884,8 +738,7 @@ export function DashboardClient() {
 
     try {
       if (!projectSave?.saved || !projectSave.projectId || !projectSave.versionId) {
-        await generateStoryboardImageDirect(result);
-        return;
+        throw new Error("请先完成本次生成并保存项目后，再生成镜头分镜图。镜头分镜图会保存为项目 VisualAsset。");
       }
 
       const job = await createStoryboardCodexJob(result);
@@ -1131,8 +984,7 @@ export function DashboardClient() {
                 {result.storyboard.map((shot) => {
                   const panelImage = storyboardImage?.panels[shot.shotNumber];
                   return (
-                    <Fragment key={shot.shotNumber}>
-                    <tr className="border-t border-cyan-300/10 align-top text-slate-300">
+                    <tr key={shot.shotNumber} className="border-t border-cyan-300/10 align-top text-slate-300">
                       <td className="p-4 font-bold text-cyan-200">{shot.shotNumber}</td>
                       <td className="p-4 text-slate-400">{shot.timeRange || "-"}</td>
                       <td className="max-w-[360px] p-4">{shot.visual}</td>
@@ -1175,42 +1027,6 @@ export function DashboardClient() {
                       </td>
                       <td className="p-4"><CopyButton text={shot.videoPrompt} label="复制提示词" /></td>
                     </tr>
-                    <tr className="border-t border-cyan-300/6 bg-slate-950/28 text-slate-300">
-                      <td className="p-4 text-xs font-bold uppercase text-cyan-200/70" colSpan={3}>
-                        镜头资产
-                      </td>
-                      <td className="p-4" colSpan={11}>
-                        <div className="grid gap-3 md:grid-cols-4">
-                          <div className="rounded-xl border border-cyan-300/14 bg-slate-950/65 p-3">
-                            <div className="mb-2 flex items-center justify-between gap-2">
-                              <span className="text-xs font-semibold text-cyan-100">镜头分镜图</span>
-                              <span className="text-[11px] text-slate-500">SHOT_STORYBOARD</span>
-                            </div>
-                            {panelImage ? (
-                              <button
-                                onClick={() => setSelectedShot(shot)}
-                                className="block overflow-hidden rounded-lg border border-white/10 bg-black/30 text-left transition hover:border-cyan-200/45"
-                              >
-                                <img src={panelImage} alt={`镜头 ${shot.shotNumber} 分镜图`} className="aspect-video w-full object-cover" />
-                              </button>
-                            ) : (
-                              <div className="flex aspect-video items-center justify-center rounded-lg border border-dashed border-cyan-300/18 bg-slate-950/70 text-xs text-slate-500">
-                                待生成
-                              </div>
-                            )}
-                          </div>
-                          {["角色三视图", "场景图", "道具图"].map((label) => (
-                            <div key={label} className="rounded-xl border border-dashed border-cyan-300/12 bg-slate-950/35 p-3">
-                              <div className="mb-2 text-xs font-semibold text-slate-300">{label}</div>
-                              <div className="flex aspect-video items-center justify-center rounded-lg bg-black/20 text-xs text-slate-600">
-                                后续资产位
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </td>
-                    </tr>
-                    </Fragment>
                   );
                 })}
               </tbody>

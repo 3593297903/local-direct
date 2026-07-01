@@ -7,7 +7,7 @@ test("sidebar collapses by default, expands on hover, and highlights routes", as
   const sidebarSource = await readFile(join(process.cwd(), "components", "Sidebar.tsx"), "utf8");
 
   assert.match(sidebarSource, /usePathname/);
-  assert.match(sidebarSource, /useSearchParams/);
+  assert.doesNotMatch(sidebarSource, /useSearchParams/);
   assert.match(sidebarSource, /group\/sidebar/);
   assert.match(sidebarSource, /w-\[4\.25rem\]/);
   assert.match(sidebarSource, /group-hover\/sidebar:w-48/);

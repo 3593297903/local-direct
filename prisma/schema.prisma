@@ -300,9 +300,14 @@ model StoryboardShot {
   scene            String?
   visual           String?
   shotType         String?
+  composition      String?
   cameraMovement   String?
+  lighting         String?
+  sound            String?
+  dialogue         String?
   emotion          String?
   transition       String?
+  shotPurpose      String?
   firstFramePrompt String?
   videoPrompt      String?
   lastFramePrompt  String?

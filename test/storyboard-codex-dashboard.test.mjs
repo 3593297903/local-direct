@@ -17,6 +17,15 @@ test("dashboard creates and polls Codex storyboard image jobs", () => {
   assert.doesNotMatch(source, /completedJob\.sheetUrl\) throw/);
 });
 
+test("dashboard requires saved projects and does not fall back to the legacy sheet endpoint", () => {
+  const source = readFileSync("components/DashboardClient.tsx", "utf8");
+
+  assert.doesNotMatch(source, /generateStoryboardImageDirect/);
+  assert.doesNotMatch(source, /fetch\("\/api\/storyboard-image",/);
+  assert.match(source, /createStoryboardCodexJob\(result\)/);
+  assert.match(source, /projectSave\?\.saved/);
+});
+
 test("dashboard waits long enough for five local Codex storyboard panels", () => {
   const source = readFileSync("components/DashboardClient.tsx", "utf8");
 

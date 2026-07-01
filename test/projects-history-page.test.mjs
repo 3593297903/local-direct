@@ -55,10 +55,35 @@ test("projects page shows saved prompt history and supports resume editing", () 
 
   assert.match(page, /<Sidebar \/>/);
   assert.match(page, /<ProjectsClient \/>/);
-  assert.match(client, /我的项目/);
+  assert.match(client, /项目列表/);
   assert.match(client, /第 \{version\.versionNumber\} 集/);
   assert.match(client, /storyboardImageUrl/);
   assert.match(client, /vd_resume_script/);
   assert.match(client, /vd_resume_version_id/);
   assert.match(client, /下载 DOCX/);
+});
+
+test("projects page puts global project actions in the project list toolbar", () => {
+  const client = readFileSync("components/ProjectsClient.tsx", "utf8");
+  const styles = readFileSync("app/globals.css", "utf8");
+
+  assert.doesNotMatch(client, /projects-header/);
+  assert.match(client, /projects-list-toolbar/);
+  assert.match(client, /projects-list-actions/);
+  assert.match(client, /projects-list-action-button/);
+  assert.match(styles, /\.projects-list-action-button/);
+  assert.ok(client.indexOf("项目列表") < client.indexOf("新建生成"));
+});
+
+test("projects detail keeps episode selection in a fixed scrollable dock", () => {
+  const client = readFileSync("components/ProjectsClient.tsx", "utf8");
+  const styles = readFileSync("app/globals.css", "utf8");
+
+  assert.match(client, /projects-version-dock/);
+  assert.match(client, /projects-version-list/);
+  assert.match(client, /projects-version-button/);
+  assert.doesNotMatch(client, /selectedStoryboardAssets/);
+  assert.match(styles, /\.projects-version-list/);
+  assert.match(styles, /max-height:\s*15rem/);
+  assert.match(styles, /overflow-y:\s*auto/);
 });

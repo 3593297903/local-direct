@@ -75,3 +75,13 @@ test("auth cookies are secure only when the configured app URL is HTTPS", () => 
   assert.match(adminLogout, /secure: shouldUseSecureCookie\(\)/);
   assert.doesNotMatch(authProxy, /secure: process\.env\.NODE_ENV === "production"/);
 });
+
+test("middleware does not refresh legacy Supabase sessions for Nest JWT auth", () => {
+  const middleware = readFileSync("middleware.ts", "utf8");
+
+  assert.match(middleware, /NextResponse\.next/);
+  assert.doesNotMatch(middleware, /@supabase\/ssr/);
+  assert.doesNotMatch(middleware, /createServerClient/);
+  assert.doesNotMatch(middleware, /supabase\.auth\.getUser/);
+  assert.doesNotMatch(middleware, /NEXT_PUBLIC_SUPABASE/);
+});

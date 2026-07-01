@@ -20,7 +20,7 @@ const RequestSchema = z.object({
   projectId: z.string().uuid(),
   versionId: z.string().uuid(),
   title: z.string().min(1).default("AI 视频分镜图"),
-  style: z.string().min(1).default("黑白铅笔电影分镜"),
+  style: z.string().min(1).default("16:9 彩色电影级分镜图，电影光影，写实概念美术"),
   storyboard: z.array(ShotSchema).min(1).max(8),
   size: z.string().optional(),
   quality: z.string().optional(),

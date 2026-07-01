@@ -130,6 +130,27 @@ function extractJson(text: string) {
   return trimmed;
 }
 
+function parseProviderJson(text: string, meta: { requestId?: string; provider: string; model: string }) {
+  const extracted = extractJson(text);
+  try {
+    return JSON.parse(extracted);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      const preview = text.replace(/\s+/g, " ").slice(0, 240);
+      logger.warn("ai_provider_non_json_response", {
+        requestId: meta.requestId,
+        provider: meta.provider,
+        model: meta.model,
+        preview,
+      });
+      throw new Error(
+        `AI provider returned non-JSON response (${meta.provider}/${meta.model}). Please retry or use the local Codex generator. Preview: ${preview}`,
+      );
+    }
+    throw error;
+  }
+}
+
 const DOCUMENT_TEMPLATE_TASK = [
   "严格按用户提供的 Word 文档水准生成：文案分析 -> 文案到剧本 -> 剧本到专业电影脚本 -> 电影脚本到完整 AI 视频提示词。",
   "所有展示给用户的视频提示词必须使用中文。不要输出英文完整提示词，不要用英文段落替代中文描述；除 AI / JSON / 16:9 / 35mm 等必要术语外，主体内容必须是中文。",
@@ -635,7 +656,7 @@ async function callOpenAICompatible(input: AnalyzeScriptInput & { provider: stri
   const content = data.choices?.[0]?.message?.content;
   if (!content) throw new Error("AI returned empty content");
 
-  const parsed = JSON.parse(extractJson(content));
+  const parsed = parseProviderJson(content, { requestId: input.requestId, provider, model });
   const result = repairTemplatePlaceholders(AnalysisSchema.parse(parsed));
   assertNoTemplatePlaceholders(result);
   logger.info("ai_provider_request_completed", {
@@ -721,7 +742,7 @@ async function callAnthropic(input: AnalyzeScriptInput) {
 
   const data = await res.json();
   const text = data.content?.map((c: { text?: string }) => c.text).join("\n") || "";
-  const parsed = JSON.parse(extractJson(text));
+  const parsed = parseProviderJson(text, { requestId: input.requestId, provider, model });
   const result = repairTemplatePlaceholders(AnalysisSchema.parse(parsed));
   assertNoTemplatePlaceholders(result);
   logger.info("ai_provider_request_completed", {

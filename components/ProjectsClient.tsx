@@ -1,16 +1,23 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  BookOpen,
+  Boxes,
+  Building2,
   CalendarClock,
+  Check,
+  Clapperboard,
   Copy,
   Download,
   Edit3,
   FileText,
   Image as ImageIcon,
   Loader2,
+  Package,
   RefreshCw,
   Trash2,
+  UserRound,
 } from "lucide-react";
 
 const SHOW_DIRECTOR_MEMORY = false;
@@ -31,9 +38,14 @@ type ProjectShot = {
   scene?: string | null;
   visual?: string | null;
   shotType?: string | null;
+  composition?: string | null;
   cameraMovement?: string | null;
+  lighting?: string | null;
+  sound?: string | null;
+  dialogue?: string | null;
   emotion?: string | null;
   transition?: string | null;
+  shotPurpose?: string | null;
   firstFramePrompt?: string | null;
   videoPrompt?: string | null;
   lastFramePrompt?: string | null;
@@ -78,6 +90,9 @@ type ProjectVisualEntity = {
   createdAt?: string;
   updatedAt?: string;
 };
+
+type ProjectDetailView = "episodes" | "assets";
+type AssetLibraryType = "CHARACTER" | "SCENE" | "PROP" | "STYLE";
 
 type ShotVisualReference = {
   id: string;
@@ -238,22 +253,21 @@ function getShotAssets(version: ProjectVersion, shot: ProjectShot, type?: Visual
   });
 }
 
+function getProjectVisualAssets(project: ProjectDetail | null) {
+  return (project?.versions || []).flatMap((version) => version.visualAssets || []);
+}
+
+function getEntityVisualAssets(project: ProjectDetail | null, entity: ProjectVisualEntity) {
+  return getProjectVisualAssets(project).filter((asset) => asset.entityId === entity.id);
+}
+
+function getPrimaryEntityAsset(project: ProjectDetail | null, entity: ProjectVisualEntity) {
+  const assets = getEntityVisualAssets(project, entity);
+  return assets.find((asset) => asset.id === entity.primaryAssetId) || assets.find((asset) => asset.isPrimary) || assets[0] || null;
+}
+
 function getProjectVisualEntities(project: ProjectDetail | null, type?: ProjectVisualEntity["type"]) {
   return (project?.visualEntities || []).filter((entity) => !type || entity.type === type);
-}
-
-function getVisualEntityById(project: ProjectDetail | null, entityId: string) {
-  return (project?.visualEntities || []).find((entity) => entity.id === entityId) || null;
-}
-
-function getShotVisualReferences(project: ProjectDetail | null, version: ProjectVersion, shot: ProjectShot) {
-  return (version.shotVisualReferences || [])
-    .filter((reference) => reference.shotId === shot.id)
-    .map((reference) => ({
-      ...reference,
-      entity: getVisualEntityById(project, reference.entityId),
-    }))
-    .filter((reference) => reference.entity);
 }
 
 function getVisualEntityStatusLabel(status?: string | null) {
@@ -276,29 +290,33 @@ export function ProjectsClient() {
   const [checkedProjectIds, setCheckedProjectIds] = useState<string[]>([]);
   const [deletingProjects, setDeletingProjects] = useState(false);
   const [deletingEpisode, setDeletingEpisode] = useState(false);
+  const [projectDetailView, setProjectDetailView] = useState<ProjectDetailView>("episodes");
+  const [activeAssetType, setActiveAssetType] = useState<AssetLibraryType>("CHARACTER");
 
   const selectedVersion = useMemo(() => {
     if (!project) return null;
     return project.versions.find((version) => version.id === selectedVersionId) || project.versions[0] || null;
   }, [project, selectedVersionId]);
 
-  const selectedStoryboardAssets = useMemo(
-    () => (selectedVersion?.visualAssets || []).filter((asset) => asset.type === "SHOT_STORYBOARD" && asset.imageUrl),
-    [selectedVersion],
-  );
-
-  const visualBibleSections = useMemo(
+  const projectAssetLibrarySections = useMemo(
     () => [
-      { type: "CHARACTER", label: "角色", empty: "暂无固定角色" },
-      { type: "SCENE", label: "场景", empty: "暂无固定场景" },
-      { type: "PROP", label: "道具", empty: "暂无固定道具" },
-      { type: "STYLE", label: "风格锁定", empty: "暂无风格锁定" },
+      { type: "CHARACTER" as const, label: "角色", assetLabel: "角色三视图", empty: "暂无角色资产", icon: UserRound },
+      { type: "SCENE" as const, label: "场景", assetLabel: "场景图", empty: "暂无场景资产", icon: Building2 },
+      { type: "PROP" as const, label: "道具", assetLabel: "道具图", empty: "暂无道具资产", icon: Package },
+      { type: "STYLE" as const, label: "风格", assetLabel: "风格参考", empty: "暂无风格资产", icon: Boxes },
     ].map((section) => ({
       ...section,
       entities: getProjectVisualEntities(project, section.type),
+      assetCount: getProjectVisualEntities(project, section.type).reduce(
+        (count, entity) => count + getEntityVisualAssets(project, entity).length,
+        0,
+      ),
     })),
     [project],
   );
+
+  const activeAssetLibrarySection =
+    projectAssetLibrarySections.find((section) => section.type === activeAssetType) || projectAssetLibrarySections[0];
 
   useEffect(() => {
     let active = true;
@@ -352,6 +370,11 @@ export function ProjectsClient() {
   useEffect(() => {
     void reloadSelectedProject(selectedProjectId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    setProjectDetailView("episodes");
+    setActiveAssetType("CHARACTER");
   }, [selectedProjectId]);
 
   function resumeEditing() {
@@ -557,41 +580,6 @@ export function ProjectsClient() {
 
   return (
     <div className="projects-page-shell relative min-h-[calc(100vh-4rem)] text-slate-100">
-      <div className="projects-header mb-5 rounded-2xl p-5 md:p-6">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <div className="mb-2 text-xs uppercase tracking-wide text-cyan-200/70">Project History</div>
-            <h1 className="text-3xl font-black text-white">我的项目</h1>
-            <p className="mt-2 text-sm text-slate-400">
-              这里保存生成过的视频提示词、剧集记录、镜头表和分镜图。
-            </p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={deleteCheckedProjects}
-              disabled={deletingProjects}
-              className={`projects-action-button ${
-                deleteMode
-                  ? "projects-action-danger"
-                  : ""
-              } disabled:cursor-not-allowed disabled:opacity-60`}
-            >
-              {deletingProjects ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-              {deleteMode ? (checkedProjectIds.length ? `删除 ${checkedProjectIds.length}` : "取消删除") : "删除"}
-            </button>
-            <button
-              type="button"
-              onClick={startNewProject}
-              className="projects-action-button projects-action-primary"
-            >
-              <Edit3 className="h-4 w-4" />
-              新建生成
-            </button>
-          </div>
-        </div>
-      </div>
-
       {listError && (
         <div className="mb-4 rounded-xl border border-red-400/20 bg-red-500/10 p-3 text-sm text-red-100">
           {listError === "Unauthorized" ? (
@@ -609,14 +597,41 @@ export function ProjectsClient() {
 
       <div className="grid gap-5 xl:grid-cols-[360px_1fr]">
         <section className="projects-list-panel rounded-2xl p-3">
-          <div className="mb-3 flex items-center justify-between px-2 pt-1">
-            <h2 className="font-bold text-white">项目列表</h2>
-            {loadingList && <Loader2 className="h-4 w-4 animate-spin text-cyan-100" />}
+          <div className="projects-list-toolbar mb-3 flex items-center justify-between gap-2 px-2 pt-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <h2 className="shrink-0 font-bold text-white">项目列表</h2>
+              {loadingList && <Loader2 className="h-4 w-4 animate-spin text-cyan-100" />}
+            </div>
+            <div className="projects-list-actions flex shrink-0 items-center gap-1.5">
+              <button
+                type="button"
+                onClick={deleteCheckedProjects}
+                disabled={deletingProjects}
+                title={deleteMode ? "确认删除或取消删除模式" : "进入项目删除模式"}
+                className={`projects-list-action-button ${
+                  deleteMode
+                    ? "projects-list-action-danger"
+                    : ""
+                } disabled:cursor-not-allowed disabled:opacity-60`}
+              >
+                {deletingProjects ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                <span>{deleteMode ? (checkedProjectIds.length ? `删除 ${checkedProjectIds.length}` : "取消") : "删除"}</span>
+              </button>
+              <button
+                type="button"
+                onClick={startNewProject}
+                title="新建生成"
+                className="projects-list-action-button projects-list-action-primary"
+              >
+                <Edit3 className="h-3.5 w-3.5" />
+                <span>新建生成</span>
+              </button>
+            </div>
           </div>
 
           {deleteMode && (
             <p className="mb-3 px-2 text-xs text-red-100/75">
-              删除模式：点击项目右侧的框勾选，再点击顶部删除。
+              删除模式：点击项目右侧的框勾选，再点击列表右上角删除。
             </p>
           )}
 
@@ -702,6 +717,51 @@ export function ProjectsClient() {
 
           {!loadingDetail && !projectDetailError && project && selectedVersion && (
             <div className="space-y-5">
+              <div className="projects-project-stepper" role="tablist" aria-label="项目工作流">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={projectDetailView === "episodes"}
+                  onClick={() => setProjectDetailView("episodes")}
+                  className={`projects-stepper-item ${
+                    projectDetailView === "episodes"
+                      ? "projects-stepper-active"
+                      : projectDetailView === "assets"
+                        ? "projects-stepper-complete"
+                        : ""
+                  }`}
+                >
+                  <span className="projects-stepper-number">
+                    {projectDetailView === "assets" ? <Check className="h-3.5 w-3.5" /> : "1"}
+                  </span>
+                  <BookOpen className="h-4 w-4" />
+                  <span>剧集</span>
+                </button>
+                <span className="projects-stepper-connector" aria-hidden="true" />
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={projectDetailView === "assets"}
+                  onClick={() => setProjectDetailView("assets")}
+                  className={`projects-stepper-item ${projectDetailView === "assets" ? "projects-stepper-active" : ""}`}
+                >
+                  <span className="projects-stepper-number">2</span>
+                  <Boxes className="h-4 w-4" />
+                  <span>资产库</span>
+                </button>
+                <span className="projects-stepper-connector" aria-hidden="true" />
+                <button
+                  type="button"
+                  className="projects-stepper-item projects-stepper-disabled"
+                  disabled
+                  title="后续接入分集视频生成"
+                >
+                  <span className="projects-stepper-number">3</span>
+                  <Clapperboard className="h-4 w-4" />
+                  <span>分集视频</span>
+                </button>
+              </div>
+
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
                   <div className="text-xs uppercase tracking-wide text-cyan-200/70">Saved Project</div>
@@ -750,77 +810,8 @@ export function ProjectsClient() {
                 </div>
               </div>
 
-              <div className="flex flex-wrap gap-2">
-                {project.versions.map((version) => (
-                  <button
-                    key={version.id}
-                    onClick={() => setSelectedVersionId(version.id)}
-                    className={`rounded-xl border px-3 py-2 text-sm font-semibold transition ${
-                      version.id === selectedVersion.id
-                        ? "border-cyan-200/50 bg-cyan-300/[0.11] text-cyan-50"
-                        : "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.08]"
-                    }`}
-                  >
-                    第 {version.versionNumber} 集
-                    <span className="ml-2 text-xs text-slate-500">{formatDate(version.createdAt)}</span>
-                  </button>
-                ))}
-              </div>
-
-              <section className="rounded-2xl border border-cyan-300/14 bg-slate-950/32 p-4">
-                <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <div className="text-xs uppercase tracking-wide text-cyan-200/70">Project Visual Bible</div>
-                    <h3 className="mt-1 text-lg font-black text-white">项目视觉圣经</h3>
-                  </div>
-                  <div className="text-xs text-slate-500">
-                    角色、场景、道具在项目内固定，镜头只引用这些资产。
-                  </div>
-                </div>
-
-                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                  {visualBibleSections.map((section) => (
-                    <div key={section.type} className="rounded-xl border border-white/10 bg-slate-950/55 p-3">
-                      <div className="mb-3 flex items-center justify-between gap-2">
-                        <div className="text-sm font-bold text-white">{section.label}</div>
-                        <span className="rounded-full border border-cyan-200/15 px-2 py-0.5 text-[11px] text-cyan-100/70">
-                          {section.entities.length}
-                        </span>
-                      </div>
-
-                      <div className="space-y-2">
-                        {section.entities.map((entity) => (
-                          <div key={entity.id} className="rounded-lg border border-white/10 bg-white/[0.03] p-3">
-                            <div className="flex items-start justify-between gap-3">
-                              <div className="min-w-0">
-                                <div className="truncate font-semibold text-white">{entity.name}</div>
-                                <div className="mt-1 text-xs text-slate-500">
-                                  @{entity.key} · {getVisualEntityStatusLabel(entity.status)}
-                                </div>
-                              </div>
-                              {entity.status === "LOCKED" && (
-                                <span className="shrink-0 rounded-full border border-cyan-200/20 bg-cyan-300/10 px-2 py-0.5 text-[11px] font-semibold text-cyan-50">
-                                  已锁定
-                                </span>
-                              )}
-                            </div>
-                            <p className="mt-2 line-clamp-3 text-xs leading-5 text-slate-400">
-                              {entity.visualLock || entity.canonicalPrompt || entity.negativeLock || "等待生成或确认视觉锁定。"}
-                            </p>
-                          </div>
-                        ))}
-
-                        {!section.entities.length && (
-                          <div className="rounded-lg border border-dashed border-cyan-300/12 bg-black/20 p-3 text-xs leading-5 text-slate-500">
-                            {section.empty}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
-
+              {projectDetailView === "episodes" && (
+                <>
               <div className="grid gap-4 lg:grid-cols-2">
                 <div className="projects-content-card rounded-2xl p-4">
                   <div className="mb-3 flex items-center gap-2 text-sm font-bold text-white">
@@ -831,28 +822,29 @@ export function ProjectsClient() {
                     {selectedVersion.optimizedScript || selectedVersion.originalScript}
                   </div>
                 </div>
-                <div className="projects-content-card rounded-2xl p-4">
-                  <div className="mb-3 flex items-center gap-2 text-sm font-bold text-white">
-                    <ImageIcon className="h-4 w-4 text-cyan-100" />
-                    镜头资产概览
+                <div className="projects-content-card projects-version-dock rounded-2xl p-4">
+                  <div className="mb-3 flex items-center justify-between gap-3 text-sm font-bold text-white">
+                    <div className="flex items-center gap-2">
+                      <CalendarClock className="h-4 w-4 text-cyan-100" />
+                      剧集列表
+                    </div>
+                    <span className="text-xs font-semibold text-slate-500">共 {project.versions.length} 集</span>
                   </div>
-                  {selectedStoryboardAssets[0]?.imageUrl ? (
-                    <div className="rounded-xl border border-white/10 bg-black/30">
-                      <img
-                        src={selectedStoryboardAssets[0].imageUrl}
-                        alt="最新镜头分镜图"
-                        className="aspect-video w-full object-cover"
-                      />
-                      <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs text-slate-400">
-                        <span>已保存 {selectedStoryboardAssets.length} 张镜头分镜图</span>
-                        <span>{selectedStoryboardAssets[0].name}</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="flex h-48 items-center justify-center rounded-xl border border-dashed border-cyan-300/16 bg-slate-950/60 px-4 text-center text-sm text-slate-500">
-                      这一集还没有保存镜头资产。回到工作台点击“生成镜头分镜图”后，图片会按镜头显示在下方。
-                    </div>
-                  )}
+                  <div className="projects-version-list" aria-label="项目剧集列表">
+                    {project.versions.map((version) => (
+                      <button
+                        key={version.id}
+                        type="button"
+                        onClick={() => setSelectedVersionId(version.id)}
+                        className={`projects-version-button ${
+                          version.id === selectedVersion.id ? "projects-version-button-active" : ""
+                        }`}
+                      >
+                        <span>第 {version.versionNumber} 集</span>
+                        <span>{formatDate(version.createdAt)}</span>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -1008,106 +1000,157 @@ export function ProjectsClient() {
               )}
 
               <div className="overflow-x-auto rounded-2xl border border-slate-300/14 bg-slate-950/35">
-                <table className="w-full min-w-[980px] border-collapse text-left text-sm">
+                <table className="w-full min-w-[1680px] border-collapse text-left text-sm">
                   <thead className="bg-cyan-300/[0.06] text-xs uppercase text-cyan-100/70">
                     <tr>
                       <th className="p-3">镜头</th>
                       <th className="p-3">画面</th>
+                      <th className="p-3">镜头分镜图</th>
                       <th className="p-3">景别</th>
+                      <th className="p-3">机位/构图</th>
                       <th className="p-3">运镜</th>
+                      <th className="p-3">光影/色调</th>
+                      <th className="p-3">声音/台词</th>
                       <th className="p-3">情绪</th>
                       <th className="p-3">转场</th>
+                      <th className="p-3">镜头目的</th>
                       <th className="p-3">视频提示词</th>
                     </tr>
                   </thead>
                   <tbody>
                     {selectedVersion.shots.map((shot) => {
                       const storyboardAssets = getShotAssets(selectedVersion, shot, "SHOT_STORYBOARD");
-                      const fixedReferences = getShotVisualReferences(project, selectedVersion, shot);
                       return (
-                        <Fragment key={shot.id}>
-                          <tr className="border-t border-cyan-300/10 align-top text-slate-300">
+                          <tr key={shot.id} className="border-t border-cyan-300/10 align-top text-slate-300">
                             <td className="p-3 font-bold text-cyan-100">{shot.shotNumber}</td>
                             <td className="max-w-[280px] p-3">{shot.visual || shot.scene || "-"}</td>
+                            <td className="w-48 p-3">
+                              {storyboardAssets[0]?.imageUrl ? (
+                                <a
+                                  href={storyboardAssets[0].imageUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="block w-44 overflow-hidden rounded-xl border border-cyan-300/16 bg-slate-950 transition hover:border-cyan-200/45"
+                                >
+                                  <img
+                                    src={storyboardAssets[0].imageUrl}
+                                    alt={`镜头 ${shot.shotNumber} 分镜图`}
+                                    className="aspect-video w-full object-cover"
+                                  />
+                                </a>
+                              ) : (
+                                <span className="inline-flex w-44 items-center justify-center rounded-xl border border-dashed border-cyan-300/18 bg-slate-950/60 px-3 py-7 text-center text-xs text-slate-500">
+                                  生成后显示
+                                </span>
+                              )}
+                            </td>
                             <td className="p-3 text-slate-400">{shot.shotType || "-"}</td>
+                            <td className="p-3 text-slate-400">{shot.composition || "-"}</td>
                             <td className="p-3 text-slate-400">{shot.cameraMovement || "-"}</td>
+                            <td className="p-3 text-slate-400">{shot.lighting || "-"}</td>
+                            <td className="max-w-[260px] p-3 text-slate-400">
+                              <div>{shot.sound || "-"}</div>
+                              <div className="mt-2 text-slate-500">台词：{shot.dialogue || "-"}</div>
+                            </td>
                             <td className="p-3 text-slate-400">{shot.emotion || "-"}</td>
                             <td className="p-3 text-slate-400">{shot.transition || "-"}</td>
+                            <td className="max-w-[260px] p-3 text-slate-400">{shot.shotPurpose || "-"}</td>
                             <td className="max-w-[360px] p-3 text-slate-400">{shot.videoPrompt || "-"}</td>
                           </tr>
-                          <tr className="border-t border-cyan-300/6 bg-slate-950/28 text-slate-300">
-                            <td className="p-3 text-xs font-bold uppercase text-cyan-200/70" colSpan={2}>
-                              镜头资产
-                            </td>
-                            <td className="p-3" colSpan={5}>
-                              <div className="mb-3 rounded-xl border border-cyan-300/12 bg-black/20 p-3">
-                                <div className="mb-2 text-xs font-bold text-cyan-100">引用固定资产</div>
-                                {fixedReferences.length ? (
-                                  <div className="flex flex-wrap gap-2">
-                                    {fixedReferences.map((reference) => (
-                                      <span
-                                        key={reference.id}
-                                        className="rounded-full border border-cyan-200/15 bg-cyan-300/[0.08] px-2.5 py-1 text-xs text-cyan-50"
-                                      >
-                                        @{reference.entity?.key} · {reference.entity?.name} · {reference.role || "SUBJECT"}
-                                      </span>
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <div className="text-xs text-slate-500">
-                                    暂未绑定固定角色、场景或道具；后续生成镜头图时建议先绑定项目视觉圣经资产。
-                                  </div>
-                                )}
-                              </div>
-                              <div className="grid gap-3 md:grid-cols-4">
-                                <div className="rounded-xl border border-cyan-300/14 bg-slate-950/65 p-3">
-                                  <div className="mb-2 flex items-center justify-between gap-2">
-                                    <span className="text-xs font-semibold text-cyan-100">镜头分镜图</span>
-                                    <span className="text-[11px] text-slate-500">SHOT_STORYBOARD</span>
-                                  </div>
-                                  {storyboardAssets[0]?.imageUrl ? (
-                                    <a
-                                      href={storyboardAssets[0].imageUrl}
-                                      target="_blank"
-                                      rel="noreferrer"
-                                      className="block overflow-hidden rounded-lg border border-white/10 bg-black/30 transition hover:border-cyan-200/45"
-                                    >
-                                      <img
-                                        src={storyboardAssets[0].imageUrl}
-                                        alt={`镜头 ${shot.shotNumber} 分镜图`}
-                                        className="aspect-video w-full object-cover"
-                                      />
-                                    </a>
-                                  ) : (
-                                    <div className="flex aspect-video items-center justify-center rounded-lg border border-dashed border-cyan-300/18 bg-slate-950/70 text-xs text-slate-500">
-                                      暂无资产
-                                    </div>
-                                  )}
-                                </div>
-                                {[
-                                  ["角色三视图", "CHARACTER_TURNAROUND"],
-                                  ["场景图", "SCENE_KEYART"],
-                                  ["道具图", "PROP_SHEET"],
-                                ].map(([label, assetType]) => (
-                                  <div key={assetType} className="rounded-xl border border-dashed border-cyan-300/12 bg-slate-950/35 p-3">
-                                    <div className="mb-2 flex items-center justify-between gap-2">
-                                      <span className="text-xs font-semibold text-slate-300">{label}</span>
-                                      <span className="text-[11px] text-slate-600">{assetType}</span>
-                                    </div>
-                                    <div className="flex aspect-video items-center justify-center rounded-lg bg-black/20 text-xs text-slate-600">
-                                      待扩展
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </td>
-                          </tr>
-                        </Fragment>
                       );
                     })}
                   </tbody>
                 </table>
               </div>
+                </>
+              )}
+
+              {projectDetailView === "assets" && (
+                <section className="projects-asset-library rounded-2xl border border-cyan-300/14 bg-slate-950/32 p-4">
+                  <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="text-xs uppercase tracking-wide text-cyan-200/70">Project Visual Bible</div>
+                      <h3 className="mt-1 text-lg font-black text-white">项目视觉圣经</h3>
+                      <p className="mt-2 text-sm text-slate-500">
+                        这里集中存放本项目固定的角色三视图、场景图、道具图和风格参考。
+                      </p>
+                    </div>
+                    <div className="rounded-full border border-cyan-200/15 bg-cyan-300/[0.08] px-3 py-1 text-xs font-semibold text-cyan-50">
+                      共 {projectAssetLibrarySections.reduce((count, section) => count + section.entities.length, 0)} 个资产对象
+                    </div>
+                  </div>
+
+                  <div className="projects-asset-tabs mb-5 flex flex-wrap gap-2" role="tablist" aria-label="资产库分类">
+                    {projectAssetLibrarySections.map((section) => {
+                      const Icon = section.icon;
+                      const active = section.type === activeAssetType;
+                      return (
+                        <button
+                          key={section.type}
+                          type="button"
+                          role="tab"
+                          aria-selected={active}
+                          onClick={() => setActiveAssetType(section.type)}
+                          className={`projects-asset-tab ${active ? "projects-asset-tab-active" : ""}`}
+                        >
+                          <Icon className="h-4 w-4" />
+                          <span>{section.label}</span>
+                          <span className="projects-asset-count">{section.entities.length}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="projects-asset-grid">
+                    {activeAssetLibrarySection.entities.map((entity) => {
+                      const entityAssets = getEntityVisualAssets(project, entity);
+                      const primaryAsset = getPrimaryEntityAsset(project, entity);
+
+                      return (
+                        <article key={entity.id} className="projects-asset-card">
+                          <div className="projects-asset-preview">
+                            {primaryAsset?.imageUrl ? (
+                              <img
+                                src={primaryAsset.imageUrl}
+                                alt={`${entity.name} ${activeAssetLibrarySection.assetLabel}`}
+                                className="h-full w-full object-cover"
+                              />
+                            ) : (
+                              <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center text-xs text-slate-500">
+                                <ImageIcon className="h-5 w-5 text-cyan-100/50" />
+                                <span>{activeAssetLibrarySection.assetLabel}待生成</span>
+                              </div>
+                            )}
+                          </div>
+                          <div className="p-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <h4 className="truncate text-sm font-bold text-white">{entity.name}</h4>
+                                <div className="mt-1 text-xs text-slate-500">
+                                  @{entity.key} · {entityAssets.length} 个{activeAssetLibrarySection.assetLabel}
+                                </div>
+                              </div>
+                              <span className="shrink-0 rounded-full border border-cyan-200/15 bg-cyan-300/[0.08] px-2 py-0.5 text-[11px] font-semibold text-cyan-50">
+                                {getVisualEntityStatusLabel(entity.status)}
+                              </span>
+                            </div>
+                            <p className="mt-3 line-clamp-3 text-xs leading-5 text-slate-400">
+                              {entity.visualLock || entity.canonicalPrompt || entity.negativeLock || "等待生成或确认视觉锁定。"}
+                            </p>
+                          </div>
+                        </article>
+                      );
+                    })}
+
+                    {!activeAssetLibrarySection.entities.length && (
+                      <div className="projects-asset-empty">
+                        <ImageIcon className="h-5 w-5 text-cyan-100/45" />
+                        <span>{activeAssetLibrarySection.empty}</span>
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
             </div>
           )}
         </section>

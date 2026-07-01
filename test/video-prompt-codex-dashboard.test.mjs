@@ -15,3 +15,11 @@ test("dashboard generates video prompts through local Codex jobs with analyze fa
   assert.match(source, /saveAnalysisProject\(script, singleResult, fullVideoPrompt/);
   assert.match(source, /video-prompt:codex-worker/);
 });
+
+test("dashboard preserves completed Codex job failures instead of blindly falling back", () => {
+  const source = readFileSync("components/DashboardClient.tsx", "utf8");
+
+  assert.match(source, /CodexVideoPromptJobFailedError/);
+  assert.match(source, /if \(err instanceof CodexVideoPromptJobFailedError\) throw err/);
+  assert.match(source, /res\.json\(\)\.catch\(\(\) => null\)/);
+});

@@ -16,7 +16,12 @@ export async function POST(request: Request, context: { params: Promise<{ jobId:
 
   try {
     const params = await context.params;
-    const job = await completeStoryboardCodexPanel(params.jobId, params.panelId);
+    const body = await request.json().catch(() => ({}));
+    const job = await completeStoryboardCodexPanel(params.jobId, params.panelId, {
+      sourceImagePath: typeof body?.sourceImagePath === "string" ? body.sourceImagePath : undefined,
+      imageFingerprint: typeof body?.imageFingerprint === "string" ? body.imageFingerprint : undefined,
+      codexLogPath: typeof body?.codexLogPath === "string" ? body.codexLogPath : undefined,
+    });
     return NextResponse.json({ ok: true, job });
   } catch (error: any) {
     return NextResponse.json(

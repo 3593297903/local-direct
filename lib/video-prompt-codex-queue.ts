@@ -45,6 +45,25 @@ type ClaimOptions = QueueOptions & {
 const TASK_ROOT = ".tmp-video-prompt-codex";
 const JOB_DIR = "jobs";
 const RESULT_DIR = "results";
+const REQUIRED_STORYBOARD_SHOT_FIELDS = [
+  "shotNumber",
+  "timeRange",
+  "scene",
+  "visual",
+  "shotType",
+  "composition",
+  "cameraMovement",
+  "lighting",
+  "sound",
+  "dialogue",
+  "emotion",
+  "transition",
+  "shotPurpose",
+  "firstFramePrompt",
+  "videoPrompt",
+  "lastFramePrompt",
+  "negativePrompt",
+];
 
 export class VideoPromptCodexQueueError extends Error {
   constructor(message: string) {
@@ -177,7 +196,12 @@ function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outp
     "Storyboard requirements:",
     "- Create a coherent shot list for the requested duration.",
     "- For a normal 15秒 request, return 5 shots unless the script clearly needs fewer.",
-    "- Every shot must include shotNumber, timeRange, scene, visual, shotType, cameraMovement, emotion, transition, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt.",
+    "- Every shot must include shotNumber, timeRange, scene, visual, shotType, composition, cameraMovement, lighting, sound, dialogue, emotion, transition, shotPurpose, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt.",
+    "- composition must describe camera position and frame composition.",
+    "- lighting must describe film lighting and color tone.",
+    "- sound must describe ambience, effects, or music.",
+    "- dialogue must contain the line spoken in the shot, or the exact string \"无\" when there is no dialogue.",
+    "- shotPurpose must explain why this shot exists in the sequence.",
     "",
     `Script: ${input.script}`,
     `Content type: ${input.contentType || "短剧 / 通用"}`,
@@ -271,7 +295,7 @@ async function ensureQueueDirs(rootDir: string) {
 
 async function readOutputJson(filePath: string) {
   try {
-    const result = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+    const result = JSON.parse(stripJsonBom(await readFile(filePath, "utf8"))) as Record<string, unknown>;
     validateAnalysisResultShape(result);
     return result;
   } catch (error) {
@@ -281,6 +305,10 @@ async function readOutputJson(filePath: string) {
         : `Codex did not produce valid video prompt JSON: ${filePath}`,
     );
   }
+}
+
+function stripJsonBom(value: string) {
+  return value.charCodeAt(0) === 0xfeff ? value.slice(1) : value;
 }
 
 async function isValidOutputJson(filePath: string) {
@@ -307,6 +335,23 @@ function validateAnalysisResultShape(result: Record<string, unknown>) {
   if (!Array.isArray(result.storyboard) || result.storyboard.length < 1) {
     throw new VideoPromptCodexQueueError("Video prompt JSON is missing storyboard");
   }
+  result.storyboard.forEach((shot, index) => {
+    if (!shot || typeof shot !== "object") {
+      throw new VideoPromptCodexQueueError(`Video prompt JSON storyboard[${index}] must be an object`);
+    }
+    const record = shot as Record<string, unknown>;
+    for (const field of REQUIRED_STORYBOARD_SHOT_FIELDS) {
+      if (field === "shotNumber") {
+        if (typeof record[field] !== "number" || !Number.isFinite(record[field])) {
+          throw new VideoPromptCodexQueueError(`Video prompt JSON is missing storyboard[${index}].${field}`);
+        }
+        continue;
+      }
+      if (typeof record[field] !== "string" || !record[field].trim()) {
+        throw new VideoPromptCodexQueueError(`Video prompt JSON is missing storyboard[${index}].${field}`);
+      }
+    }
+  });
 }
 
 function validateCreateInput(input: CreateVideoPromptCodexJobInput) {

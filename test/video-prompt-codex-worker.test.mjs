@@ -17,5 +17,6 @@ test("video prompt Codex worker invokes codex exec and reports job status", () =
   assert.match(source, /strict JSON/);
   assert.match(source, /AnalysisResult/);
   assert.match(source, /assertOutputJson/);
+  assert.match(source, /stripJsonBom/);
   assert.match(source, /VIDEO_PROMPT_CODEX_WORKER_TOKEN/);
 });

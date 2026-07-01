@@ -55,9 +55,14 @@ function sampleAnalysisResult() {
         scene: "厨房",
         visual: "自动窗帘打开，早餐机启动。",
         shotType: "中景",
+        composition: "eye-level medium shot with the table in the foreground",
         cameraMovement: "缓慢推进",
+        lighting: "soft morning window light with clean blue projection glow",
+        sound: "quiet kitchen ambience and gentle machine hum",
+        dialogue: "无",
         emotion: "平静",
         transition: "硬切",
+        shotPurpose: "establish the home routine and introduce the projection clue",
         firstFramePrompt: "未来厨房清晨。",
         videoPrompt: "未来厨房里早餐机启动，吐司机亮起。",
         lastFramePrompt: "吐司弹起。",
@@ -89,6 +94,11 @@ test("creates, claims, and completes a local Codex video prompt job", async () =
     assert.match(job.prompt, /optimizedScript/);
     assert.match(job.prompt, /workflow\.fullVideoPrompt/);
     assert.match(job.prompt, /storyboard/);
+    assert.match(job.prompt, /composition/);
+    assert.match(job.prompt, /lighting/);
+    assert.match(job.prompt, /sound/);
+    assert.match(job.prompt, /dialogue/);
+    assert.match(job.prompt, /shotPurpose/);
     assert.doesNotMatch(job.prompt, /external API/i);
     assert.match(job.outputPath, /tmp-video-prompt-codex[\\/]results[\\/]video-prompt-job-/);
     assert.equal(job.result, null);
@@ -142,6 +152,59 @@ test("stale running video prompt jobs can be reclaimed or failed", async () => {
     const failed = await failVideoPromptCodexJob(job.id, "codex failed", { rootDir });
     assert.equal(failed.status, "failed");
     assert.equal(failed.error, "codex failed");
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("completes a Codex video prompt job when the output JSON starts with UTF-8 BOM", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptCodexJob(
+      {
+        script: "A woman enters a quiet kitchen and sees a floating calendar projection.",
+        duration: "15 seconds",
+      },
+      { rootDir },
+    );
+
+    const claimed = await claimNextVideoPromptCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    mkdirSync(path.dirname(claimed.outputPath), { recursive: true });
+    writeFileSync(claimed.outputPath, `\uFEFF${JSON.stringify(sampleAnalysisResult(), null, 2)}`, "utf8");
+
+    const completed = await completeVideoPromptCodexJob(job.id, { rootDir });
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result.storyboard.length, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("rejects Codex video prompt JSON when storyboard production fields are missing", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptCodexJob(
+      {
+        script: "A teacher reads a note in an empty classroom.",
+        duration: "15 seconds",
+      },
+      { rootDir },
+    );
+
+    const claimed = await claimNextVideoPromptCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    const incomplete = sampleAnalysisResult();
+    delete incomplete.storyboard[0].composition;
+    mkdirSync(path.dirname(claimed.outputPath), { recursive: true });
+    writeFileSync(claimed.outputPath, JSON.stringify(incomplete, null, 2), "utf8");
+
+    await assert.rejects(
+      () => completeVideoPromptCodexJob(job.id, { rootDir }),
+      /storyboard\[0\]\.composition/,
+    );
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

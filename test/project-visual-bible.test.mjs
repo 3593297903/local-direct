@@ -67,7 +67,7 @@ test("Project save derives candidate visual bible entities from generation memor
   assert.match(service, /await upsertProjectVisualEntities\(prisma/);
 });
 
-test("Projects page shows the project visual bible and shot-level fixed asset references", () => {
+test("Projects page shows the project visual bible in the asset library", () => {
   const client = readFileSync("components/ProjectsClient.tsx", "utf8");
 
   assert.match(client, /type ProjectVisualEntity/);
@@ -79,6 +79,23 @@ test("Projects page shows the project visual bible and shot-level fixed asset re
   assert.match(client, /场景/);
   assert.match(client, /道具/);
   assert.match(client, /已锁定/);
-  assert.match(client, /getShotVisualReferences/);
-  assert.match(client, /引用固定资产/);
+  assert.match(client, /projectAssetLibrarySections/);
+  assert.match(client, /getEntityVisualAssets/);
+  assert.match(client, /projects-asset-card/);
+});
+
+test("Projects page separates episode content from the project asset library", () => {
+  const client = readFileSync("components/ProjectsClient.tsx", "utf8");
+
+  assert.match(client, /projectDetailView/);
+  assert.match(client, /projects-project-stepper/);
+  assert.match(client, /剧集/);
+  assert.match(client, /资产库/);
+  assert.match(client, /分集视频/);
+  assert.match(client, /setProjectDetailView\("episodes"\)/);
+  assert.match(client, /setProjectDetailView\("assets"\)/);
+  assert.match(client, /projectAssetLibrarySections/);
+  assert.match(client, /activeAssetType/);
+  assert.match(client, /getEntityVisualAssets/);
+  assert.match(client, /projects-asset-grid/);
 });

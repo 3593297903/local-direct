@@ -11,6 +11,9 @@ const concurrency = positiveInteger(process.env.STORYBOARD_CODEX_CONCURRENCY, 5)
 const taskTimeoutMs = positiveInteger(process.env.STORYBOARD_CODEX_TASK_TIMEOUT_MS, 30 * 60_000);
 const workerToken = process.env.STORYBOARD_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-storyboard-codex", "codex-messages");
+const logDir = path.join(rootDir, ".tmp-storyboard-codex", "codex-logs");
+const sourceManifestDir = path.join(rootDir, ".tmp-storyboard-codex", "source-manifests");
+const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
 console.log("Local Director storyboard Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -51,9 +54,18 @@ async function processTask(task) {
   console.log(`Claimed storyboard panel ${task.id} for job ${task.jobId} (shot ${task.shotNumber}).`);
   try {
     await runCodex(task);
-    await assertOutputFile(task.outputPath);
-    await completeTask(task);
-    console.log(`Completed storyboard panel ${task.id}: ${task.outputPath}`);
+    await normalizePngToExpectedSize(task.outputPath, task.size);
+    await assertOutputFile(task.outputPath, task.size);
+    const metadata = await buildCompletionMetadata(task);
+    const completed = await completeTask(task, metadata);
+    const panelStatus = completed.job?.panels?.find((panel) => panel.id === task.id)?.status;
+    if (panelStatus === "completed") {
+      console.log(`Completed storyboard panel ${task.id}: ${task.outputPath}`);
+    } else if (panelStatus === "pending") {
+      console.warn(`Storyboard panel ${task.id} was detected as duplicate and returned to pending for retry.`);
+    } else if (panelStatus === "failed") {
+      console.error(`Storyboard panel ${task.id} was marked failed after duplicate checks.`);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await failTask(task, message).catch((failError) => {
@@ -68,8 +80,11 @@ async function claimTask() {
   return data.task || null;
 }
 
-async function completeTask(task) {
-  await postJson(`/api/storyboard-image/jobs/${encodeURIComponent(task.jobId)}/panels/${encodeURIComponent(task.id)}/complete`, {});
+async function completeTask(task, metadata) {
+  return postJson(
+    `/api/storyboard-image/jobs/${encodeURIComponent(task.jobId)}/panels/${encodeURIComponent(task.id)}/complete`,
+    metadata,
+  );
 }
 
 async function failTask(task, message) {
@@ -117,14 +132,19 @@ function buildCodexPrompt(task) {
     "3. 如果这是同一批里的多张图，请保持人物身份、服装、道具、光影和空间方向一致，但让这一张是独立镜头。",
     "4. 生成后把最终选定的 PNG 复制到输出路径，文件名和路径必须完全一致。",
     "5. 如果输出目录不存在，先创建目录。",
-    "6. 保存后检查 PNG 文件存在且大小大于 0。",
-    "7. 最终回复只写一行：DONE。",
+    `6. 保存后的 PNG 像素尺寸必须严格等于 ${task.size}，横向 16:9。`,
+    "7. 保存后检查 PNG 文件存在且大小大于 0。",
+    "8. 保存时请在命令输出里打印最终源图路径，格式为：SOURCE_IMAGE_PATH=<absolute path>。",
+    "9. 不要复用同批次其他镜头已经保存过的图片；如果发现抓错了其他镜头的图片，必须重新生成。",
+    "10. 最终回复只写一行：DONE。",
   ].join("\n");
 }
 
 async function runCodex(task) {
   const messagePath = codexMessagePath(task);
+  const logPath = codexLogPath(task);
   await fsp.mkdir(path.dirname(messagePath), { recursive: true });
+  await fsp.mkdir(path.dirname(logPath), { recursive: true });
   const command = resolveCodexCommand();
   const args = [
     "exec",
@@ -140,30 +160,52 @@ async function runCodex(task) {
 
   console.log(`Running codex exec for storyboard panel ${task.id}.`);
   await new Promise((resolve, reject) => {
+    const logStream = fs.createWriteStream(logPath, { flags: "a" });
+    logStream.write(`\n[${new Date().toISOString()}] codex exec started for ${task.id}\n`);
     const child = spawn(command, args, {
       cwd: rootDir,
-      env: process.env,
+      env: {
+        ...process.env,
+        LOCALDIRECTOR_STORYBOARD_TASK_ID: task.id,
+        LOCALDIRECTOR_STORYBOARD_JOB_ID: task.jobId,
+      },
       shell: shouldRunCodexThroughShell(command),
-      stdio: ["pipe", "inherit", "inherit"],
-      windowsHide: false,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
     let timedOut = false;
+    let settled = false;
+    const settle = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      logStream.write(`[${new Date().toISOString()}] codex exec ${error ? "failed" : "finished"} for ${task.id}\n`);
+      logStream.end();
+      if (error) reject(error);
+      else resolve();
+    };
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill();
-      reject(new Error(`codex exec timed out after ${taskTimeoutMs}ms`));
+      terminateProcessTree(child);
+      settle(new Error(`codex exec timed out after ${taskTimeoutMs}ms`));
     }, taskTimeoutMs);
 
+    child.stdout?.on("data", (chunk) => {
+      process.stdout.write(chunk);
+      logStream.write(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      process.stderr.write(chunk);
+      logStream.write(chunk);
+    });
     child.stdin.end(buildCodexPrompt(task), "utf8");
     child.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
+      settle(error);
     });
     child.on("exit", (code) => {
-      clearTimeout(timeout);
       if (timedOut) return;
-      if (code === 0) resolve();
-      else reject(new Error(`codex exec exited with code ${code}`));
+      if (code === 0) settle();
+      else settle(new Error(`codex exec exited with code ${code}`));
     });
   });
 }
@@ -172,11 +214,207 @@ function codexMessagePath(task) {
   return path.join(messageDir, `${safeFileName(task.id)}.txt`);
 }
 
-async function assertOutputFile(filePath) {
+function codexLogPath(task) {
+  return path.join(logDir, `${safeFileName(task.id)}.log`);
+}
+
+function sourceManifestPath(task) {
+  return path.join(sourceManifestDir, `${safeFileName(task.id)}.json`);
+}
+
+async function buildCompletionMetadata(task) {
+  const logPath = codexLogPath(task);
+  const metadata = {
+    sourceImagePath: await extractSourceImagePathFromLog(logPath),
+    imageFingerprint: await computeImageFingerprint(task.outputPath).catch((error) => {
+      console.warn(`Could not compute image fingerprint for ${task.id}:`, error instanceof Error ? error.message : error);
+      return null;
+    }),
+    codexLogPath: logPath,
+  };
+
+  await fsp.mkdir(path.dirname(sourceManifestPath(task)), { recursive: true });
+  await fsp.writeFile(
+    sourceManifestPath(task),
+    `${JSON.stringify({ taskId: task.id, jobId: task.jobId, outputPath: task.outputPath, ...metadata }, null, 2)}\n`,
+    "utf8",
+  );
+
+  return metadata;
+}
+
+async function extractSourceImagePathFromLog(logPath) {
+  try {
+    const logText = await fsp.readFile(logPath, "utf8");
+    const joinedWrappedLines = logText.replace(/\r?\n\s+/g, "");
+    const explicitMatch = /SOURCE_IMAGE_PATH=([A-Za-z]:\\[^\r\n"'<>|]+?\.png)/i.exec(joinedWrappedLines);
+    if (explicitMatch) return explicitMatch[1];
+
+    const generatedImagePaths = joinedWrappedLines.match(/[A-Za-z]:\\[^\r\n"'<>|]+?\.codex\\generated_images\\[^\r\n"'<>|]+?\.png/gi) || [];
+    const fullPaths = generatedImagePaths.filter((item) => !item.includes("..."));
+    return fullPaths.length ? fullPaths[fullPaths.length - 1] : null;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`Could not read Codex log for source image extraction: ${error instanceof Error ? error.message : error}`);
+    }
+    return null;
+  }
+}
+
+async function computeImageFingerprint(filePath) {
+  if (process.platform !== "win32") return null;
+
+  const script = [
+    `Add-Type -AssemblyName System.Drawing`,
+    `$path = ${powerShellString(filePath)}`,
+    `$src = [System.Drawing.Image]::FromFile($path)`,
+    `$bmp = [System.Drawing.Bitmap]::new(32, 18)`,
+    `$graphics = [System.Drawing.Graphics]::FromImage($bmp)`,
+    `$hex = New-Object System.Text.StringBuilder`,
+    `try {`,
+    `  $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic`,
+    `  $graphics.DrawImage($src, 0, 0, 32, 18)`,
+    `  for ($y = 0; $y -lt 18; $y++) {`,
+    `    for ($x = 0; $x -lt 32; $x++) {`,
+    `      $pixel = $bmp.GetPixel($x, $y)`,
+    `      $gray = [int](($pixel.R * 0.299) + ($pixel.G * 0.587) + ($pixel.B * 0.114))`,
+    `      [void]$hex.Append($gray.ToString("x2"))`,
+    `    }`,
+    `  }`,
+    `  $hex.ToString()`,
+    `} finally {`,
+    `  $graphics.Dispose()`,
+    `  $bmp.Dispose()`,
+    `  $src.Dispose()`,
+    `}`,
+  ].join("; ");
+
+  return new Promise((resolve, reject) => {
+    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
+      cwd: rootDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve(stdout.replace(/[^a-f0-9]/gi, "").toLowerCase() || null);
+      else reject(new Error(`Image fingerprint failed with code ${code}: ${stderr.trim()}`));
+    });
+  });
+}
+
+async function normalizePngToExpectedSize(filePath, expectedSize) {
+  const expected = parseImageSize(expectedSize);
+  const actual = await readPngDimensions(filePath);
+  if (!actual) throw new Error(`Codex did not produce a readable PNG file: ${filePath}`);
+  if (actual.width === expected.width && actual.height === expected.height) return;
+
+  if (process.platform !== "win32") {
+    throw new Error(
+      `Codex produced ${actual.width}x${actual.height}, expected ${expected.width}x${expected.height}: ${filePath}`,
+    );
+  }
+
+  await resizePngWithPowerShell(filePath, expected.width, expected.height);
+}
+
+async function resizePngWithPowerShell(filePath, width, height) {
+  const tmpPath = `${filePath}.normalized-${process.pid}.png`;
+  const script = [
+    `Add-Type -AssemblyName System.Drawing`,
+    `$src = ${powerShellString(filePath)}`,
+    `$tmp = ${powerShellString(tmpPath)}`,
+    `$targetWidth = ${width}`,
+    `$targetHeight = ${height}`,
+    `$srcBitmap = [System.Drawing.Image]::FromFile($src)`,
+    `$destBitmap = [System.Drawing.Bitmap]::new($targetWidth, $targetHeight)`,
+    `$graphics = [System.Drawing.Graphics]::FromImage($destBitmap)`,
+    `try {`,
+    `  $graphics.Clear([System.Drawing.Color]::Black)`,
+    `  $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality`,
+    `  $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic`,
+    `  $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality`,
+    `  $graphics.DrawImage($srcBitmap, 0, 0, $targetWidth, $targetHeight)`,
+    `  $destBitmap.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png)`,
+    `} finally {`,
+    `  $graphics.Dispose()`,
+    `  $destBitmap.Dispose()`,
+    `  $srcBitmap.Dispose()`,
+    `}`,
+    `Move-Item -LiteralPath $tmp -Destination $src -Force`,
+  ].join("; ");
+
+  await new Promise((resolve, reject) => {
+    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
+      cwd: rootDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`PNG resize failed with code ${code}: ${stderr.trim()}`));
+    });
+  });
+}
+
+async function assertOutputFile(filePath, expectedSize = "1024x576") {
   const fileStat = await fsp.stat(filePath);
   if (!fileStat.isFile() || fileStat.size <= 0) {
     throw new Error(`Codex did not produce a valid PNG file: ${filePath}`);
   }
+  const expected = parseImageSize(expectedSize);
+  const actual = await readPngDimensions(filePath);
+  if (!actual || actual.width !== expected.width || actual.height !== expected.height) {
+    throw new Error(`Codex did not produce a ${expected.width}x${expected.height} PNG file: ${filePath}`);
+  }
+}
+
+async function readPngDimensions(filePath) {
+  const buffer = await fsp.readFile(filePath);
+  if (buffer.length < 33) return null;
+  if (!pngSignature.every((byte, index) => buffer[index] === byte)) return null;
+  if (buffer.toString("ascii", 12, 16) !== "IHDR") return null;
+  return {
+    width: buffer.readUInt32BE(16),
+    height: buffer.readUInt32BE(20),
+  };
+}
+
+function parseImageSize(size) {
+  const match = /^(\d+)x(\d+)$/i.exec(String(size || "1024x576"));
+  if (!match) return { width: 1024, height: 576 };
+  return {
+    width: Number(match[1]),
+    height: Number(match[2]),
+  };
+}
+
+function powerShellString(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function terminateProcessTree(child) {
+  if (process.platform === "win32" && child.pid) {
+    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    return;
+  }
+  child.kill();
 }
 
 function resolveCodexCommand() {

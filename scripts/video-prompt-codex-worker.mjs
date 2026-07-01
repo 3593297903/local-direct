@@ -151,7 +151,7 @@ async function assertOutputJson(filePath) {
   if (!fileStat.isFile() || fileStat.size <= 0) {
     throw new Error(`Codex did not produce a valid JSON file: ${filePath}`);
   }
-  const result = JSON.parse(await fsp.readFile(filePath, "utf8"));
+  const result = JSON.parse(stripJsonBom(await fsp.readFile(filePath, "utf8")));
   if (!result || typeof result !== "object") throw new Error("Codex output JSON is not an object");
   if (typeof result.optimizedScript !== "string") throw new Error("Codex output JSON is missing optimizedScript");
   if (!result.workflow || typeof result.workflow.fullVideoPrompt !== "string") {
@@ -171,6 +171,10 @@ function resolveCodexCommand() {
     if (fs.existsSync(candidate)) return candidate;
   }
   return "codex";
+}
+
+function stripJsonBom(value) {
+  return value.charCodeAt(0) === 0xfeff ? value.slice(1) : value;
 }
 
 function shouldRunCodexThroughShell(command) {

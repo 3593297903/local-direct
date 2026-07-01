@@ -41,23 +41,27 @@ test("Next project proxy supports saving visual assets through the authenticated
   assert.match(route, /saveVisualAssetsToNest/);
 });
 
-test("Dashboard saves shot storyboard panels as VisualAsset records and renders shot asset sections", () => {
+test("Dashboard saves shot storyboard panels and does not render expanded shot asset rows", () => {
   const dashboard = readFileSync("components/DashboardClient.tsx", "utf8");
 
   assert.match(dashboard, /生成镜头分镜图/);
   assert.match(dashboard, /saveStoryboardVisualAssets/);
   assert.match(dashboard, /\/api\/projects\/visual-assets/);
   assert.match(dashboard, /SHOT_STORYBOARD/);
-  assert.match(dashboard, /镜头资产/);
+  assert.match(dashboard, /镜头分镜图/);
+  assert.doesNotMatch(dashboard, /colSpan=\{3\}[\s\S]{0,120}镜头资产/);
+  assert.doesNotMatch(dashboard, /后续资产位/);
   assert.doesNotMatch(dashboard, /整张参考分镜图/);
 });
 
-test("Projects page shows saved visual assets under each shot", () => {
+test("Projects page keeps shot storyboard images in the shot table without expanded asset rows", () => {
   const client = readFileSync("components/ProjectsClient.tsx", "utf8");
 
   assert.match(client, /type VisualAsset/);
   assert.match(client, /visualAssets\?: VisualAsset\[\]/);
   assert.match(client, /getShotAssets/);
-  assert.match(client, /镜头资产/);
+  assert.match(client, /镜头分镜图/);
   assert.match(client, /SHOT_STORYBOARD/);
+  assert.doesNotMatch(client, /colSpan=\{2\}[\s\S]{0,120}镜头资产/);
+  assert.doesNotMatch(client, /引用固定资产/);
 });

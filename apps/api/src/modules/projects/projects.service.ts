@@ -866,9 +866,14 @@ function mapShotDetail(shot: {
   scene: string | null;
   visual: string | null;
   shotType: string | null;
+  composition: string | null;
   cameraMovement: string | null;
+  lighting: string | null;
+  sound: string | null;
+  dialogue: string | null;
   emotion: string | null;
   transition: string | null;
+  shotPurpose: string | null;
   firstFramePrompt: string | null;
   videoPrompt: string | null;
   lastFramePrompt: string | null;
@@ -880,9 +885,14 @@ function mapShotDetail(shot: {
     scene: shot.scene,
     visual: shot.visual,
     shotType: shot.shotType,
+    composition: shot.composition,
     cameraMovement: shot.cameraMovement,
+    lighting: shot.lighting,
+    sound: shot.sound,
+    dialogue: shot.dialogue,
     emotion: shot.emotion,
     transition: shot.transition,
+    shotPurpose: shot.shotPurpose,
     firstFramePrompt: shot.firstFramePrompt,
     videoPrompt: shot.videoPrompt,
     lastFramePrompt: shot.lastFramePrompt,
@@ -1378,9 +1388,14 @@ export class ProjectsService {
                 scene: true,
                 visual: true,
                 shotType: true,
+                composition: true,
                 cameraMovement: true,
+                lighting: true,
+                sound: true,
+                dialogue: true,
                 emotion: true,
                 transition: true,
+                shotPurpose: true,
                 firstFramePrompt: true,
                 videoPrompt: true,
                 lastFramePrompt: true,
@@ -1806,9 +1821,14 @@ export class ProjectsService {
                 scene: shot.scene,
                 visual: shot.visual,
                 shotType: shot.shotType,
+                composition: shot.composition,
                 cameraMovement: shot.cameraMovement,
+                lighting: shot.lighting,
+                sound: shot.sound,
+                dialogue: shot.dialogue,
                 emotion: shot.emotion,
                 transition: shot.transition,
+                shotPurpose: shot.shotPurpose,
                 firstFramePrompt: shot.firstFramePrompt,
                 videoPrompt: shot.videoPrompt,
                 lastFramePrompt: shot.lastFramePrompt,
@@ -1877,9 +1897,14 @@ export class ProjectsService {
               scene: shot.scene,
               visual: shot.visual,
               shotType: shot.shotType,
+              composition: shot.composition,
               cameraMovement: shot.cameraMovement,
+              lighting: shot.lighting,
+              sound: shot.sound,
+              dialogue: shot.dialogue,
               emotion: shot.emotion,
               transition: shot.transition,
+              shotPurpose: shot.shotPurpose,
               firstFramePrompt: shot.firstFramePrompt,
               videoPrompt: shot.videoPrompt,
               lastFramePrompt: shot.lastFramePrompt,

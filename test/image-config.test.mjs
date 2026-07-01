@@ -37,7 +37,7 @@ test("image config uses a supported real image provider model", () => {
   assert.match(envExample, /IMAGE_MODEL=gpt-image-1/);
 });
 
-test("storyboard image prompt and cropper preserve one panel per shot", () => {
+test("storyboard image route returns per-shot panels and dashboard uses Codex panel assets", () => {
   const routeSource = readFileSync("app/api/storyboard-image/route.ts", "utf8");
   const dashboardSource = readFileSync("components/DashboardClient.tsx", "utf8");
 
@@ -52,10 +52,11 @@ test("storyboard image prompt and cropper preserve one panel per shot", () => {
   assert.match(routeSource, /equal-height horizontal rows/);
   assert.match(routeSource, /thick, straight, full-width black horizontal divider/);
 
-  assert.match(dashboardSource, /normalizeStoryboardPanels/);
-  assert.match(dashboardSource, /data\.panels/);
-  assert.match(dashboardSource, /detectStoryboardPanelBoxes/);
-  assert.match(dashboardSource, /rowScores/);
-  assert.match(dashboardSource, /internalBands/);
-  assert.match(dashboardSource, /equalBoxes/);
+  assert.match(dashboardSource, /storyboardCodexPanels/);
+  assert.match(dashboardSource, /saveStoryboardVisualAssets/);
+  assert.match(dashboardSource, /SHOT_STORYBOARD/);
+  assert.doesNotMatch(dashboardSource, /normalizeStoryboardPanels/);
+  assert.doesNotMatch(dashboardSource, /data\.panels/);
+  assert.doesNotMatch(dashboardSource, /detectStoryboardPanelBoxes/);
+  assert.doesNotMatch(dashboardSource, /rowScores/);
 });

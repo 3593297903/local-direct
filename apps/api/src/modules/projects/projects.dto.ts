@@ -19,7 +19,23 @@ export class CreateStoryboardShotDto {
 
   @IsOptional()
   @IsString()
+  composition?: string;
+
+  @IsOptional()
+  @IsString()
   cameraMovement?: string;
+
+  @IsOptional()
+  @IsString()
+  lighting?: string;
+
+  @IsOptional()
+  @IsString()
+  sound?: string;
+
+  @IsOptional()
+  @IsString()
+  dialogue?: string;
 
   @IsOptional()
   @IsString()
@@ -28,6 +44,10 @@ export class CreateStoryboardShotDto {
   @IsOptional()
   @IsString()
   transition?: string;
+
+  @IsOptional()
+  @IsString()
+  shotPurpose?: string;
 
   @IsOptional()
   @IsString()

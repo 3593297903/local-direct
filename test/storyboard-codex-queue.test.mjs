@@ -23,6 +23,18 @@ function makeTempRoot() {
   return path.join(os.tmpdir(), `localdirector-storyboard-codex-${Date.now()}-${Math.random().toString(16).slice(2)}`);
 }
 
+function pngHeader(width = 1024, height = 576) {
+  const buffer = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buffer, 0);
+  buffer.writeUInt32BE(13, 8);
+  buffer.write("IHDR", 12, "ascii");
+  buffer.writeUInt32BE(width, 16);
+  buffer.writeUInt32BE(height, 20);
+  buffer[24] = 8;
+  buffer[25] = 6;
+  return buffer;
+}
+
 const sampleStoryboard = [
   {
     shotNumber: 1,
@@ -80,7 +92,7 @@ test("creates one Codex storyboard panel task for each shot", async () => {
   }
 });
 
-test("claiming and completing panel tasks finalizes the storyboard sheet", async () => {
+test("claiming and completing panel tasks stores panel URLs without generating a legacy sheet", async () => {
   const rootDir = makeTempRoot();
   try {
     mkdirSync(rootDir, { recursive: true });
@@ -100,19 +112,100 @@ test("claiming and completing panel tasks finalizes the storyboard sheet", async
       assert.ok(panel, "expected a pending panel to claim");
       assert.equal(panel.jobId, job.id);
       mkdirSync(path.dirname(panel.outputPath), { recursive: true });
-      writeFileSync(panel.outputPath, Buffer.from("png-bytes"));
+      writeFileSync(panel.outputPath, Buffer.concat([pngHeader(), Buffer.from(`panel-${index}`)]));
       const updated = await completeStoryboardCodexPanel(panel.jobId, panel.id, { rootDir });
       assert.equal(updated.panels[index].status, "completed");
     }
 
     const completed = await getStoryboardCodexJob(job.id, { rootDir });
     assert.equal(completed.status, "completed");
-    assert.ok(completed.sheetUrl?.endsWith(`sheet-${job.id}.svg`));
+    assert.equal(completed.sheetUrl, null);
     assert.ok(completed.panels.every((panel) => panel.imageUrl?.endsWith(".png")));
-    assert.ok(existsSync(completed.sheetPath), "expected sheet svg to be written");
-    const sheetSvg = readFileSync(completed.sheetPath, "utf8");
-    assert.match(sheetSvg, /data:image\/png;base64,/);
-    assert.doesNotMatch(sheetSvg, /href="\/project-assets\//);
+    assert.equal(existsSync(completed.sheetPath), false);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("complete rejects missing, non-PNG, and wrong-size storyboard panel outputs", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    mkdirSync(rootDir, { recursive: true });
+    const job = await createStoryboardCodexJob(
+      {
+        projectId: "33333333-3333-4333-8333-333333333333",
+        versionId: "44444444-4444-4444-8444-444444444444",
+        title: "尺寸校验",
+        style: "专业电影分镜",
+        storyboard: sampleStoryboard.slice(0, 1),
+      },
+      { rootDir },
+    );
+
+    const panel = await claimNextStoryboardCodexPanel({ rootDir, order: "oldest" });
+    assert.ok(panel, "expected a pending panel to claim");
+
+    await assert.rejects(
+      () => completeStoryboardCodexPanel(job.id, panel.id, { rootDir }),
+      /valid storyboard image/,
+    );
+
+    mkdirSync(path.dirname(panel.outputPath), { recursive: true });
+    writeFileSync(panel.outputPath, Buffer.from("png-bytes"));
+    await assert.rejects(
+      () => completeStoryboardCodexPanel(job.id, panel.id, { rootDir }),
+      /valid storyboard image/,
+    );
+
+    writeFileSync(panel.outputPath, pngHeader(1672, 941));
+    await assert.rejects(
+      () => completeStoryboardCodexPanel(job.id, panel.id, { rootDir }),
+      /valid storyboard image/,
+    );
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("complete returns duplicate storyboard panel outputs to pending for retry", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    mkdirSync(rootDir, { recursive: true });
+    const job = await createStoryboardCodexJob(
+      {
+        projectId: "33333333-3333-4333-8333-333333333333",
+        versionId: "44444444-4444-4444-8444-444444444444",
+        title: "骞跺彂涓插浘",
+        style: "涓撲笟鐢靛奖鍒嗛暅",
+        storyboard: sampleStoryboard,
+      },
+      { rootDir },
+    );
+
+    const sourceImagePath = "C:\\Users\\Administrator\\.codex\\generated_images\\same-source\\ig_same.png";
+
+    const firstPanel = await claimNextStoryboardCodexPanel({ rootDir, order: "oldest" });
+    assert.ok(firstPanel, "expected first panel to claim");
+    mkdirSync(path.dirname(firstPanel.outputPath), { recursive: true });
+    writeFileSync(firstPanel.outputPath, Buffer.concat([pngHeader(), Buffer.from("first")]));
+    const firstCompleted = await completeStoryboardCodexPanel(firstPanel.jobId, firstPanel.id, {
+      rootDir,
+      sourceImagePath,
+    });
+    assert.equal(firstCompleted.panels[0].status, "completed");
+
+    const secondPanel = await claimNextStoryboardCodexPanel({ rootDir, order: "oldest" });
+    assert.ok(secondPanel, "expected second panel to claim");
+    writeFileSync(secondPanel.outputPath, Buffer.concat([pngHeader(), Buffer.from("second")]));
+    const secondUpdated = await completeStoryboardCodexPanel(secondPanel.jobId, secondPanel.id, {
+      rootDir,
+      sourceImagePath,
+    });
+
+    const retriedPanel = secondUpdated.panels.find((panel) => panel.id === secondPanel.id);
+    assert.equal(retriedPanel.status, "pending");
+    assert.match(retriedPanel.error, /duplicate/i);
+    assert.equal(existsSync(secondPanel.outputPath), false);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
@@ -151,4 +244,14 @@ test("stale running panel tasks are reclaimed after the running timeout", async 
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
+});
+
+test("storyboard queue serializes JSON mutations with a filesystem lock", () => {
+  const source = readFileSync("lib/storyboard-codex-queue.ts", "utf8");
+
+  assert.match(source, /QUEUE_LOCK_DIR/);
+  assert.match(source, /withQueueLock/);
+  assert.match(source, /claimNextStoryboardCodexPanel[\s\S]*withQueueLock/);
+  assert.match(source, /completeStoryboardCodexPanel[\s\S]*withQueueLock/);
+  assert.match(source, /failStoryboardCodexPanel[\s\S]*withQueueLock/);
 });

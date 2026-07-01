@@ -17,7 +17,7 @@ const ShotSchema = z.object({
 
 const RequestSchema = z.object({
   title: z.string().default("AI 视频分镜图"),
-  style: z.string().default("电影感铅笔分镜草图"),
+  style: z.string().default("16:9 彩色电影级分镜图，电影光影，写实概念美术"),
   storyboard: z.array(ShotSchema).min(1).max(8),
 });
 
