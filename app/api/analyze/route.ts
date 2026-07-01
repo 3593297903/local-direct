@@ -14,7 +14,7 @@ const RequestSchema = z.object({
   versionId: z.string().uuid().optional(),
   contentType: z.string().default("自动识别"),
   style: z.string().default("自动匹配文案气质"),
-  duration: z.string().default("15秒"),
+  duration: z.string().optional().default("auto"),
   provider: z.string().optional(),
   save: z.boolean().optional().default(false),
 });

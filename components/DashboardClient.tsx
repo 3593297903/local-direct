@@ -94,6 +94,8 @@ type BatchPromptSection = {
   promptText: string;
 };
 
+type DurationMode = "auto" | "fixed";
+
 const particleColors = [
   "rgba(129, 140, 248, 0.45)",
   "rgba(167, 139, 250, 0.45)",
@@ -260,6 +262,7 @@ export function DashboardClient() {
   const [imageLoading, setImageLoading] = useState(false);
   const [uploadingText, setUploadingText] = useState(false);
   const [batchGenerating, setBatchGenerating] = useState(false);
+  const [durationMode, setDurationMode] = useState<DurationMode>("auto");
   const [durationSeconds, setDurationSeconds] = useState(15);
   const [durationPickerOpen, setDurationPickerOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState("");
@@ -325,10 +328,14 @@ export function DashboardClient() {
     return creatingNewEpisodeRef.current ? undefined : resumeVersionId || undefined;
   }
 
-  async function requestAnalysis(inputScript: string, inputDurationSeconds: number) {
+  function selectedDurationValue() {
+    return durationMode === "auto" ? "auto" : `${durationSeconds}秒`;
+  }
+
+  async function requestAnalysis(inputScript: string, inputDuration: string) {
     return requestAnalysisWithContext(
       inputScript,
-      inputDurationSeconds,
+      inputDuration,
       resumeProjectId || undefined,
       getActiveResumeVersionId(),
     );
@@ -336,16 +343,16 @@ export function DashboardClient() {
 
   async function requestAnalysisWithContext(
     inputScript: string,
-    inputDurationSeconds: number,
+    inputDuration: string,
     projectId: string | undefined = resumeProjectId || undefined,
     versionId: string | undefined = resumeVersionId || undefined,
   ) {
-    return requestAnalysisWithProviderFallback(inputScript, inputDurationSeconds, projectId, versionId);
+    return requestAnalysisWithProviderFallback(inputScript, inputDuration, projectId, versionId);
   }
 
   async function createVideoPromptCodexJob(
     inputScript: string,
-    inputDurationSeconds: number,
+    inputDuration: string,
     projectId: string | undefined,
     versionId: string | undefined,
   ) {
@@ -354,7 +361,7 @@ export function DashboardClient() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         script: inputScript,
-        duration: `${inputDurationSeconds}秒`,
+        duration: inputDuration,
         projectId: projectId || undefined,
         versionId: versionId || undefined,
       }),
@@ -399,12 +406,12 @@ export function DashboardClient() {
 
   async function requestAnalysisWithProviderFallback(
     inputScript: string,
-    inputDurationSeconds: number,
+    inputDuration: string,
     projectId: string | undefined,
     versionId: string | undefined,
   ) {
     try {
-      const job = await createVideoPromptCodexJob(inputScript, inputDurationSeconds, projectId, versionId);
+      const job = await createVideoPromptCodexJob(inputScript, inputDuration, projectId, versionId);
       setGenerationProgress("已创建 Codex 视频提示词任务，请确认 video-prompt:codex-worker 正在运行。");
       const completedJob = await pollVideoPromptCodexJob(job.id);
       if (!completedJob.result) {
@@ -416,13 +423,13 @@ export function DashboardClient() {
       if (err instanceof CodexVideoPromptJobFailedError) throw err;
       console.warn("video-prompt codex endpoint unavailable, falling back to /api/analyze", err);
       setGenerationProgress("本地 Codex 视频提示词入口暂不可用，正在回退到在线模型生成。");
-      return requestAnalysisViaProvider(inputScript, inputDurationSeconds, projectId, versionId);
+      return requestAnalysisViaProvider(inputScript, inputDuration, projectId, versionId);
     }
   }
 
   async function requestAnalysisViaProvider(
     inputScript: string,
-    inputDurationSeconds: number,
+    inputDuration: string,
     projectId: string | undefined,
     versionId: string | undefined,
   ) {
@@ -431,7 +438,7 @@ export function DashboardClient() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         script: inputScript,
-        duration: `${inputDurationSeconds}秒`,
+        duration: inputDuration,
         projectId: projectId || undefined,
         versionId: versionId || undefined,
       }),
@@ -628,7 +635,7 @@ export function DashboardClient() {
 
         for (const segment of segments) {
           setGenerationProgress(`正在生成第 ${segment.index} / ${segments.length} 段...`);
-          const segmentResult = await requestAnalysisWithContext(segment.text, 15, activeProjectId || undefined, undefined);
+          const segmentResult = await requestAnalysisWithContext(segment.text, "15秒", activeProjectId || undefined, undefined);
           const fullVideoPrompt = buildVideoGenerationPromptText(segmentResult);
           const save = await saveAnalysisProject(segment.text, segmentResult, fullVideoPrompt, activeProjectId || undefined, undefined);
           setProjectSave(save);
@@ -650,7 +657,7 @@ export function DashboardClient() {
       }
 
       setGenerationProgress("正在生成...");
-      const singleResult = await requestAnalysis(script, durationSeconds);
+      const singleResult = await requestAnalysis(script, selectedDurationValue());
       const fullVideoPrompt = buildVideoGenerationPromptText(singleResult);
       const save = await saveAnalysisProject(script, singleResult, fullVideoPrompt);
       setProjectSave(save);
@@ -946,22 +953,53 @@ export function DashboardClient() {
                   onClick={() => setDurationPickerOpen((open) => !open)}
                 >
                   <Clock className="h-3.5 w-3.5" />
-                  {durationSeconds}s
+                  {durationMode === "auto" ? "自动" : `${durationSeconds}s`}
                 </button>
                 {durationPickerOpen && (
                   <div className="duration-popover" role="dialog" aria-label="选择视频时长">
                     <div className="mb-3 flex items-center justify-between gap-4">
                       <span className="text-sm font-semibold text-slate-300">视频时长</span>
-                      <span className="text-sm font-bold text-slate-200">{durationSeconds}s</span>
+                      <span className="text-sm font-bold text-slate-200">{durationMode === "auto" ? "自动" : `${durationSeconds}s`}</span>
                     </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        className={`rounded-lg border px-3 py-2 text-xs font-semibold transition ${
+                          durationMode === "auto"
+                            ? "border-cyan-200/60 bg-cyan-300/16 text-cyan-50"
+                            : "border-white/10 bg-white/[0.03] text-slate-400 hover:text-slate-100"
+                        }`}
+                        onClick={() => setDurationMode("auto")}
+                      >
+                        自动
+                      </button>
+                      <button
+                        type="button"
+                        className={`rounded-lg border px-3 py-2 text-xs font-semibold transition ${
+                          durationMode === "fixed"
+                            ? "border-cyan-200/60 bg-cyan-300/16 text-cyan-50"
+                            : "border-white/10 bg-white/[0.03] text-slate-400 hover:text-slate-100"
+                        }`}
+                        onClick={() => setDurationMode("fixed")}
+                      >
+                        手动 {durationSeconds}s
+                      </button>
+                    </div>
+                    <p className="mt-3 text-[11px] leading-5 text-slate-500">
+                      自动模式会优先读取文案里的总时长，没有写时长时由系统按内容密度判断。
+                    </p>
                     <input
                       type="range"
                       min="4"
                       max="15"
                       step="1"
                       value={durationSeconds}
-                      onChange={(e) => setDurationSeconds(Number(e.target.value))}
-                      className="duration-slider"
+                      disabled={durationMode === "auto"}
+                      onChange={(e) => {
+                        setDurationMode("fixed");
+                        setDurationSeconds(Number(e.target.value));
+                      }}
+                      className={`duration-slider mt-3 ${durationMode === "auto" ? "opacity-45" : ""}`}
                     />
                     <div className="mt-2 flex justify-between text-[11px] text-slate-500">
                       <span>4s</span>

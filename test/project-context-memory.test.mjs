@@ -49,7 +49,7 @@ test("analysis route fetches director context before calling the AI", () => {
   assert.match(analyzeRoute, /const directorContext/);
   assert.match(analyzeRoute, /analyzeScript\(\{[\s\S]*directorContext/);
 
-  assert.match(dashboard, /requestAnalysisWithContext\([\s\S]*inputScript: string[\s\S]*inputDurationSeconds: number[\s\S]*projectId/);
+  assert.match(dashboard, /requestAnalysisWithContext\([\s\S]*inputScript: string[\s\S]*inputDuration: string[\s\S]*projectId/);
   assert.match(dashboard, /projectId: projectId \|\| undefined/);
 });
 

@@ -23,6 +23,17 @@ function parseDurationSeconds(duration: string) {
   return Math.min(15, Math.max(1, Number.isFinite(seconds) ? seconds : 15));
 }
 
+function clampMockDurationSeconds(seconds: number) {
+  return Math.min(15, Math.max(4, seconds));
+}
+
+function parseMockDurationNumber(value: string | undefined) {
+  const match = String(value || "").match(/\d+(\.\d+)?/);
+  if (!match) return null;
+  const seconds = Number(match[0]);
+  return Number.isFinite(seconds) ? clampMockDurationSeconds(seconds) : null;
+}
+
 function estimateDurationSeconds(script: string) {
   const compact = script.replace(/\s+/g, "");
   const sentenceCount = script
@@ -37,10 +48,26 @@ function estimateDurationSeconds(script: string) {
   return 15;
 }
 
+function extractExplicitMockDurationSeconds(script: string) {
+  const candidates = [
+    /(?:总时长|视频时长|片长|时长)\s*[:：]?\s*(?:约|大约|控制在|不超过)?\s*(\d+(?:\.\d+)?)\s*(?:秒|s|S)/u,
+    /(?:生成|制作|输出)\s*(?:一条|一个)?\s*(?:约|大约)?\s*(\d+(?:\.\d+)?)\s*(?:秒|s|S)\s*(?:的)?(?:短片|视频|片子)/u,
+    /(\d+(?:\.\d+)?)\s*(?:秒|s|S)\s*(?:的)?(?:短片|视频|片子)/u,
+  ];
+
+  for (const pattern of candidates) {
+    const match = script.match(pattern);
+    if (!match) continue;
+    const seconds = Number(match[1]);
+    if (Number.isFinite(seconds)) return clampMockDurationSeconds(seconds);
+  }
+
+  return null;
+}
+
 function normalizeMockDuration(duration: string | undefined, script: string) {
-  const match = String(duration || "").match(/\d+(\.\d+)?/);
-  const rawSeconds = match ? Number(match[0]) : estimateDurationSeconds(script);
-  const seconds = Math.min(15, Math.max(4, Number.isFinite(rawSeconds) ? rawSeconds : estimateDurationSeconds(script)));
+  const rawSeconds = parseMockDurationNumber(duration) ?? extractExplicitMockDurationSeconds(script) ?? estimateDurationSeconds(script);
+  const seconds = clampMockDurationSeconds(rawSeconds);
   return `${Number.isInteger(seconds) ? seconds.toFixed(0) : seconds.toFixed(1)}秒`;
 }
 

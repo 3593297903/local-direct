@@ -83,6 +83,8 @@ export async function createVideoPromptCodexJob(
   const jobId = createId("video-prompt-job");
   const outputFileName = `${jobId}.json`;
   const outputPath = path.join(resultDir(rootDir), outputFileName);
+  const requestedDuration = normalizeRequestedDuration(input.duration);
+  const normalizedInput = { ...input, duration: requestedDuration };
   const job: VideoPromptCodexJob = {
     id: jobId,
     projectId: input.projectId || null,
@@ -90,8 +92,8 @@ export async function createVideoPromptCodexJob(
     script: input.script,
     contentType: input.contentType || "短剧 / 通用",
     style: input.style || "自动匹配文案气质",
-    duration: input.duration || "15秒",
-    prompt: buildVideoPromptCodexPrompt(input, outputPath),
+    duration: requestedDuration,
+    prompt: buildVideoPromptCodexPrompt(normalizedInput, outputPath),
     status: "pending",
     outputFileName,
     outputPath,
@@ -104,6 +106,11 @@ export async function createVideoPromptCodexJob(
   await ensureQueueDirs(rootDir);
   await writeJob(rootDir, job);
   return job;
+}
+
+function normalizeRequestedDuration(duration: string | undefined) {
+  const trimmed = duration?.trim();
+  return trimmed || "auto";
 }
 
 export async function getVideoPromptCodexJob(jobId: string, options: QueueOptions = {}) {
@@ -176,6 +183,8 @@ export async function failVideoPromptCodexJob(
 }
 
 function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outputPath: string) {
+  const requestedDuration = normalizeRequestedDuration(input.duration);
+  const durationMode = requestedDuration.toLowerCase() === "auto" ? "auto" : "fixed";
   return [
     "You are handling a Local Director local video prompt generation task.",
     "",
@@ -195,13 +204,20 @@ function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outp
     "",
     "Storyboard requirements:",
     "- Create a coherent shot list for the requested duration.",
-    "- For a normal 15秒 request, return 5 shots unless the script clearly needs fewer.",
+    "- For dense 13-15 second requests, return 4-5 shots unless the script clearly needs fewer.",
     "- Every shot must include shotNumber, timeRange, scene, visual, shotType, composition, cameraMovement, lighting, sound, dialogue, emotion, transition, shotPurpose, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt.",
     "- composition must describe camera position and frame composition.",
     "- lighting must describe film lighting and color tone.",
     "- sound must describe ambience, effects, or music.",
     "- dialogue must contain the line spoken in the shot, or the exact string \"无\" when there is no dialogue.",
     "- shotPurpose must explain why this shot exists in the sequence.",
+    "",
+    "Duration rules:",
+    `- Duration mode: ${durationMode}`,
+    "- If Duration mode is auto, first honor explicit duration written in Script, such as 总时长：9秒, 视频时长：12秒, or 9 秒视频.",
+    "- If Duration mode is auto and Script has no explicit duration, infer the best duration from the script rhythm, between 4 and 15 seconds.",
+    "- If Duration mode is fixed, treat Duration as the upper budget and keep the final total within that budget.",
+    "- Always output the resolved duration in the JSON duration field, not the word auto.",
     "",
     "File writing requirements:",
     "- Write the JSON file as UTF-8.",
@@ -212,7 +228,7 @@ function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outp
     `Script: ${input.script}`,
     `Content type: ${input.contentType || "短剧 / 通用"}`,
     `Style: ${input.style || "自动匹配文案气质"}`,
-    `Duration: ${input.duration || "15秒"}`,
+    `Duration: ${requestedDuration}`,
     `Output path: ${outputPath}`,
     "",
     "Completion requirements:",

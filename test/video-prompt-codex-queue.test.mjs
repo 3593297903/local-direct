@@ -127,6 +127,27 @@ test("creates, claims, and completes a local Codex video prompt job", async () =
   }
 });
 
+test("video prompt Codex jobs default to automatic duration and preserve source duration hints", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptCodexJob(
+      {
+        script: "总时长：9秒。一个孩子在教室里写下一句话，老师停下红笔。",
+      },
+      { rootDir },
+    );
+
+    assert.equal(job.duration, "auto");
+    assert.match(job.prompt, /Duration mode: auto/);
+    assert.match(job.prompt, /honor explicit duration/i);
+    assert.match(job.prompt, /infer the best duration/i);
+    assert.match(job.prompt, /Duration: auto/);
+    assert.doesNotMatch(job.prompt, /Duration: 15/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("stale running video prompt jobs can be reclaimed or failed", async () => {
   const rootDir = makeTempRoot();
   try {

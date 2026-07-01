@@ -127,7 +127,7 @@ test("dashboard only exposes the final video generation prompt", async () => {
   assert.doesNotMatch(dashboardSource, /aria-label="内容类型"/);
   assert.doesNotMatch(dashboardSource, /aria-label="风格"/);
   assert.doesNotMatch(dashboardSource, /aria-label="时长"/);
-  assert.match(dashboardSource, /requestAnalysis\(script, durationSeconds\)/);
+  assert.match(dashboardSource, /requestAnalysis\(script, selectedDurationValue\(\)\)/);
   assert.match(dashboardSource, /视频生成提示词/);
   assert.match(dashboardSource, /核心主题/);
   assert.match(dashboardSource, /技术参数/);

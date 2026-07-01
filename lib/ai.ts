@@ -527,17 +527,45 @@ function estimateDurationSeconds(script: string) {
   return 15;
 }
 
+function clampDurationSeconds(seconds: number) {
+  return Math.min(15, Math.max(4, seconds));
+}
+
+function parseDurationNumber(value: string | undefined) {
+  const match = String(value || "").match(/\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const seconds = Number(match[0]);
+  return Number.isFinite(seconds) ? clampDurationSeconds(seconds) : null;
+}
+
+export function extractExplicitDurationSeconds(script: string) {
+  const candidates = [
+    /(?:总时长|视频时长|片长|时长)\s*[:：]?\s*(?:约|大约|控制在|不超过)?\s*(\d+(?:\.\d+)?)\s*(?:秒|s|S)/u,
+    /(?:生成|制作|输出)\s*(?:一条|一个)?\s*(?:约|大约)?\s*(\d+(?:\.\d+)?)\s*(?:秒|s|S)\s*(?:的)?(?:短片|视频|片子)/u,
+    /(\d+(?:\.\d+)?)\s*(?:秒|s|S)\s*(?:的)?(?:短片|视频|片子)/u,
+  ];
+
+  for (const pattern of candidates) {
+    const match = script.match(pattern);
+    if (!match) continue;
+    const seconds = Number(match[1]);
+    if (Number.isFinite(seconds)) return clampDurationSeconds(seconds);
+  }
+
+  return null;
+}
+
 export function normalizeDuration(duration: string | undefined, script: string) {
-  const match = String(duration || "").match(/\d+(?:\.\d+)?/);
-  const rawSeconds = match ? Number(match[0]) : estimateDurationSeconds(script);
-  const seconds = Math.min(15, Math.max(4, Number.isFinite(rawSeconds) ? rawSeconds : estimateDurationSeconds(script)));
+  const requestedSeconds = parseDurationNumber(duration);
+  const rawSeconds = requestedSeconds ?? extractExplicitDurationSeconds(script) ?? estimateDurationSeconds(script);
+  const seconds = clampDurationSeconds(rawSeconds);
   return `${Number.isInteger(seconds) ? seconds.toFixed(0) : seconds.toFixed(1)}秒`;
 }
 
 function parseDurationSeconds(duration: string) {
   const match = duration.match(/\d+(?:\.\d+)?/);
   const seconds = match ? Number(match[0]) : 15;
-  return Number.isFinite(seconds) ? Math.min(15, Math.max(4, seconds)) : 15;
+  return Number.isFinite(seconds) ? clampDurationSeconds(seconds) : 15;
 }
 
 function formatDurationSeconds(seconds: number) {
