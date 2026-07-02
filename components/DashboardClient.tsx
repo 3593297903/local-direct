@@ -5,7 +5,6 @@ import { AnalysisResult, KnowledgeItem, StoryboardShot } from "@/types";
 import { CopyButton } from "@/components/CopyButton";
 import { Drawer } from "@/components/Drawer";
 import { PreviewAnimation } from "@/components/PreviewAnimation";
-import { splitLongScriptIntoPromptSegments, type PromptSegment } from "@/lib/long-script";
 import { matchShotReferences, ShotReferenceMatches } from "@/lib/reference-matcher";
 import { Clock, Download, FileText, Film, ImageIcon, Loader2, Maximize2, ScanLine, Send, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
 
@@ -89,13 +88,15 @@ class CodexVideoPromptJobFailedError extends Error {
 }
 
 type BatchPromptSection = {
-  segment: PromptSegment;
+  segment: {
+    index: number;
+    text: string;
+  };
   result: AnalysisResult;
   promptText: string;
 };
 
 type DurationMode = "auto" | "fixed";
-type BatchResultKind = "segments" | "episodes";
 
 const MAX_EPISODE_BATCH_COUNT = 30;
 
@@ -287,7 +288,6 @@ export function DashboardClient() {
   const [imageLoading, setImageLoading] = useState(false);
   const [uploadingText, setUploadingText] = useState(false);
   const [batchGenerating, setBatchGenerating] = useState(false);
-  const [batchResultKind, setBatchResultKind] = useState<BatchResultKind>("segments");
   const [durationMode, setDurationMode] = useState<DurationMode>("auto");
   const [durationSeconds, setDurationSeconds] = useState(15);
   const [durationPickerOpen, setDurationPickerOpen] = useState(false);
@@ -608,7 +608,6 @@ export function DashboardClient() {
     let activeProjectId = resumeProjectId || "";
     let latestSave: ProjectSaveState | null = null;
     setBatchGenerating(true);
-    setBatchResultKind("episodes");
 
     for (let episodeIndex = 1; episodeIndex <= episodeCount; episodeIndex += 1) {
       const episodeScript = buildBatchEpisodeScript(script, episodeIndex, episodeCount);
@@ -675,8 +674,7 @@ export function DashboardClient() {
       if (!cleanText) throw new Error("没有从文件中读取到正文");
       setScript(cleanText);
       setUploadedFileName(file.name);
-      const count = splitLongScriptIntoPromptSegments(cleanText).length || 1;
-      setGenerationProgress(`已导入 ${file.name}，约 ${cleanText.length} 字，预计拆成 ${count} 段 15s 内提示词。`);
+      setGenerationProgress(`已导入 ${file.name}，约 ${cleanText.length} 字。生成时会按当前集数和时长设置处理。`);
     } catch (err: any) {
       setError(err?.message || "文案文件读取失败");
       setGenerationProgress("");
@@ -701,36 +699,6 @@ export function DashboardClient() {
     setBatchResults([]);
 
     try {
-      if (uploadedFileName) {
-        const segments = splitLongScriptIntoPromptSegments(script);
-        const completed: BatchPromptSection[] = [];
-        let activeProjectId = resumeProjectId || "";
-        setBatchGenerating(true);
-        setBatchResultKind("segments");
-
-        for (const segment of segments) {
-          setGenerationProgress(`正在生成第 ${segment.index} / ${segments.length} 段...`);
-          const segmentResult = await requestAnalysisWithContext(segment.text, "15秒", activeProjectId || undefined, undefined);
-          const fullVideoPrompt = buildVideoGenerationPromptText(segmentResult);
-          const save = await saveAnalysisProject(segment.text, segmentResult, fullVideoPrompt, activeProjectId || undefined, undefined);
-          setProjectSave(save);
-          if (save.projectId) {
-            activeProjectId = save.projectId;
-            setResumeProjectId(save.projectId);
-          }
-          completed.push({
-            segment,
-            result: segmentResult,
-            promptText: fullVideoPrompt,
-          });
-          setBatchResults([...completed]);
-          setResult(segmentResult);
-        }
-
-        setGenerationProgress(`已生成 ${completed.length} 段，每段视频提示词均控制在 15s 内。`);
-        return;
-      }
-
       if (episodeCount > 1) {
         await runBatchEpisodeGeneration();
         return;
@@ -761,10 +729,9 @@ export function DashboardClient() {
   }
 
   async function downloadPromptDocx() {
-    const batchUnitLabel = batchResultKind === "episodes" ? "集" : "段";
     const sections = batchResults.length
       ? batchResults.map((item) => ({
-          heading: `第 ${item.segment.index} ${batchUnitLabel}｜${item.result.title}｜${item.result.duration}`,
+          heading: `第 ${item.segment.index} 集｜${item.result.title}｜${item.result.duration}`,
           originalText: item.segment.text,
           promptText: item.promptText,
         }))
@@ -1220,11 +1187,9 @@ export function DashboardClient() {
             <div className="mb-6 rounded-2xl border border-violet-300/16 bg-violet-500/8 p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h3 className="font-bold text-white">{batchResultKind === "episodes" ? "批量剧集生成" : "批量提示词生成"}</h3>
+                  <h3 className="font-bold text-white">批量剧集生成</h3>
                   <p className="mt-1 text-sm text-slate-400">
-                    {batchResultKind === "episodes"
-                      ? `已生成 ${batchResults.length} 集，并按顺序保存到同一个项目。`
-                      : `已生成 ${batchResults.length} 段，每段按 15s 以内的视频提示词模板输出。`}
+                    已生成 {batchResults.length} 集，并按顺序保存到同一个项目。
                   </p>
                 </div>
                 <button

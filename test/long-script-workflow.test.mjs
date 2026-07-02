@@ -22,7 +22,7 @@ async function compileModule(sourcePath, outputName) {
   return pathToFileURL(outputPath).href;
 }
 
-test("long uploaded copy is split into ordered 15-second prompt segments", async () => {
+test("long copy splitter remains available as a standalone helper", async () => {
   const moduleUrl = await compileModule(join(process.cwd(), "lib", "long-script.ts"), "long-script.mjs");
   const { splitLongScriptIntoPromptSegments } = await import(moduleUrl);
   const paragraph = "林夏收到旧照片，照片背面写着一栋废弃大楼的地址。她撑伞走进雨夜，楼道尽头传来旧收音机的声音。她看见照片里多年后死去的自己站在窗边，对她做出安静的手势。";
@@ -59,11 +59,14 @@ test("prompt docx generator returns a downloadable Word document", async () => {
   assert.match(asText, /核心主题/);
 });
 
-test("dashboard exposes upload, batch generation progress, and docx download", async () => {
+test("dashboard imports uploaded copy without auto-splitting it into prompt segments", async () => {
   const dashboardSource = await readFile(join(process.cwd(), "components", "DashboardClient.tsx"), "utf8");
 
   assert.match(dashboardSource, /accept="\.txt,\.docx"/);
   assert.match(dashboardSource, /handlePromptFileUpload/);
+  assert.match(dashboardSource, /setUploadedFileName\(file\.name\)/);
+  assert.doesNotMatch(dashboardSource, /splitLongScriptIntoPromptSegments/);
+  assert.doesNotMatch(dashboardSource, /if \(uploadedFileName\)\s*\{/);
   assert.match(dashboardSource, /batchGenerating/);
   assert.match(dashboardSource, /正在生成/);
   assert.match(dashboardSource, /downloadPromptDocx/);
