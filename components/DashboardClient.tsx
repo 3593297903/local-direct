@@ -57,6 +57,24 @@ type VideoPromptCodexJob = {
   error?: string | null;
 };
 
+type SeasonPackEpisodeResult = {
+  episodeIndex: number;
+  fileName: string;
+  result: AnalysisResult;
+};
+
+type SeasonPackCodexJob = {
+  id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  episodeCount: number;
+  result?: {
+    episodes: SeasonPackEpisodeResult[];
+    manifest?: Record<string, unknown> | null;
+    seasonPlan?: Record<string, unknown> | null;
+  } | null;
+  error?: string | null;
+};
+
 type PromptSafetyOptimizationResult = {
   targetModel: string;
   status: "PASSED" | "OPTIMIZED" | "BLOCKED_NEEDS_USER_EDIT";
@@ -269,6 +287,21 @@ function buildBatchEpisodeScript(baseScript: string, episodeIndex: number, episo
   ].join("\n");
 }
 
+function episodeSourceText(baseScript: string, episodeIndex: number, episodeCount: number, episodeResult: AnalysisResult) {
+  const source = baseScript.trim();
+  const excerpt = source.length > 1400 ? `${source.slice(0, 1400)}\n...` : source;
+  return [
+    `整季文件包生成：第 ${episodeIndex} / ${episodeCount} 集`,
+    `本集标题：${episodeResult.title}`,
+    "",
+    "本集生成文案：",
+    episodeResult.optimizedScript,
+    "",
+    "整季原始输入摘录：",
+    excerpt,
+  ].join("\n");
+}
+
 export function DashboardClient() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [script, setScript] = useState("一个男人在雨夜收到一张旧照片，发现照片里的人竟然是多年后死去的自己。他沿着照片背后的地址，走进一栋废弃大楼。");
@@ -403,6 +436,59 @@ export function DashboardClient() {
       throw new Error(data?.error || "Codex 视频提示词任务创建失败");
     }
     return data.job as VideoPromptCodexJob;
+  }
+
+  async function createSeasonPackCodexJob(
+    inputScript: string,
+    inputDuration: string,
+    projectId: string | undefined,
+  ) {
+    const res = await fetch("/api/season-pack/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        script: inputScript,
+        duration: inputDuration,
+        episodeCount,
+        projectId: projectId || undefined,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.error || "Codex 整季提示词任务创建失败");
+    }
+    return data.job as SeasonPackCodexJob;
+  }
+
+  async function pollSeasonPackCodexJob(jobId: string) {
+    const startedAt = Date.now();
+    const timeoutMs = Math.max(45 * 60_000, episodeCount * 3 * 60_000);
+    let lastStatus = "";
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const res = await fetch(`/api/season-pack/jobs/${jobId}`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || "Codex 整季提示词任务读取失败");
+      }
+
+      const currentJob = data.job as SeasonPackCodexJob;
+      if (currentJob.status !== lastStatus) {
+        lastStatus = currentJob.status;
+        setGenerationProgress(
+          currentJob.status === "running"
+            ? `Codex 正在一次性生成 ${currentJob.episodeCount || episodeCount} 集视频提示词文件包...`
+            : `Codex 整季提示词任务状态：${currentJob.status}`,
+        );
+      }
+      if (currentJob.status === "completed") return currentJob;
+      if (currentJob.status === "failed") {
+        throw new Error(currentJob.error || "Codex 整季提示词任务失败");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+    }
+
+    throw new Error("Codex 整季提示词任务等待超时，请确认 season-pack:codex-worker 正在运行。");
   }
 
   async function pollVideoPromptCodexJob(jobId: string) {
@@ -609,11 +695,22 @@ export function DashboardClient() {
     let latestSave: ProjectSaveState | null = null;
     setBatchGenerating(true);
 
-    for (let episodeIndex = 1; episodeIndex <= episodeCount; episodeIndex += 1) {
-      const episodeScript = buildBatchEpisodeScript(script, episodeIndex, episodeCount);
+    setGenerationProgress(`正在创建 ${episodeCount} 集整季提示词文件包任务...`);
+    const job = await createSeasonPackCodexJob(script, selectedDurationValue(), activeProjectId || undefined);
+    setGenerationProgress(`已创建整季任务 ${job.id}，请确认 season-pack:codex-worker 正在运行。`);
+    const seasonPackJob = await pollSeasonPackCodexJob(job.id);
+    const episodes = [...(seasonPackJob.result?.episodes || [])].sort((left, right) => left.episodeIndex - right.episodeIndex);
+    if (episodes.length !== episodeCount) {
+      throw new Error(`整季提示词任务完成但集数不完整：${episodes.length} / ${episodeCount}`);
+    }
+
+    for (const episode of episodes) {
+      const episodeIndex = episode.episodeIndex;
+      const episodeResult = episode.result;
+      const episodeScript = episodeSourceText(script, episodeIndex, episodeCount, episodeResult);
       setGenerationProgress(`正在生成第 ${episodeIndex} / ${episodeCount} 集...`);
 
-      const episodeResult = await requestAnalysisWithContext(episodeScript, selectedDurationValue(), activeProjectId || undefined, undefined);
+      setGenerationProgress(`正在保存第 ${episodeIndex} / ${episodeCount} 集...`);
       const fullVideoPrompt = buildVideoGenerationPromptText(episodeResult);
       const save = await saveAnalysisProject(episodeScript, episodeResult, fullVideoPrompt, activeProjectId || undefined, undefined);
       if (!save.saved || !save.projectId || !save.versionId) {
