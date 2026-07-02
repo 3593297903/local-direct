@@ -226,6 +226,7 @@ function buildSeasonPackCodexPrompt(
     "Each episode file must contain one strict Local Director AnalysisResult JSON object.",
     "Each AnalysisResult must include optimizedScript, workflow.fullVideoPrompt, workflow.fullNegativePrompt, and storyboard.",
     "Every storyboard shot must include shotNumber, timeRange, scene, visual, shotType, composition, cameraMovement, lighting, sound, dialogue, emotion, transition, shotPurpose, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt.",
+    "For silent shots, set dialogue to the exact string \"无\". Never leave dialogue empty and never omit it.",
     "",
     "Write these files as UTF-8 with Node.js fs.writeFileSync. Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
     `Pack directory: ${paths.packDir}`,
@@ -367,6 +368,7 @@ async function readOutputJson(filePath: string, sourceText = "") {
       throw new SeasonPackCodexQueueError(`Season pack output file is empty: ${filePath}`);
     }
     const result = JSON.parse(stripJsonBom(await readFile(filePath, "utf8"))) as Record<string, unknown>;
+    normalizeAnalysisResultShape(result);
     validateAnalysisResultShape(result);
     validateEncodingQuality(result, sourceText);
     return result;
@@ -450,6 +452,17 @@ function validateAnalysisResultShape(result: Record<string, unknown>) {
       }
     }
   });
+}
+
+function normalizeAnalysisResultShape(result: Record<string, unknown>) {
+  if (!Array.isArray(result.storyboard)) return;
+  for (const shot of result.storyboard) {
+    if (!shot || typeof shot !== "object") continue;
+    const record = shot as Record<string, unknown>;
+    if (record.dialogue === undefined || record.dialogue === null || (typeof record.dialogue === "string" && !record.dialogue.trim())) {
+      record.dialogue = "无";
+    }
+  }
 }
 
 function validateCreateInput(input: CreateSeasonPackCodexJobInput) {

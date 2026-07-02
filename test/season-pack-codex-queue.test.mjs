@@ -111,6 +111,33 @@ test("creates, claims, and completes a season pack Codex job from per-episode fi
   }
 });
 
+test("normalizes empty storyboard dialogue instead of failing a completed season pack", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createSeasonPackCodexJob(
+      {
+        script: "Episode 1 has a silent shot without dialogue.",
+        episodeCount: 1,
+      },
+      { rootDir },
+    );
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    const result = sampleAnalysisResult(1);
+    result.storyboard[0].dialogue = "";
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(result, null, 2), "utf8");
+
+    const completed = await completeSeasonPackCodexJob(job.id, { rootDir });
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result.episodes[0].result.storyboard[0].dialogue, "无");
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("rejects season pack jobs above 30 episodes", async () => {
   await assert.rejects(
     () => createSeasonPackCodexJob({ script: "A long project outline.", episodeCount: 31 }, { rootDir: makeTempRoot() }),
