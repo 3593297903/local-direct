@@ -352,16 +352,16 @@ function buildAnalysisResultFromProjectVersion(project: ProjectDetail, version: 
     shotNumber: shot.shotNumber,
     timeRange: shot.timeRange || buildShotTimeRange(index, version.shots.length, duration),
     scene: shot.scene || "镜头",
-    visual: shot.visual || shot.videoPrompt || "画面按本集剧情推进。",
+    visual: shot.visual || shot.videoPrompt || "画面按本段剧情推进。",
     shotType: shot.shotType || "中景",
     composition: shot.composition || "保持电影级构图，主体清晰，空间关系明确。",
     cameraMovement: shot.cameraMovement || "稳定轻微推进",
-    lighting: shot.lighting || "自然电影光影，色调与本集风格一致。",
+    lighting: shot.lighting || "自然电影光影，色调与本段风格一致。",
     sound: shot.sound || "真实环境声",
     dialogue: shot.dialogue || "无台词",
     emotion: shot.emotion || "克制",
     transition: shot.transition || "自然切换",
-    shotPurpose: shot.shotPurpose || "推动本集剧情信息。",
+    shotPurpose: shot.shotPurpose || "推动本段剧情信息。",
     firstFramePrompt: shot.firstFramePrompt || shot.visual || shot.videoPrompt || "镜头起始画面。",
     videoPrompt: shot.videoPrompt || shot.visual || "本镜头视频提示词。",
     lastFramePrompt: shot.lastFramePrompt || shot.visual || shot.videoPrompt || "镜头结束画面。",
@@ -410,9 +410,9 @@ function getStoryboardAssetShotNumbers(version: ProjectVersion) {
 
 function getEpisodeStoryboardActionLabel(version: ProjectVersion) {
   const generatedCount = getStoryboardAssetShotNumbers(version).size;
-  if (generatedCount <= 0) return "生成本集镜头分镜图";
-  if (generatedCount < version.shots.length) return "补齐本集镜头分镜图";
-  return "重新生成本集分镜图";
+  if (generatedCount <= 0) return "生成本段镜头分镜图";
+  if (generatedCount < version.shots.length) return "补齐本段镜头分镜图";
+  return "重新生成本段分镜图";
 }
 
 function getEpisodeStoryboardTargetShots(version: ProjectVersion) {
@@ -638,10 +638,10 @@ export function ProjectsClient() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        title: `${selectedVersion.title}-第${selectedVersion.versionNumber}集`,
+        title: `${selectedVersion.title}-第${selectedVersion.versionNumber}段`,
         sections: [
           {
-            heading: `${selectedVersion.title} 第${selectedVersion.versionNumber}集`,
+            heading: `${selectedVersion.title} 第${selectedVersion.versionNumber}段`,
             originalText: selectedVersion.originalScript,
             promptText: buildPromptText(selectedVersion),
           },
@@ -658,7 +658,7 @@ export function ProjectsClient() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${selectedVersion.title}-第${selectedVersion.versionNumber}集.docx`;
+    link.download = `${selectedVersion.title}-第${selectedVersion.versionNumber}段.docx`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -679,7 +679,7 @@ export function ProjectsClient() {
 
   async function createProjectStoryboardCodexJob(version: ProjectVersion, shots: ProjectShot[]) {
     if (!project) throw new Error("项目详情未加载完成");
-    if (!shots.length) throw new Error("本集没有可生成的镜头");
+    if (!shots.length) throw new Error("本段没有可生成的镜头");
 
     const res = await fetch("/api/storyboard-image/jobs", {
       method: "POST",
@@ -687,7 +687,7 @@ export function ProjectsClient() {
       body: JSON.stringify({
         projectId: project.id,
         versionId: version.id,
-        title: `${project.title} 第${version.versionNumber}集`,
+        title: `${project.title} 第${version.versionNumber}段`,
         style: `${version.style || project.style || "电影级分镜"}，16:9 彩色电影级分镜图，电影光影，写实概念美术`,
         storyboard: shots.map(mapProjectShotToStoryboardJobShot),
       }),
@@ -813,7 +813,7 @@ export function ProjectsClient() {
       if (!Object.keys(panels).length) throw new Error("Codex 分镜图任务完成但没有生成镜头图片");
       await saveProjectStoryboardVisualAssets(completedJob, savedPanelIds);
       await reloadSelectedProject(project.id, selectedVersion?.id || version.id);
-      setStoryboardGenerationMessage("镜头分镜图生成完成，已保存到本集镜头表。");
+      setStoryboardGenerationMessage("镜头分镜图生成完成，已保存到本段镜头表。");
     } catch (err) {
       if (savedPanelIds.size > 0) {
         await reloadSelectedProject(project.id, selectedVersion?.id || version.id).catch(() => undefined);
@@ -874,7 +874,7 @@ export function ProjectsClient() {
         lastStatus = currentJob.status;
         setPromptSafetyMessage(
           currentJob.status === "running"
-            ? "Codex 正在本地优化本集 Seedance 2.0 合规提示词..."
+            ? "Codex 正在本地优化本段 Seedance 2.0 合规提示词..."
             : `Seedance 合规优化任务状态：${currentJob.status}`,
         );
       }
@@ -890,7 +890,7 @@ export function ProjectsClient() {
     if (!project || !selectedVersion) return;
     setPromptSafetyLoading(true);
     setPromptSafetyError("");
-    setPromptSafetyMessage("已创建本集 Seedance 合规优化准备任务，请确认 prompt-safety:codex-worker 正在运行。");
+    setPromptSafetyMessage("已创建本段 Seedance 合规优化准备任务，请确认 prompt-safety:codex-worker 正在运行。");
 
     try {
       const sourceResult = buildAnalysisResultFromProjectVersion(project, selectedVersion);
@@ -901,7 +901,7 @@ export function ProjectsClient() {
       if (!safetyResult || !optimizedResult) throw new Error("Seedance 合规优化完成但没有返回优化结果");
       if (safetyResult.status === "BLOCKED_NEEDS_USER_EDIT") {
         const reason = safetyResult.findings.map((finding) => finding.reason).filter(Boolean).join("；");
-        throw new Error(reason || "当前本集提示词无法自动合规改写，需要先调整文案");
+        throw new Error(reason || "当前本段提示词无法自动合规改写，需要先调整文案");
       }
 
       const optimizedPromptText = buildAnalysisResultPromptText(optimizedResult);
@@ -921,7 +921,7 @@ export function ProjectsClient() {
 
       await reloadSelectedProject(project.id, selectedVersion.id);
       setPromptSafetyMessage(
-        `Seedance 合规优化完成并已应用到本集：${safetyResult.findings.length} 处风险记录，${safetyResult.changeSummary.length} 条修改说明。`,
+        `Seedance 合规优化完成并已应用到本段：${safetyResult.findings.length} 处风险记录，${safetyResult.changeSummary.length} 条修改说明。`,
       );
     } catch (err) {
       setPromptSafetyError(err instanceof Error ? err.message : "Seedance 合规优化失败");
@@ -991,17 +991,17 @@ export function ProjectsClient() {
 
   async function deleteSelectedEpisode() {
     if (!project || !selectedVersion) return;
-    if (!window.confirm(`确定删除第 ${selectedVersion.versionNumber} 集吗？后面的集数会自动补位。`)) return;
+    if (!window.confirm(`确定删除第 ${selectedVersion.versionNumber} 段吗？后面的段数会自动补位。`)) return;
 
     setDeletingEpisode(true);
     setProjectDetailError("");
     try {
       const res = await fetch(`/api/projects/${project.id}?versionId=${selectedVersion.id}`, { method: "DELETE" });
       const data = await res.json().catch(() => null);
-      if (!res.ok || !data?.ok) throw new Error(data?.error || "剧集删除失败");
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "分段删除失败");
       await reloadSelectedProject(project.id);
     } catch (err) {
-      setProjectDetailError(err instanceof Error ? err.message : "剧集删除失败");
+      setProjectDetailError(err instanceof Error ? err.message : "分段删除失败");
     } finally {
       setDeletingEpisode(false);
     }
@@ -1217,7 +1217,7 @@ export function ProjectsClient() {
                     {projectDetailView === "assets" ? <Check className="h-3.5 w-3.5" /> : "1"}
                   </span>
                   <BookOpen className="h-4 w-4" />
-                  <span>剧集</span>
+                  <span>分段</span>
                 </button>
                 <span className="projects-stepper-connector" aria-hidden="true" />
                 <button
@@ -1236,11 +1236,11 @@ export function ProjectsClient() {
                   type="button"
                   className="projects-stepper-item projects-stepper-disabled"
                   disabled
-                  title="后续接入分集视频生成"
+                  title="后续接入分段视频生成"
                 >
                   <span className="projects-stepper-number">3</span>
                   <Clapperboard className="h-4 w-4" />
-                  <span>分集视频</span>
+                  <span>分段视频</span>
                 </button>
               </div>
 
@@ -1265,7 +1265,7 @@ export function ProjectsClient() {
                     className="projects-action-button"
                   >
                     <Edit3 className="h-4 w-4" />
-                    新建一集
+                    新建一段
                   </button>
                   <button
                     onClick={generateEpisodeStoryboards}
@@ -1289,7 +1289,7 @@ export function ProjectsClient() {
                     className="projects-action-button projects-action-danger disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     {deletingEpisode ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                    删除本集
+                    删除本段
                   </button>
                   <button
                     onClick={copyPrompt}
@@ -1348,11 +1348,11 @@ export function ProjectsClient() {
                   <div className="mb-3 flex items-center justify-between gap-3 text-sm font-bold text-white">
                     <div className="flex items-center gap-2">
                       <CalendarClock className="h-4 w-4 text-cyan-100" />
-                      剧集列表
+                      分段列表
                     </div>
-                    <span className="text-xs font-semibold text-slate-500">共 {project.versions.length} 集</span>
+                    <span className="text-xs font-semibold text-slate-500">共 {project.versions.length} 段</span>
                   </div>
-                  <div className="projects-version-list" aria-label="项目剧集列表">
+                  <div className="projects-version-list" aria-label="项目分段列表">
                     {project.versions.map((version) => (
                       <button
                         key={version.id}
@@ -1362,7 +1362,7 @@ export function ProjectsClient() {
                           version.id === selectedVersion.id ? "projects-version-button-active" : ""
                         }`}
                       >
-                        <span>第 {version.versionNumber} 集</span>
+                        <span>第 {version.versionNumber} 段</span>
                         <span>{formatDate(version.createdAt)}</span>
                       </button>
                     ))}

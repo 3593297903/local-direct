@@ -13,6 +13,7 @@ test("Next projects route proxies authenticated project reads and writes to Nest
   assert.match(helper, /mapAnalysisResultToNestProjectBody/);
   assert.match(helper, /originalScript/);
   assert.match(helper, /storyboard\.map/);
+  assert.match(helper, /payload \? payload\.message \|\| payload\.error \|\| fallback : fallback/);
 
   const route = readFileSync("app/api/projects/route.ts", "utf8");
   assert.doesNotMatch(route, /supabase/i);

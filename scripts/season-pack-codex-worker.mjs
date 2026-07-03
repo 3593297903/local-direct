@@ -81,8 +81,10 @@ async function postJson(pathname, body) {
 
 function buildCodexPrompt(task) {
   return [
-    "You are running Local Director season one-shot generation from a local Codex CLI worker.",
+    "You are running Local Director season planning from a local Codex CLI worker.",
     "The task prompt already contains the full source, output paths, and file-pack contract.",
+    "This task must create Story Bible, Episode Chain, and Episode Input Packs only.",
+    "Do not create final AnalysisResult JSON here.",
     "Follow it exactly. Do not call network providers. Do not open a browser. Do not ask for user input.",
     "After writing and validating the file pack, reply with exactly one line: DONE.",
     "",
@@ -159,12 +161,13 @@ async function assertSeasonPackOutput(task) {
     const raw = await assertJsonFile(filePath, fileName);
     const parsed = JSON.parse(stripJsonBom(raw));
     if (!parsed || typeof parsed !== "object") throw new Error(`${fileName} is not a JSON object`);
-    if (typeof parsed.optimizedScript !== "string") throw new Error(`${fileName} is missing optimizedScript`);
-    if (!parsed.workflow || typeof parsed.workflow.fullVideoPrompt !== "string") {
-      throw new Error(`${fileName} is missing workflow.fullVideoPrompt`);
+    for (const field of ["episodeIndex", "title", "sourceText", "duration", "contentType", "style", "storyBible", "episodeChain", "blueprint", "shotCount", "renderInputScript"]) {
+      if (parsed[field] === undefined || parsed[field] === null || parsed[field] === "") {
+        throw new Error(`${fileName} is missing ${field}`);
+      }
     }
-    if (!Array.isArray(parsed.storyboard) || parsed.storyboard.length < 1) {
-      throw new Error(`${fileName} is missing storyboard`);
+    if (Array.isArray(parsed.storyboard) || typeof parsed?.workflow?.fullVideoPrompt === "string") {
+      throw new Error(`${fileName} must be an Episode Input Pack, not a final AnalysisResult`);
     }
     assertNoEncodingDamage(raw, `${task.script || ""}\n${task.prompt || ""}`);
   }

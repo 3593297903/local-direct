@@ -88,7 +88,7 @@ function buildCodexPrompt(task) {
     "Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
     "After writing, read the file back as UTF-8 and confirm Chinese characters are preserved, not replaced by question marks.",
     "",
-    "The JSON must include optimizedScript, workflow.fullVideoPrompt, and storyboard.",
+    "The JSON must include optimizedScript, workflow.fullVideoPrompt, workflow.concisePrompt, and storyboard.",
     `Task ID: ${task.id}`,
     `Output path: ${task.outputPath}`,
     "",

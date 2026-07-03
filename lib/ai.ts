@@ -87,7 +87,7 @@ const AnalysisSchema = z.object({
     fullNegativePrompt: ModelString,
     shotPromptText: OptionalModelString,
     editingPlan: OptionalModelString,
-    concisePrompt: ModelString,
+    concisePrompt: OptionalModelString,
     finalPromptPackage: OptionalModelString,
   }).optional(),
   storyboard: z.array(z.object({
@@ -393,6 +393,27 @@ export function repairTemplatePlaceholders<T extends AnalysisResult>(result: T):
   };
 }
 
+function cleanAnalysisString(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeParsedAnalysisResult(result: z.infer<typeof AnalysisSchema>): AnalysisResult {
+  if (!result.workflow) return result as AnalysisResult;
+
+  const concisePrompt =
+    cleanAnalysisString(result.workflow.concisePrompt) ||
+    cleanAnalysisString(result.optimizedScript) ||
+    cleanAnalysisString(result.workflow.fullVideoPrompt);
+
+  return {
+    ...result,
+    workflow: {
+      ...result.workflow,
+      concisePrompt,
+    },
+  } as AnalysisResult;
+}
+
 function isTemplatePlaceholderError(error: unknown): error is TemplatePlaceholderError {
   return error instanceof TemplatePlaceholderError || (error instanceof Error && error.name === "TemplatePlaceholderError");
 }
@@ -685,7 +706,7 @@ async function callOpenAICompatible(input: AnalyzeScriptInput & { provider: stri
   if (!content) throw new Error("AI returned empty content");
 
   const parsed = parseProviderJson(content, { requestId: input.requestId, provider, model });
-  const result = repairTemplatePlaceholders(AnalysisSchema.parse(parsed));
+  const result = repairTemplatePlaceholders(normalizeParsedAnalysisResult(AnalysisSchema.parse(parsed)));
   assertNoTemplatePlaceholders(result);
   logger.info("ai_provider_request_completed", {
     requestId: input.requestId,
@@ -771,7 +792,7 @@ async function callAnthropic(input: AnalyzeScriptInput) {
   const data = await res.json();
   const text = data.content?.map((c: { text?: string }) => c.text).join("\n") || "";
   const parsed = parseProviderJson(text, { requestId: input.requestId, provider, model });
-  const result = repairTemplatePlaceholders(AnalysisSchema.parse(parsed));
+  const result = repairTemplatePlaceholders(normalizeParsedAnalysisResult(AnalysisSchema.parse(parsed)));
   assertNoTemplatePlaceholders(result);
   logger.info("ai_provider_request_completed", {
     requestId: input.requestId,

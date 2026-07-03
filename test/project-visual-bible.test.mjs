@@ -89,9 +89,9 @@ test("Projects page separates episode content from the project asset library", (
 
   assert.match(client, /projectDetailView/);
   assert.match(client, /projects-project-stepper/);
-  assert.match(client, /剧集/);
+  assert.match(client, /分段/);
   assert.match(client, /资产库/);
-  assert.match(client, /分集视频/);
+  assert.match(client, /分段视频/);
   assert.match(client, /setProjectDetailView\("episodes"\)/);
   assert.match(client, /setProjectDetailView\("assets"\)/);
   assert.match(client, /projectAssetLibrarySections/);

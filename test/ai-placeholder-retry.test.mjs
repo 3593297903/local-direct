@@ -252,3 +252,90 @@ test("AI provider non-JSON responses fail with a clear diagnostic error", async 
     else process.env.AI_MODEL = originalModel;
   }
 });
+
+test("AI provider results fill missing workflow concisePrompt from optimized script", async () => {
+  const { analyzeScriptDirect } = await import(moduleUrl);
+  const originalFetch = globalThis.fetch;
+  const originalProvider = process.env.AI_PROVIDER;
+  const originalAiKey = process.env.AI_API_KEY;
+  const originalKey = process.env.OPENAI_API_KEY;
+  const originalModel = process.env.AI_MODEL;
+
+  try {
+    process.env.AI_PROVIDER = "openai";
+    process.env.AI_API_KEY = "test-key";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.AI_MODEL = "test-model";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  title: "测试片段",
+                  contentType: "短剧",
+                  duration: "15秒",
+                  style: "冷静写实",
+                  diagnosis: [],
+                  optimizedScript: "完整视频提示词文本",
+                  workflow: {
+                    sourceAnalysis: "源文案分析",
+                    generationDiagnosis: {
+                      genre: "短剧",
+                      emotions: ["克制"],
+                      sceneKeywords: ["室内"],
+                      visualFocus: ["纸张"],
+                      cameraStrategy: "固定镜头",
+                      avoid: [],
+                    },
+                    screenplay: "可拍摄剧本",
+                    filmScript: "电影分镜脚本",
+                    fullVideoPrompt: "完整视频提示词文本",
+                    fullNegativePrompt: "不要乱码，不要水印。",
+                  },
+                  storyboard: [
+                    {
+                      shotNumber: 1,
+                      timeRange: "0.0s-4.0s",
+                      scene: "室内",
+                      visual: "纸张放在桌面上，窗外冷光照入。",
+                      shotType: "近景",
+                      cameraMovement: "固定镜头",
+                      emotion: "克制",
+                      transition: "硬切",
+                      firstFramePrompt: "室内桌面纸张近景。",
+                      videoPrompt: "镜头固定，纸张在冷光中轻微颤动。",
+                      lastFramePrompt: "画面停在纸张边缘。",
+                      negativePrompt: "不要乱码，不要水印。",
+                    },
+                  ],
+                  recommendedItems: [],
+                  editingNotes: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+
+    const result = await analyzeScriptDirect({
+      script: "室内桌面上有一张纸。",
+      duration: "15秒",
+      requestId: "test_missing_concise_prompt",
+    });
+
+    assert.equal(result.workflow?.concisePrompt, "完整视频提示词文本");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalProvider === undefined) delete process.env.AI_PROVIDER;
+    else process.env.AI_PROVIDER = originalProvider;
+    if (originalAiKey === undefined) delete process.env.AI_API_KEY;
+    else process.env.AI_API_KEY = originalAiKey;
+    if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalKey;
+    if (originalModel === undefined) delete process.env.AI_MODEL;
+    else process.env.AI_MODEL = originalModel;
+  }
+});

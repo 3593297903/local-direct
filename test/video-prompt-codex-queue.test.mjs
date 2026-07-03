@@ -206,6 +206,40 @@ test("completes a Codex video prompt job when the output JSON starts with UTF-8 
   }
 });
 
+test("fills missing workflow concisePrompt from completed Codex video prompt output", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptCodexJob(
+      {
+        script: "A quiet interrogation room scene resolves into a single usable video prompt.",
+        duration: "15 seconds",
+      },
+      { rootDir },
+    );
+
+    const claimed = await claimNextVideoPromptCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    const incomplete = sampleAnalysisResult();
+    delete incomplete.workflow.concisePrompt;
+
+    mkdirSync(path.dirname(claimed.outputPath), { recursive: true });
+    writeFileSync(claimed.outputPath, JSON.stringify(incomplete, null, 2), "utf8");
+
+    const completed = await completeVideoPromptCodexJob(job.id, { rootDir });
+    assert.equal(completed.status, "completed");
+    assert.equal(
+      completed.result.workflow.concisePrompt,
+      completed.result.optimizedScript,
+    );
+
+    const reloaded = await getVideoPromptCodexJob(job.id, { rootDir });
+    assert.equal(reloaded.result.workflow.concisePrompt, reloaded.result.optimizedScript);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("rejects mojibake question-mark output for Chinese video prompt jobs", async () => {
   const rootDir = makeTempRoot();
   try {

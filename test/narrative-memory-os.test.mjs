@@ -60,7 +60,7 @@ test("AI result can carry hidden structured memory without changing full video p
   assert.match(ai, /Do not mix narrativeMemory or qualityCheck into workflow\.shotPromptText or workflow\.fullVideoPrompt/);
   assert.match(proxy, /result\.narrativeMemory/);
   assert.match(proxy, /result\.qualityCheck/);
-  assert.match(proxy, /fullVideoPrompt: payload\.fullVideoPrompt/);
+  assert.match(proxy, /fullVideoPrompt: deriveProjectSaveFullVideoPrompt\(payload\)/);
 });
 
 test("project page keeps director memory tools hidden from normal users", () => {

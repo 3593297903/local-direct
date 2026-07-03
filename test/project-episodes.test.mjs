@@ -20,15 +20,15 @@ test("project save can overwrite the selected episode instead of always creating
   assert.match(dashboard, /versionId,\s*originalScript/s);
 });
 
-test("project versions are presented and downloaded as episodes", () => {
+test("project versions are presented and downloaded as segments", () => {
   const projects = readFileSync("components/ProjectsClient.tsx", "utf8");
 
-  assert.match(projects, /第\s*\{version\.versionNumber\}\s*集/);
+  assert.match(projects, /第\s*\{version\.versionNumber\}\s*段/);
   assert.doesNotMatch(projects, /版本 v\{version\.versionNumber\}/);
-  assert.match(projects, /第\$\{selectedVersion\.versionNumber\}集/);
+  assert.match(projects, /第\$\{selectedVersion\.versionNumber\}段/);
 });
 
-test("users can delete a single episode and remaining episodes are compacted", () => {
+test("users can delete a single segment and remaining segments are compacted", () => {
   const controller = readFileSync("apps/api/src/modules/projects/projects.controller.ts", "utf8");
   const service = readFileSync("apps/api/src/modules/projects/projects.service.ts", "utf8");
   const route = readFileSync("app/api/projects/[projectId]/route.ts", "utf8");

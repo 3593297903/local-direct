@@ -11,6 +11,7 @@ export type CreateVideoPromptCodexJobInput = {
   contentType?: string;
   style?: string;
   duration?: string;
+  projectMemory?: string;
 };
 
 export type VideoPromptCodexJob = {
@@ -21,6 +22,7 @@ export type VideoPromptCodexJob = {
   contentType: string;
   style: string;
   duration: string;
+  projectMemory: string;
   prompt: string;
   status: VideoPromptCodexJobStatus;
   outputFileName: string;
@@ -84,7 +86,8 @@ export async function createVideoPromptCodexJob(
   const outputFileName = `${jobId}.json`;
   const outputPath = path.join(resultDir(rootDir), outputFileName);
   const requestedDuration = normalizeRequestedDuration(input.duration);
-  const normalizedInput = { ...input, duration: requestedDuration };
+  const projectMemory = input.projectMemory || "";
+  const normalizedInput = { ...input, duration: requestedDuration, projectMemory };
   const job: VideoPromptCodexJob = {
     id: jobId,
     projectId: input.projectId || null,
@@ -93,6 +96,7 @@ export async function createVideoPromptCodexJob(
     contentType: input.contentType || "短剧 / 通用",
     style: input.style || "自动匹配文案气质",
     duration: requestedDuration,
+    projectMemory,
     prompt: buildVideoPromptCodexPrompt(normalizedInput, outputPath),
     status: "pending",
     outputFileName,
@@ -200,6 +204,7 @@ function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outp
     "- optimizedScript",
     "- workflow.fullVideoPrompt",
     "- workflow.fullNegativePrompt",
+    "- workflow.concisePrompt",
     "- storyboard",
     "",
     "Storyboard requirements:",
@@ -229,19 +234,22 @@ function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outp
     `Content type: ${input.contentType || "短剧 / 通用"}`,
     `Style: ${input.style || "自动匹配文案气质"}`,
     `Duration: ${requestedDuration}`,
+    "",
+    "Project memory / continuity context:",
+    input.projectMemory || "(none)",
     `Output path: ${outputPath}`,
     "",
     "Completion requirements:",
     "1. Write the final JSON object to the exact output path.",
     "2. Create the output directory first if it does not exist.",
-    "3. Ensure the file is valid JSON and includes optimizedScript plus workflow.fullVideoPrompt.",
+    "3. Ensure the file is valid JSON and includes optimizedScript, workflow.fullVideoPrompt, and workflow.concisePrompt.",
     "4. Reply with one line only: DONE.",
   ].join("\n");
 }
 
 async function syncAndSaveJob(rootDir: string, job: VideoPromptCodexJob) {
   const synced = await syncJobFromOutputFile(job);
-  const finalized = applyJobStatus(synced);
+  const finalized = applyJobStatus(normalizeCompletedJobResult(synced));
   if (JSON.stringify(finalized) !== JSON.stringify(job)) {
     await writeJob(rootDir, finalized);
   }
@@ -317,7 +325,7 @@ async function ensureQueueDirs(rootDir: string) {
 
 async function readOutputJson(filePath: string, sourceText = "") {
   try {
-    const result = JSON.parse(stripJsonBom(await readFile(filePath, "utf8"))) as Record<string, unknown>;
+    const result = normalizeAnalysisResultShape(JSON.parse(stripJsonBom(await readFile(filePath, "utf8"))) as Record<string, unknown>);
     validateAnalysisResultShape(result);
     validateVideoPromptEncodingQuality(result, sourceText);
     return result;
@@ -328,6 +336,59 @@ async function readOutputJson(filePath: string, sourceText = "") {
         : `Codex did not produce valid video prompt JSON: ${filePath}`,
     );
   }
+}
+
+function normalizeCompletedJobResult(job: VideoPromptCodexJob): VideoPromptCodexJob {
+  if (job.status !== "completed" || !job.result) return job;
+
+  const normalizedResult = normalizeAnalysisResultShape(
+    JSON.parse(JSON.stringify(job.result)) as Record<string, unknown>,
+  );
+  if (JSON.stringify(normalizedResult) === JSON.stringify(job.result)) return job;
+  return { ...job, result: normalizedResult };
+}
+
+function normalizeAnalysisResultShape(result: Record<string, unknown>) {
+  const workflow = result.workflow && typeof result.workflow === "object"
+    ? (result.workflow as Record<string, unknown>)
+    : {};
+
+  const optimizedScript = cleanString(result.optimizedScript);
+  const fullVideoPrompt = cleanString(workflow.fullVideoPrompt);
+  const fallbackPrompt = optimizedScript || fullVideoPrompt;
+
+  result.workflow = workflow;
+
+  if (!cleanString(workflow.concisePrompt)) {
+    workflow.concisePrompt = fallbackPrompt;
+  }
+  if (!cleanString(workflow.sourceAnalysis)) {
+    workflow.sourceAnalysis = cleanString(result.title) || fallbackPrompt;
+  }
+  if (!cleanString(workflow.screenplay)) {
+    workflow.screenplay = fallbackPrompt;
+  }
+  if (!cleanString(workflow.filmScript)) {
+    workflow.filmScript = fullVideoPrompt || optimizedScript;
+  }
+  if (!cleanString(workflow.fullNegativePrompt)) {
+    workflow.fullNegativePrompt = "不要乱码，不要字幕错误，不要水印，不要畸形肢体，不要过曝画面。";
+  }
+  if (!Array.isArray(result.diagnosis)) {
+    result.diagnosis = [];
+  }
+  if (!Array.isArray(result.recommendedItems)) {
+    result.recommendedItems = workflow.concisePrompt ? [workflow.concisePrompt] : [];
+  }
+  if (!Array.isArray(result.editingNotes)) {
+    result.editingNotes = [];
+  }
+
+  return result;
+}
+
+function cleanString(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function stripJsonBom(value: string) {

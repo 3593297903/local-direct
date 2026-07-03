@@ -14,10 +14,12 @@ test("project versions persist the exact rendered full video prompt", () => {
   assert.match(dto, /fullVideoPrompt\?: string/);
   assert.match(service, /fullVideoPrompt: input\.fullVideoPrompt/);
   assert.match(service, /fullVideoPrompt: true/);
-  assert.match(proxy, /fullVideoPrompt: payload\.fullVideoPrompt/);
+  assert.match(proxy, /fullVideoPrompt: deriveProjectSaveFullVideoPrompt\(payload\)/);
+  assert.match(proxy, /function deriveProjectSaveFullVideoPrompt/);
 
   assert.match(dashboard, /const fullVideoPrompt = buildVideoGenerationPromptText\(singleResult\)/);
   assert.match(dashboard, /saveAnalysisProject\(script, singleResult, fullVideoPrompt\)/);
+  assert.match(dashboard, /const episodeResult = normalizeBatchEpisodeResult/);
   assert.match(dashboard, /const fullVideoPrompt = buildVideoGenerationPromptText\(episodeResult\)/);
   assert.match(dashboard, /saveAnalysisProject\(episodeScript, episodeResult, fullVideoPrompt, activeProjectId \|\| undefined, undefined\)/);
   assert.doesNotMatch(dashboard, /save:\s*true/);

@@ -60,7 +60,21 @@ type VideoPromptCodexJob = {
 type SeasonPackEpisodeResult = {
   episodeIndex: number;
   fileName: string;
-  result: AnalysisResult;
+  input: SeasonPackEpisodeInput;
+};
+
+type SeasonPackEpisodeInput = {
+  episodeIndex: number;
+  title: string;
+  sourceText: string;
+  duration: string;
+  contentType: string;
+  style: string;
+  storyBible: unknown;
+  episodeChain: unknown;
+  blueprint: unknown;
+  shotCount: number;
+  renderInputScript: string;
 };
 
 type SeasonPackCodexJob = {
@@ -117,6 +131,31 @@ type BatchPromptSection = {
 type DurationMode = "auto" | "fixed";
 
 const MAX_EPISODE_BATCH_COUNT = 30;
+const BATCH_SINGLE_RENDER_CONCURRENCY = 3;
+const GENERIC_SEASON_TEMPLATE_PHRASES = [
+  "人物、地点和关键物件按案件逻辑分层",
+  "缓慢推进后停住",
+  "同期环境声、脚步声、纸张声或市场声",
+  "保留北方县城真实空间感",
+];
+const REQUIRED_BATCH_SEGMENT_SHOT_FIELDS = [
+  "timeRange",
+  "scene",
+  "visual",
+  "shotType",
+  "composition",
+  "cameraMovement",
+  "lighting",
+  "sound",
+  "dialogue",
+  "emotion",
+  "transition",
+  "shotPurpose",
+  "firstFramePrompt",
+  "videoPrompt",
+  "lastFramePrompt",
+  "negativePrompt",
+] as const;
 
 const particleColors = [
   "rgba(129, 140, 248, 0.45)",
@@ -229,21 +268,25 @@ function ResultTextBlock({
 
 function buildVideoGenerationPromptText(result: AnalysisResult) {
   const workflow = result.workflow;
-  const coreTheme = workflow?.coreTheme || `${result.title}：围绕原文案核心事件，保持人物关系、线索顺序和情绪推进，生成一段可直接执行的 AI 视频提示词。`;
+  const title = cleanPromptValue(result.title, "未命名视频提示词");
+  const duration = cleanPromptValue(result.duration, "15秒");
+  const style = cleanPromptValue(result.style, "电影级写实");
+  const contentType = cleanPromptValue(result.contentType, "短剧 / 通用");
+  const coreTheme = cleanPromptValue(workflow?.coreTheme, "") || `${title}：围绕原文案核心事件，保持人物关系、线索顺序和情绪推进，生成一段可直接执行的 AI 视频提示词。`;
   const technicalParams =
-    workflow?.videoParameterLock ||
+    cleanPromptValue(workflow?.videoParameterLock, "") ||
     [
-      `总时长：${result.duration}`,
+      `总时长：${duration}`,
       "画幅：16:9",
-      `风格：${result.style}`,
-      `场景：${result.contentType}对应的主要空间，保持原文案地点、时间、天气和人物关系一致。`,
+      `风格：${style}`,
+      `场景：${contentType}对应的主要空间，保持原文案地点、时间、天气和人物关系一致。`,
       "运镜原则：按线索推进顺序设计镜头，由空间建立到关键动作，再到人物反应和段尾转场。",
       "光影原则：根据题材控制主色调、明暗层次和真实光源，不使用突兀过曝或廉价特效。",
       "声音原则：以真实环境声、动作声和必要台词为主，不使用喧宾夺主的背景音乐。",
       "画面表达重点：用空间、动作、物件、人物反应和镜头节奏表达剧情，不依赖血腥、怪物、突脸惊吓或无关元素。",
     ].join("\n");
 
-  const shotLines = result.storyboard
+  const shotLines = (Array.isArray(result.storyboard) ? result.storyboard : [])
     .map(
       (shot) =>
         `${shot.timeRange || "-"}｜镜头${shot.shotNumber}｜${shot.shotType || "镜头"}｜${shot.scene || shot.shotPurpose || "剧情推进"}
@@ -265,6 +308,298 @@ ${shot.lighting ? `光影：${shot.lighting}` : ""}
   ].filter(Boolean).join("\n\n");
 }
 
+function cleanPromptValue(value: unknown, fallback = "") {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "undefined" || trimmed === "null" || /\bundefined\b/.test(trimmed)) return fallback;
+  return trimmed;
+}
+
+function normalizeBatchEpisodeResult(
+  baseScript: string,
+  episodeIndex: number,
+  episodeCount: number,
+  result: AnalysisResult,
+  requestedDuration: string,
+) {
+  const sourceInfo = inferBatchEpisodeSourceInfo(baseScript, episodeIndex);
+  const title = cleanPromptValue(result.title, "")
+    || titleFromGeneratedText(result.optimizedScript)
+    || sourceInfo.title
+    || `第${episodeIndex}段`;
+  const duration = cleanPromptValue(result.duration, "")
+    || durationFromGeneratedText(result.optimizedScript)
+    || sourceInfo.duration
+    || normalizePromptDuration(requestedDuration)
+    || "15秒";
+  const contentType = cleanPromptValue(result.contentType, "")
+    || inferPromptContentType(baseScript)
+    || "短剧 / 通用";
+  const style = cleanPromptValue(result.style, "")
+    || inferPromptStyle(baseScript)
+    || "电影级写实";
+  const workflow = result.workflow ? { ...result.workflow } : undefined;
+  const normalizedWorkflow = workflow
+    ? {
+      ...workflow,
+      coreTheme: cleanPromptValue(workflow.coreTheme, "")
+        || `${title}：围绕原文案核心事件，保持人物关系、线索顺序和情绪推进，生成一段可直接执行的 AI 视频提示词。`,
+      videoParameterLock: cleanPromptValue(workflow.videoParameterLock, "")
+        || [
+          `总时长：${duration}`,
+          "画幅：16:9",
+          `风格：${style}`,
+          `场景：${contentType}对应的主要空间，保持原文案地点、时间、天气和人物关系一致。`,
+        ].join("\n"),
+    }
+    : undefined;
+
+  return {
+    ...result,
+    title,
+    duration,
+    contentType,
+    style,
+    workflow: normalizedWorkflow,
+    recommendedItems: Array.isArray(result.recommendedItems) ? result.recommendedItems : [],
+    editingNotes: Array.isArray(result.editingNotes) ? result.editingNotes : [],
+    diagnosis: Array.isArray(result.diagnosis) ? result.diagnosis : [],
+    storyboard: Array.isArray(result.storyboard) ? result.storyboard : [],
+  } as AnalysisResult;
+}
+
+function inferBatchEpisodeSourceInfo(baseScript: string, episodeIndex: number) {
+  const lines = baseScript.replace(/\r\n?/g, "\n").split("\n");
+  let active = false;
+  let title = "";
+  let duration = "";
+  let shotCount = 0;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const segmentMatch = matchPromptSourceSegmentHeading(line);
+    if (segmentMatch) {
+      active = segmentMatch.episodeIndex === episodeIndex;
+      if (active) {
+        title = `第${episodeIndex}段｜${cleanSourceTitle(segmentMatch.title)}`;
+        shotCount = 0;
+      }
+      continue;
+    }
+    if (!active) continue;
+    const durationMatch = line.match(/^(?:总时长|时长)\s*[：:]\s*(\d+(?:\.\d+)?)\s*秒/);
+    if (durationMatch) duration = `${formatPromptSeconds(Number(durationMatch[1]))}秒`;
+    const shotMatch = matchPromptSourceShotLine(line);
+    if (shotMatch) {
+      shotCount += 1;
+      if (shotMatch.endSeconds !== undefined) duration = `${formatPromptSeconds(shotMatch.endSeconds)}秒`;
+    }
+  }
+
+  return { title, duration, shotCount };
+}
+
+function matchPromptSourceSegmentHeading(line: string) {
+  const match = line.match(/^第\s*([0-9一二三四五六七八九十百]+)\s*(?:段|集)\s*(?:[｜|:：\-—]\s*)?(.+)?$/);
+  if (!match) return null;
+  const episodeIndex = parsePromptLocalizedInteger(match[1]);
+  if (!episodeIndex) return null;
+  return { episodeIndex, title: match[2] || `第${episodeIndex}段` };
+}
+
+function matchPromptSourceShotLine(line: string) {
+  const match = line.match(
+    /^(\d+(?:\.\d+)?|(?:\d{1,2}:)?\d{1,2}:\d{2})\s*(?:s|秒)?\s*[-—~～至到]\s*(\d+(?:\.\d+)?|(?:\d{1,2}:)?\d{1,2}:\d{2})\s*(?:s|秒)?\s*(?:[｜|:：\-—]\s*)?镜头\s*[0-9一二三四五六七八九十百]+/,
+  );
+  if (match) return { endSeconds: parsePromptTimecodeSeconds(match[2]) };
+  return /^镜头\s*[0-9一二三四五六七八九十百]+(?:\s*[｜|:：\-—]|$)/.test(line)
+    ? { endSeconds: undefined }
+    : null;
+}
+
+function titleFromGeneratedText(value: unknown) {
+  const text = cleanPromptValue(value, "");
+  const pipeMatch = text.match(/第\s*(\d+)\s*(?:集|段)\s*[｜|]\s*([^。\n]+)/);
+  if (pipeMatch) return `第${Number(pipeMatch[1])}段｜${cleanSourceTitle(pipeMatch[2])}`;
+  const bracketMatch = text.match(/第\s*(\d+)\s*集\s*[《"]?([^》"\n：:]{2,40})/);
+  if (bracketMatch) return `第${Number(bracketMatch[1])}段｜${cleanSourceTitle(bracketMatch[2])}`;
+  return "";
+}
+
+function durationFromGeneratedText(value: unknown) {
+  const text = cleanPromptValue(value, "");
+  const match = text.match(/时长\s*[：:]\s*(\d+(?:\.\d+)?)\s*秒/);
+  return match ? `${formatPromptSeconds(Number(match[1]))}秒` : "";
+}
+
+function normalizePromptDuration(value: string) {
+  const text = cleanPromptValue(value, "");
+  if (!text || /^auto$/i.test(text)) return "";
+  if (/^\d+(?:\.\d+)?$/.test(text)) return `${text}秒`;
+  return text;
+}
+
+function parsePromptDurationSeconds(value: unknown) {
+  const text = cleanPromptValue(value, "");
+  if (!text || /^auto$/i.test(text)) return 0;
+  const match = text.match(/(\d+(?:\.\d+)?)\s*(?:秒|s|seconds?)/i) || text.match(/^(\d+(?:\.\d+)?)$/);
+  if (!match) return 0;
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) ? seconds : 0;
+}
+
+function parsePromptTimecodeSeconds(value: string) {
+  const text = value.trim();
+  if (/^\d+(?:\.\d+)?$/.test(text)) return Number(text);
+  const parts = text.split(":").map((part) => Number(part));
+  if (parts.some((part) => !Number.isFinite(part))) return undefined;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return undefined;
+}
+
+function parsePromptLocalizedInteger(value: string) {
+  const text = value.trim();
+  if (/^\d+$/.test(text)) return Number(text);
+  const digits: Record<string, number> = {
+    零: 0,
+    一: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+  if (text === "十") return 10;
+  const tenIndex = text.indexOf("十");
+  if (tenIndex >= 0) {
+    const left = text.slice(0, tenIndex);
+    const right = text.slice(tenIndex + 1);
+    const tens = left ? digits[left] : 1;
+    const ones = right ? digits[right] : 0;
+    if (tens === undefined || ones === undefined) return 0;
+    return tens * 10 + ones;
+  }
+  return digits[text] || 0;
+}
+
+function minimumBatchStoryboardShotCount(result: AnalysisResult, requestedDuration: string) {
+  const seconds = parsePromptDurationSeconds(result.duration) || parsePromptDurationSeconds(requestedDuration);
+  if (!seconds) return 0;
+  if (seconds <= 8) return 2;
+  if (seconds <= 20) return 4;
+  if (seconds <= 60) return 5;
+  return 6;
+}
+
+function maximumBatchStoryboardShotCount(result: AnalysisResult, requestedDuration: string) {
+  const seconds = parsePromptDurationSeconds(result.duration) || parsePromptDurationSeconds(requestedDuration);
+  if (!seconds) return 0;
+  if (seconds <= 8) return 3;
+  if (seconds <= 20) return 5;
+  if (seconds <= 60) return 8;
+  return 0;
+}
+
+function comparableBatchShotText(value: unknown) {
+  return cleanPromptValue(value, "")
+    .replace(/\s+/g, "")
+    .replace(/[，。；：、“”‘’《》【】（）()|｜\-—_]/g, "")
+    .toLowerCase();
+}
+
+function assertBatchSegmentQuality(
+  baseScript: string,
+  episodeIndex: number,
+  result: AnalysisResult,
+  requestedDuration: string,
+) {
+  const sourceInfo = inferBatchEpisodeSourceInfo(baseScript, episodeIndex);
+  const storyboard = Array.isArray(result.storyboard) ? result.storyboard : [];
+  const maximumShotCount = maximumBatchStoryboardShotCount(result, requestedDuration);
+  if (maximumShotCount > 0 && storyboard.length > maximumShotCount) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：15 秒默认 4-5 镜头，当前 ${storyboard.length} 个镜头过密。`);
+  }
+  if (sourceInfo.shotCount > 0 && (!maximumShotCount || sourceInfo.shotCount <= maximumShotCount) && storyboard.length !== sourceInfo.shotCount) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：源文案有 ${sourceInfo.shotCount} 个镜头，但结果只有 ${storyboard.length} 个镜头。`);
+  }
+  const minimumShotCount = sourceInfo.shotCount > 0 ? 0 : minimumBatchStoryboardShotCount(result, requestedDuration);
+  if (minimumShotCount > 0 && storyboard.length < minimumShotCount) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：镜头数量过少，至少需要 ${minimumShotCount} 个，实际 ${storyboard.length} 个。`);
+  }
+
+  const fullPrompt = buildVideoGenerationPromptText(result);
+  if (/\b(?:undefined|null)\b/i.test(fullPrompt)) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：提示词中包含 undefined/null 字段。`);
+  }
+  if (/16\s*:\s*9\s*竖屏|竖屏\s*16\s*:\s*9|横屏\s*竖屏/.test(fullPrompt)) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：提示词包含 16:9 竖屏这类自相矛盾描述。`);
+  }
+  if (/如上|同上|见上文|其他\s*[：:]\s*无|其它\s*[：:]\s*无|^\s*略\s*$/m.test(fullPrompt)) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：提示词包含如上/同上/略等不可执行占位。`);
+  }
+  if (/第\s*[0-9一二三四五六七八九十百]+\s*集/.test(fullPrompt)) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：提示词混入了“第 X 集”编号，应统一为“第 X 段”。`);
+  }
+  if (fullPrompt.length < 900) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：完整视频提示词过短，疑似摘要版。`);
+  }
+  const templateHits = GENERIC_SEASON_TEMPLATE_PHRASES.reduce(
+    (count, phrase) => count + fullPrompt.split(phrase).length - 1,
+    0,
+  );
+  if (templateHits >= 2) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：提示词仍是模板化概要，没有生成具体镜头。`);
+  }
+
+  const seenVisuals = new Map<string, number>();
+  storyboard.forEach((shot, index) => {
+    for (const field of REQUIRED_BATCH_SEGMENT_SHOT_FIELDS) {
+      const value = shot[field];
+      if (typeof value !== "string" || !value.trim()) {
+        throw new Error(`第 ${episodeIndex} 段生成失败：镜头 ${index + 1} 缺少 ${field} 字段。`);
+      }
+    }
+    const visual = comparableBatchShotText(shot.visual || shot.videoPrompt);
+    if (!visual || visual.length < 24) return;
+    const previous = seenVisuals.get(visual);
+    if (previous !== undefined) {
+      throw new Error(`第 ${episodeIndex} 段生成失败：镜头 ${previous + 1} 和镜头 ${index + 1} 的画面重复。`);
+    }
+    seenVisuals.set(visual, index);
+  });
+}
+
+function inferPromptContentType(sourceText: string) {
+  if (/刑侦|公安|警局|投案|案/.test(sourceText)) return "短剧 / 刑侦惊悚";
+  if (/惊悚|恐怖|旅馆|悬疑/.test(sourceText)) return "短剧 / 悬疑惊悚";
+  if (/短剧/.test(sourceText)) return "短剧 / 通用";
+  return "";
+}
+
+function inferPromptStyle(sourceText: string) {
+  const explicitStyle = sourceText.match(/(?:风格|类型)\s*[：:]\s*([^\n]+)/);
+  if (explicitStyle?.[1]) return explicitStyle[1].trim();
+  if (/中式现实刑侦惊悚片|悲剧收束/.test(sourceText)) return "中式现实刑侦惊悚片 / 悲剧收束";
+  if (/现实主义|现实/.test(sourceText) && /惊悚|悬疑/.test(sourceText)) return "现实主义悬疑惊悚，冷静克制";
+  return "";
+}
+
+function cleanSourceTitle(value: string) {
+  return value
+    .replace(/^第\s*[0-9一二三四五六七八九十百]+\s*(?:段|集)\s*(?:[｜|:：\-—]\s*)?/, "")
+    .replace(/^["'《「“]+|["'》」”]+$/g, "")
+    .trim();
+}
+
+function formatPromptSeconds(value: number) {
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(1)));
+}
+
 function clampEpisodeCount(value: number) {
   if (!Number.isFinite(value)) return 1;
   return Math.min(MAX_EPISODE_BATCH_COUNT, Math.max(1, Math.round(value)));
@@ -275,29 +610,77 @@ function buildBatchEpisodeScript(baseScript: string, episodeIndex: number, episo
   return [
     source,
     "",
-    "批量剧集生成要求：",
-    `这是同一个项目连续生成任务中的第 ${episodeIndex} / ${episodeCount} 集。`,
-    "请只生成当前这一集的完整视频提示词，不要输出其他集。",
-    "如果后端提供了项目记忆，请承接上一集结尾、人物状态、线索、世界观和视觉风格。",
+    "批量分段生成要求：",
+    `这是同一个项目连续生成任务中的第 ${episodeIndex} / ${episodeCount} 段。`,
+    "请只生成当前这一段的完整视频提示词，不要输出其他段。",
+    "如果后端提供了项目记忆，请承接上一段结尾、人物状态、线索、世界观和视觉风格。",
+    "最终标题和提示词必须使用“段”，不要写“第 N 集”或“本集”。",
+    "15 秒默认 4-5 镜头；除非用户明确选择密集镜头版，否则 10-20 秒最多 5 个镜头。",
     episodeIndex === 1
-      ? "本集需要建立核心设定、主要人物关系和本轮剧情钩子。"
+      ? "本段需要建立核心设定、主要人物关系和本轮剧情钩子。"
       : episodeIndex === episodeCount
-        ? "本集需要承接前集并完成本轮情绪收束，结尾可以保留下一轮钩子。"
-        : "本集需要承接前集并推进新的行动、线索或人物关系变化。",
+        ? "本段需要承接前段并完成本轮情绪收束，结尾可以保留下一轮钩子。"
+        : "本段需要承接前段并推进新的行动、线索或人物关系变化。",
   ].join("\n");
 }
 
-function episodeSourceText(baseScript: string, episodeIndex: number, episodeCount: number, episodeResult: AnalysisResult) {
+function buildBatchEpisodeRenderScript(episodeInput: SeasonPackEpisodeInput, episodeCount: number) {
+  return [
+    episodeInput.renderInputScript,
+    "",
+    "多段批量生成一致性锁：",
+    `这是第 ${episodeInput.episodeIndex} / ${episodeCount} 段。`,
+    "你现在必须按普通单集生成的完整质量输出，不允许输出短版、摘要版或规划说明。",
+    "最终标题、核心主题和完整视频提示词必须使用“第 N 段”，不要写“第 N 集”。",
+    "15 秒默认 4-5 镜头；除非用户明确选择密集镜头版，否则 10-20 秒最多 5 个镜头。",
+    `最终 storyboard 必须严格等于 ${episodeInput.shotCount} 个镜头。`,
+    "最终输出必须是 Local Director AnalysisResult JSON，由本地单集 Codex worker 写入文件。",
+  ].join("\n");
+}
+
+function buildBatchSegmentRepairScript(renderScript: string, episodeIndex: number, episodeCount: number, reason: string, failedResult: AnalysisResult) {
+  return [
+    renderScript,
+    "",
+    "当前段生成结果未通过 Local Director 保存前质量闸门，需要只重修当前段。",
+    `当前段：第 ${episodeIndex} / ${episodeCount} 段。`,
+    `失败原因：${reason}`,
+    "",
+    "重修要求：",
+    "1. 不要重写成新故事，只修当前段提示词和 storyboard。",
+    "2. 保留原段人物、地点、事件顺序、情绪推进和项目记忆。",
+    "3. 每个镜头必须补齐 timeRange、scene、visual、shotType、composition、cameraMovement、lighting、sound、dialogue、emotion、transition、shotPurpose、firstFramePrompt、videoPrompt、lastFramePrompt、negativePrompt。",
+    "4. 没有台词时 dialogue 必须写“无”。",
+    "5. 最终标题和提示词必须使用“第 N 段”，不要写“第 N 集”。",
+    "6. 15 秒默认 4-5 镜头；除非用户明确要求密集镜头版，否则 10-20 秒最多 5 个镜头。",
+    "7. 不要出现 undefined、null、如上、同上、略、其他：无、16:9竖屏。",
+    "",
+    "未通过校验的上次结果摘要：",
+    JSON.stringify({
+      title: failedResult.title,
+      duration: failedResult.duration,
+      style: failedResult.style,
+      storyboardCount: Array.isArray(failedResult.storyboard) ? failedResult.storyboard.length : 0,
+      optimizedScript: failedResult.optimizedScript,
+    }, null, 2),
+  ].join("\n");
+}
+
+function episodeSourceText(baseScript: string, episodeIndex: number, episodeCount: number, episodeInput: SeasonPackEpisodeInput, episodeResult: AnalysisResult) {
   const source = baseScript.trim();
   const excerpt = source.length > 1400 ? `${source.slice(0, 1400)}\n...` : source;
   return [
-    `整季文件包生成：第 ${episodeIndex} / ${episodeCount} 集`,
-    `本集标题：${episodeResult.title}`,
+    `整段规划 + 单集同款生成：第 ${episodeIndex} / ${episodeCount} 段`,
+    `本段规划标题：${episodeInput.title}`,
+    `本段标题：${episodeResult.title}`,
     "",
-    "本集生成文案：",
+    "本段原文案：",
+    episodeInput.sourceText,
+    "",
+    "单集生成结果摘要：",
     episodeResult.optimizedScript,
     "",
-    "整季原始输入摘录：",
+    "整段原始输入摘录：",
     excerpt,
   ].join("\n");
 }
@@ -364,7 +747,7 @@ export function DashboardClient() {
       setResumeVersionId("");
       creatingNewEpisodeRef.current = creatingEpisodeFromProject;
       setCreatingNewEpisode(creatingEpisodeFromProject);
-      setGenerationProgress("已选择历史项目，新输入文案后会生成下一集。");
+      setGenerationProgress("已选择历史项目，新输入文案后会生成下一段。");
       window.localStorage.removeItem("vd_new_episode");
       window.localStorage.removeItem("vd_resume_script");
       window.localStorage.removeItem("vd_resume_project_id");
@@ -377,7 +760,7 @@ export function DashboardClient() {
       setResumeVersionId(resumeVersion || "");
       creatingNewEpisodeRef.current = false;
       setCreatingNewEpisode(false);
-      setGenerationProgress(resumeVersion ? "已载入当前剧集，可修改后重新生成这一集。" : "已载入历史文案，可继续编辑。");
+      setGenerationProgress(resumeVersion ? "已载入当前分段，可修改后重新生成这一段。" : "已载入历史文案，可继续编辑。");
       window.localStorage.removeItem("vd_new_episode");
       window.localStorage.removeItem("vd_resume_script");
       window.localStorage.removeItem("vd_resume_project_id");
@@ -455,7 +838,7 @@ export function DashboardClient() {
     });
     const data = await res.json().catch(() => null);
     if (!res.ok || !data?.ok) {
-      throw new Error(data?.error || "Codex 整季提示词任务创建失败");
+      throw new Error(data?.error || "Codex 整段提示词任务创建失败");
     }
     return data.job as SeasonPackCodexJob;
   }
@@ -469,7 +852,7 @@ export function DashboardClient() {
       const res = await fetch(`/api/season-pack/jobs/${jobId}`, { cache: "no-store" });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || "Codex 整季提示词任务读取失败");
+        throw new Error(data?.error || "Codex 整段提示词任务读取失败");
       }
 
       const currentJob = data.job as SeasonPackCodexJob;
@@ -477,18 +860,18 @@ export function DashboardClient() {
         lastStatus = currentJob.status;
         setGenerationProgress(
           currentJob.status === "running"
-            ? `Codex 正在一次性生成 ${currentJob.episodeCount || episodeCount} 集视频提示词文件包...`
-            : `Codex 整季提示词任务状态：${currentJob.status}`,
+            ? `Codex 正在一次性生成 ${currentJob.episodeCount || episodeCount} 段视频提示词文件包...`
+            : `Codex 整段提示词任务状态：${currentJob.status}`,
         );
       }
       if (currentJob.status === "completed") return currentJob;
       if (currentJob.status === "failed") {
-        throw new Error(currentJob.error || "Codex 整季提示词任务失败");
+        throw new Error(currentJob.error || "Codex 整段提示词任务失败");
       }
       await new Promise((resolve) => setTimeout(resolve, 2500));
     }
 
-    throw new Error("Codex 整季提示词任务等待超时，请确认 season-pack:codex-worker 正在运行。");
+    throw new Error("Codex 整段提示词任务等待超时，请确认 season-pack:codex-worker 正在运行。");
   }
 
   async function pollVideoPromptCodexJob(jobId: string) {
@@ -695,26 +1078,111 @@ export function DashboardClient() {
     let latestSave: ProjectSaveState | null = null;
     setBatchGenerating(true);
 
-    setGenerationProgress(`正在创建 ${episodeCount} 集整季提示词文件包任务...`);
+    setGenerationProgress(`正在创建 ${episodeCount} 段整段规划任务...`);
     const job = await createSeasonPackCodexJob(script, selectedDurationValue(), activeProjectId || undefined);
-    setGenerationProgress(`已创建整季任务 ${job.id}，请确认 season-pack:codex-worker 正在运行。`);
+    setGenerationProgress(`已创建整段规划任务 ${job.id}，请确认 season-pack:codex-worker 正在运行。`);
     const seasonPackJob = await pollSeasonPackCodexJob(job.id);
     const episodes = [...(seasonPackJob.result?.episodes || [])].sort((left, right) => left.episodeIndex - right.episodeIndex);
     if (episodes.length !== episodeCount) {
-      throw new Error(`整季提示词任务完成但集数不完整：${episodes.length} / ${episodeCount}`);
+      throw new Error(`整段规划任务完成但段数不完整：${episodes.length} / ${episodeCount}`);
     }
 
-    for (const episode of episodes) {
-      const episodeIndex = episode.episodeIndex;
-      const episodeResult = episode.result;
-      const episodeScript = episodeSourceText(script, episodeIndex, episodeCount, episodeResult);
-      setGenerationProgress(`正在生成第 ${episodeIndex} / ${episodeCount} 集...`);
+    type RenderedEpisode = {
+      episodeIndex: number;
+      episodeInput: SeasonPackEpisodeInput;
+      result: AnalysisResult;
+      promptText: string;
+      sourceText: string;
+    };
 
-      setGenerationProgress(`正在保存第 ${episodeIndex} / ${episodeCount} 集...`);
-      const fullVideoPrompt = buildVideoGenerationPromptText(episodeResult);
+    const renderedEpisodes: Array<RenderedEpisode | undefined> = new Array(episodeCount);
+    let nextEpisodeToRender = 0;
+    const concurrency = Math.min(BATCH_SINGLE_RENDER_CONCURRENCY, episodes.length);
+
+    async function renderBatchSegmentWithQualityRepair(
+      renderScript: string,
+      renderDuration: string,
+      episodeIndex: number,
+      episodeCount: number,
+    ) {
+      const rawResult = await requestAnalysisWithContext(
+        renderScript,
+        renderDuration,
+        activeProjectId || undefined,
+        undefined,
+      );
+      const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, episodeCount, rawResult, renderDuration);
+      try {
+        assertBatchSegmentQuality(script, episodeIndex, episodeResult, renderDuration);
+        return episodeResult;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "当前段未通过质量校验";
+        const repairScript = buildBatchSegmentRepairScript(renderScript, episodeIndex, episodeCount, reason, episodeResult);
+        const repairedRawResult = await requestAnalysisWithContext(
+          repairScript,
+          renderDuration,
+          activeProjectId || undefined,
+          undefined,
+        );
+        const repairedResult = normalizeBatchEpisodeResult(script, episodeIndex, episodeCount, repairedRawResult, renderDuration);
+        assertBatchSegmentQuality(script, episodeIndex, repairedResult, renderDuration);
+        return repairedResult;
+      }
+    }
+
+    async function renderNextEpisode() {
+      while (nextEpisodeToRender < episodes.length) {
+        const renderIndex = nextEpisodeToRender;
+        nextEpisodeToRender += 1;
+        const episode = episodes[renderIndex];
+        const episodeIndex = episode.episodeIndex;
+        const episodeInput = episode.input;
+        const renderScript = buildBatchEpisodeRenderScript(episodeInput, episodeCount);
+        const renderDuration = episodeInput.duration || selectedDurationValue();
+
+        setGenerationProgress(`正在按单集质量生成第 ${episodeIndex} / ${episodeCount} 段（并发 ${concurrency}）...`);
+        const episodeResult = await renderBatchSegmentWithQualityRepair(renderScript, renderDuration, episodeIndex, episodeCount);
+        if (episodeInput.shotCount > 0 && episodeResult.storyboard.length !== episodeInput.shotCount) {
+          throw new Error(`第 ${episodeIndex} 段生成失败：规划要求 ${episodeInput.shotCount} 个镜头，但单集生成结果为 ${episodeResult.storyboard.length} 个镜头。`);
+        }
+        const fullVideoPrompt = buildVideoGenerationPromptText(episodeResult);
+        const episodeScript = episodeSourceText(script, episodeIndex, episodeCount, episodeInput, episodeResult);
+        renderedEpisodes[episodeIndex - 1] = {
+          episodeIndex,
+          episodeInput,
+          result: episodeResult,
+          promptText: fullVideoPrompt,
+          sourceText: episodeScript,
+        };
+        setBatchResults(
+          renderedEpisodes
+            .filter((item): item is RenderedEpisode => Boolean(item))
+            .sort((left, right) => left.episodeIndex - right.episodeIndex)
+            .map((item) => ({
+              segment: { index: item.episodeIndex, text: item.sourceText },
+              result: item.result,
+              promptText: item.promptText,
+            })),
+        );
+        setResult(episodeResult);
+      }
+    }
+
+    await Promise.all(Array.from({ length: concurrency }, () => renderNextEpisode()));
+
+    for (const rendered of renderedEpisodes) {
+      if (!rendered) {
+        throw new Error("有分段未完成单集质量生成，请重新生成。");
+      }
+      const episodeIndex = rendered.episodeIndex;
+      const episodeResult = rendered.result;
+      const episodeScript = rendered.sourceText;
+      const fullVideoPrompt = rendered.promptText;
+
+      setGenerationProgress(`正在保存第 ${episodeIndex} / ${episodeCount} 段...`);
       const save = await saveAnalysisProject(episodeScript, episodeResult, fullVideoPrompt, activeProjectId || undefined, undefined);
       if (!save.saved || !save.projectId || !save.versionId) {
-        throw new Error(`第 ${episodeIndex} 集已生成，但项目保存失败：${save.reason || "未返回保存结果"}`);
+        throw new Error(`第 ${episodeIndex} 段已生成，但项目保存失败：${save.reason || "未返回保存结果"}`);
       }
 
       activeProjectId = save.projectId;
@@ -737,7 +1205,7 @@ export function DashboardClient() {
       creatingNewEpisodeRef.current = false;
       setCreatingNewEpisode(false);
     }
-    setGenerationProgress(`已生成 ${completed.length} 集，并按顺序保存到同一个项目。`);
+    setGenerationProgress(`已生成 ${completed.length} 段，并按顺序保存到同一个项目。`);
   }
 
   async function handlePromptFileUpload(event: ChangeEvent<HTMLInputElement>) {
@@ -771,7 +1239,7 @@ export function DashboardClient() {
       if (!cleanText) throw new Error("没有从文件中读取到正文");
       setScript(cleanText);
       setUploadedFileName(file.name);
-      setGenerationProgress(`已导入 ${file.name}，约 ${cleanText.length} 字。生成时会按当前集数和时长设置处理。`);
+      setGenerationProgress(`已导入 ${file.name}，约 ${cleanText.length} 字。生成时会按当前段数和时长设置处理。`);
     } catch (err: any) {
       setError(err?.message || "文案文件读取失败");
       setGenerationProgress("");
@@ -828,7 +1296,7 @@ export function DashboardClient() {
   async function downloadPromptDocx() {
     const sections = batchResults.length
       ? batchResults.map((item) => ({
-          heading: `第 ${item.segment.index} 集｜${item.result.title}｜${item.result.duration}`,
+          heading: `第 ${item.segment.index} 段｜${item.result.title}｜${item.result.duration}`,
           originalText: item.segment.text,
           promptText: item.promptText,
         }))
@@ -1157,19 +1625,19 @@ export function DashboardClient() {
                 <button
                   type="button"
                   className="prompt-duration-pill"
-                  aria-label="生成集数"
+                  aria-label="生成段数"
                   aria-expanded={episodeCountPickerOpen}
                   disabled={uploadingText || loading || batchGenerating}
                   onClick={() => setEpisodeCountPickerOpen((open) => !open)}
                 >
                   <Film className="h-3.5 w-3.5" />
-                  {episodeCount} 集
+                  {episodeCount} 段
                 </button>
                 {episodeCountPickerOpen && (
-                  <div className="duration-popover" role="dialog" aria-label="选择生成集数">
+                  <div className="duration-popover" role="dialog" aria-label="选择生成段数">
                     <div className="mb-3 flex items-center justify-between gap-4">
-                      <span className="text-sm font-semibold text-slate-300">生成集数</span>
-                      <span className="text-sm font-bold text-slate-200">{episodeCount} 集</span>
+                      <span className="text-sm font-semibold text-slate-300">生成段数</span>
+                      <span className="text-sm font-bold text-slate-200">{episodeCount} 段</span>
                     </div>
                     <div className="grid grid-cols-5 gap-2">
                       {[1, 3, 5, 10, 30].map((count) => (
@@ -1188,7 +1656,7 @@ export function DashboardClient() {
                       ))}
                     </div>
                     <p className="mt-3 text-[11px] leading-5 text-slate-500">
-                      批量生成会按顺序逐集保存到同一个项目，后一集会读取前面已保存的项目记忆。
+                      批量生成会按顺序逐段保存到同一个项目，后一段会读取前面已保存的项目记忆。
                     </p>
                     <input
                       type="range"
@@ -1200,8 +1668,8 @@ export function DashboardClient() {
                       className="duration-slider mt-3"
                     />
                     <div className="mt-2 flex justify-between text-[11px] text-slate-500">
-                      <span>1 集</span>
-                      <span>30 集</span>
+                      <span>1 段</span>
+                      <span>30 段</span>
                     </div>
                   </div>
                 )}
@@ -1284,10 +1752,17 @@ export function DashboardClient() {
             <div className="mb-6 rounded-2xl border border-violet-300/16 bg-violet-500/8 p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h3 className="font-bold text-white">批量剧集生成</h3>
+                  <h3 className="font-bold text-white">批量分段生成</h3>
                   <p className="mt-1 text-sm text-slate-400">
-                    已生成 {batchResults.length} 集，并按顺序保存到同一个项目。
+                    已生成 {batchResults.length} 段，并按顺序保存到同一个项目。
                   </p>
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-300">
+                    {batchResults.map((item) => (
+                      <span key={item.segment.index} className="rounded-lg border border-violet-200/18 bg-violet-300/10 px-2.5 py-1">
+                        第 {item.segment.index} 段
+                      </span>
+                    ))}
+                  </div>
                 </div>
                 <button
                   onClick={downloadPromptDocx}

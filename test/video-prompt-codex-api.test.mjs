@@ -17,10 +17,12 @@ test("video prompt Codex job API exposes create, poll, claim, complete, and fail
 
   const createRoute = readFileSync(routes[0], "utf8");
   assert.match(createRoute, /createVideoPromptCodexJob/);
+  assert.match(createRoute, /fetchDirectorContextFromNest/);
   assert.match(createRoute, /RequestSchema/);
   assert.match(createRoute, /script/);
   assert.match(createRoute, /projectId/);
   assert.match(createRoute, /versionId/);
+  assert.match(createRoute, /projectMemory/);
 
   const claimRoute = readFileSync(routes[2], "utf8");
   assert.match(claimRoute, /claimNextVideoPromptCodexJob/);

@@ -59,7 +59,7 @@ function getNestApiBaseUrl() {
 }
 
 function formatUpstreamError(payload: NestResponse | null, fallback: string) {
-  const message = payload ? payload.error || payload.message || fallback : fallback;
+  const message = payload ? payload.message || payload.error || fallback : fallback;
   return Array.isArray(message) ? message.join("; ") : message;
 }
 
@@ -147,7 +147,73 @@ function getNestResponseData(payload: NestResponse | null) {
 function cleanText(value: unknown, maxLength = 500) {
   if (typeof value !== "string") return undefined;
   const text = value.replace(/\s+/g, " ").trim();
+  if (!text || text === "undefined" || text === "null" || /\bundefined\b/i.test(text)) return undefined;
   return text ? text.slice(0, maxLength) : undefined;
+}
+
+function cleanLongText(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  if (!text || text === "undefined" || text === "null" || /\bundefined\b/i.test(text)) return undefined;
+  return text;
+}
+
+function deriveProjectSaveTitle(payload: ProjectCreatePayload) {
+  const explicitTitle = cleanText(payload.result?.title, 80);
+  if (explicitTitle) return explicitTitle;
+
+  const sources = [
+    payload.result?.optimizedScript,
+    payload.result?.workflow?.fullVideoPrompt,
+    payload.originalScript,
+  ];
+  for (const source of sources) {
+    const text = cleanText(source, 300);
+    if (!text) continue;
+
+    const episodeMatch = text.match(/第\s*([0-9一二三四五六七八九十百]+)\s*[集段]\s*[｜|:：-]?\s*[《「“]?([^》」”\n:：，。,.]{2,40})/);
+    if (episodeMatch?.[1] && episodeMatch[2]) {
+      return `第${episodeMatch[1]}集｜${episodeMatch[2].trim()}`;
+    }
+
+    const bracketMatch = text.match(/《([^》]{2,40})》/);
+    if (bracketMatch?.[1]) return bracketMatch[1].trim();
+
+    const firstClause = text.split(/[。！？!?\n:：]/)[0]?.trim();
+    if (firstClause) return firstClause.slice(0, 60);
+  }
+
+  return "未命名项目";
+}
+
+function deriveProjectSaveDuration(result: AnalysisResult | undefined) {
+  const explicitDuration = cleanText(result?.duration, 40);
+  if (explicitDuration) return explicitDuration;
+
+  const shots = Array.isArray(result?.storyboard) ? result.storyboard : [];
+  let maxSeconds = 0;
+  for (const shot of shots) {
+    if (typeof shot?.timeRange !== "string") continue;
+    const matches = [...shot.timeRange.matchAll(/(\d+(?:\.\d+)?)\s*s/gi)];
+    const last = matches.at(-1)?.[1];
+    if (!last) continue;
+    const seconds = Number(last);
+    if (Number.isFinite(seconds)) maxSeconds = Math.max(maxSeconds, seconds);
+  }
+
+  if (maxSeconds > 0) {
+    return `${Number.isInteger(maxSeconds) ? maxSeconds : Number(maxSeconds.toFixed(1))}秒`;
+  }
+  return "自动";
+}
+
+function deriveProjectSaveFullVideoPrompt(payload: ProjectCreatePayload) {
+  return (
+    cleanLongText(payload.fullVideoPrompt) ||
+    cleanLongText(payload.result?.workflow?.fullVideoPrompt) ||
+    cleanLongText(payload.result?.optimizedScript) ||
+    ""
+  );
 }
 
 function uniqueStrings(values: unknown[], limit = 12) {
@@ -353,16 +419,16 @@ export function mapAnalysisResultToNestProjectBody(input: Record<string, unknown
   return {
     projectId: payload.projectId,
     versionId: payload.versionId,
-    title: payload.result.title,
+    title: deriveProjectSaveTitle(payload),
     originalScript: payload.originalScript || "",
     optimizedScript: payload.result.optimizedScript,
-    contentType: payload.result.contentType,
-    style: payload.result.style,
-    duration: payload.result.duration,
+    contentType: cleanText(payload.result.contentType, 80) || "短剧 / 通用",
+    style: cleanText(payload.result.style, 120) || "通用",
+    duration: deriveProjectSaveDuration(payload.result),
     status: payload.status || "draft",
     storyboardImageUrl: payload.storyboardImageUrl,
     storyboardImagePrompt: payload.storyboardImagePrompt,
-    fullVideoPrompt: payload.fullVideoPrompt,
+    fullVideoPrompt: deriveProjectSaveFullVideoPrompt(payload),
     storyBible: payload.storyBible || memory.storyBible,
     contextSummary: payload.contextSummary || memory.contextSummary,
     episodeSummary: payload.episodeSummary || memory.episodeSummary,
