@@ -7,6 +7,9 @@ test("dashboard can generate multiple project segments through a season pack job
   const dashboardSource = await readFile(join(process.cwd(), "components", "DashboardClient.tsx"), "utf8");
 
   assert.match(dashboardSource, /const \[episodeCount, setEpisodeCount\] = useState\(1\)/);
+  assert.match(dashboardSource, /type SegmentCountMode = "fixed" \| "auto"/);
+  assert.match(dashboardSource, /const \[segmentCountMode, setSegmentCountMode\]/);
+  assert.match(dashboardSource, /const \[batchProgress, setBatchProgress\]/);
   assert.match(dashboardSource, /const \[episodeCountPickerOpen, setEpisodeCountPickerOpen\] = useState\(false\)/);
   assert.match(dashboardSource, /aria-label="生成段数"/);
   assert.match(dashboardSource, /min="1"/);
@@ -15,6 +18,17 @@ test("dashboard can generate multiple project segments through a season pack job
   assert.match(dashboardSource, /createSeasonPackCodexJob/);
   assert.match(dashboardSource, /pollSeasonPackCodexJob/);
   assert.match(dashboardSource, /\/api\/season-pack\/jobs/);
+  assert.match(dashboardSource, /BATCH_RENDER_PACK_SIZE = 4/);
+  assert.match(dashboardSource, /BATCH_RENDER_PACK_CONCURRENCY = 3/);
+  assert.match(dashboardSource, /type VideoPromptPackCodexJob/);
+  assert.match(dashboardSource, /createVideoPromptPackCodexJob/);
+  assert.match(dashboardSource, /pollVideoPromptPackCodexJob/);
+  assert.match(dashboardSource, /\/api\/video-prompt-packs\/jobs/);
+  assert.match(dashboardSource, /renderPackedSegmentsWithQualityRepair/);
+  assert.match(dashboardSource, /chunkEpisodesForRenderPacks/);
+  assert.match(dashboardSource, /segmentCountMode/);
+  assert.match(dashboardSource, /segmentCountMode === "auto" \|\| episodeCount > 1/);
+  assert.match(dashboardSource, /resolvedSegmentCount/);
   assert.match(
     dashboardSource,
     /seasonPackJob\.result\?\.episodes/,
@@ -22,6 +36,10 @@ test("dashboard can generate multiple project segments through a season pack job
   assert.match(
     dashboardSource,
     /buildBatchEpisodeRenderScript/,
+  );
+  assert.match(
+    dashboardSource,
+    /renderPackJob\.result\?\.segments/,
   );
   assert.match(
     dashboardSource,

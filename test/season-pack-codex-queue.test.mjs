@@ -149,6 +149,71 @@ test("creates, claims, and completes a season planning job from per-episode inpu
   }
 });
 
+test("creates automatic season planning jobs and resolves segment count from the manifest", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createSeasonPackCodexJob(
+      {
+        script: "A long source chapter with several dramatic beats that should be split automatically.",
+        segmentCountMode: "auto",
+        duration: "auto",
+      },
+      { rootDir },
+    );
+
+    assert.equal(job.segmentCountMode, "auto");
+    assert.equal(job.requestedEpisodeCount, null);
+    assert.equal(job.resolvedEpisodeCount, null);
+    assert.equal(job.episodeCount, 0);
+    assert.match(job.prompt, /decide the best segment count between 1 and 30/i);
+    assert.match(job.prompt, /manifest\.json/);
+
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+    assert.equal(claimed.id, job.id);
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(
+      claimed.manifestPath,
+      JSON.stringify({ segmentCountMode: "auto", episodeCount: 2, generatedEpisodes: [1, 2], status: "completed" }, null, 2),
+      "utf8",
+    );
+    writeFileSync(claimed.seasonPlanPath, JSON.stringify({ storyBible: { title: "Auto" }, episodeChain: [{ index: 1 }, { index: 2 }] }, null, 2), "utf8");
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
+    writeFileSync(path.join(claimed.episodesDir, "episode-002.json"), JSON.stringify(sampleEpisodeInput(2), null, 2), "utf8");
+
+    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.episodeCount, 2);
+    assert.equal(completed.resolvedEpisodeCount, 2);
+    assert.equal(completed.result.episodes.length, 2);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("season pack Codex jobs claim the oldest pending task by default", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const first = await createSeasonPackCodexJob(
+      { script: "First source chapter with enough material.", episodeCount: 1 },
+      { rootDir },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await createSeasonPackCodexJob(
+      { script: "Second source chapter with enough material.", episodeCount: 1 },
+      { rootDir },
+    );
+
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir });
+    assert.ok(claimed);
+    assert.equal(claimed.id, first.id);
+    assert.notEqual(claimed.id, second.id);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("fills episode input metadata and render script from structured source", async () => {
   const rootDir = makeTempRoot();
   try {

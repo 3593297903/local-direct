@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
-import { claimNextSeasonPackCodexJob } from "@/lib/season-pack-codex-queue";
+import { claimNextVideoPromptPackCodexJob } from "@/lib/video-prompt-pack-codex-queue";
 import { getCodexRuntimeState } from "@/lib/codex-runtime-state";
 
 export const runtime = "nodejs";
 
 function isWorkerAuthorized(request: Request) {
-  const token = process.env.SEASON_PACK_CODEX_WORKER_TOKEN;
+  const token = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_TOKEN;
   if (!token) return true;
-  return request.headers.get("x-season-pack-codex-token") === token;
+  return request.headers.get("x-video-prompt-pack-codex-token") === token;
 }
 
 function positiveInteger(value: string | undefined, fallback: number) {
@@ -17,7 +17,7 @@ function positiveInteger(value: string | undefined, fallback: number) {
 
 export async function POST(request: Request) {
   if (!isWorkerAuthorized(request)) {
-    return NextResponse.json({ ok: false, error: "Unauthorized season pack Codex worker" }, { status: 401 });
+    return NextResponse.json({ ok: false, error: "Unauthorized video prompt render pack Codex worker" }, { status: 401 });
   }
 
   try {
@@ -25,14 +25,14 @@ export async function POST(request: Request) {
     if (!codexState.available) {
       return NextResponse.json({ ok: true, task: null, codexUnavailable: codexState });
     }
-    const task = await claimNextSeasonPackCodexJob({
-      order: process.env.SEASON_PACK_CODEX_ORDER === "newest" ? "newest" : "oldest",
-      runningTimeoutMs: positiveInteger(process.env.SEASON_PACK_CODEX_TASK_TIMEOUT_MS, 45 * 60_000),
+    const task = await claimNextVideoPromptPackCodexJob({
+      order: process.env.VIDEO_PROMPT_PACK_CODEX_ORDER === "newest" ? "newest" : "oldest",
+      runningTimeoutMs: positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_TASK_TIMEOUT_MS, 30 * 60_000),
     });
     return NextResponse.json({ ok: true, task });
   } catch (error: any) {
     return NextResponse.json(
-      { ok: false, error: error?.message || "Season pack Codex task claim failed" },
+      { ok: false, error: error?.message || "Video prompt render pack Codex task claim failed" },
       { status: 400 },
     );
   }

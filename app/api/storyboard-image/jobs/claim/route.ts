@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { claimNextStoryboardCodexPanel } from "@/lib/storyboard-codex-queue";
+import { getCodexRuntimeState } from "@/lib/codex-runtime-state";
 
 export const runtime = "nodejs";
 
@@ -20,6 +21,10 @@ export async function POST(request: Request) {
   }
 
   try {
+    const codexState = await getCodexRuntimeState();
+    if (!codexState.available) {
+      return NextResponse.json({ ok: true, task: null, codexUnavailable: codexState });
+    }
     const task = await claimNextStoryboardCodexPanel({
       order: process.env.STORYBOARD_CODEX_ORDER === "oldest" ? "oldest" : "newest",
       runningTimeoutMs: positiveInteger(process.env.STORYBOARD_CODEX_TASK_TIMEOUT_MS, 30 * 60_000),

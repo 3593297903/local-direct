@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { failStoryboardCodexPanel } from "@/lib/storyboard-codex-queue";
+import { failStoryboardCodexJob, failStoryboardCodexPanel } from "@/lib/storyboard-codex-queue";
+import { isCodexQuotaExhaustedMessage, markCodexQuotaExhausted } from "@/lib/codex-runtime-state";
 
 export const runtime = "nodejs";
 
@@ -18,6 +19,11 @@ export async function POST(request: Request, context: { params: Promise<{ jobId:
     const params = await context.params;
     const body = await request.json().catch(() => ({}));
     const message = typeof body?.message === "string" ? body.message : undefined;
+    if (isCodexQuotaExhaustedMessage(message)) {
+      await markCodexQuotaExhausted("storyboard-image", message);
+      const job = await failStoryboardCodexJob(params.jobId, message);
+      return NextResponse.json({ ok: true, job });
+    }
     const job = await failStoryboardCodexPanel(params.jobId, params.panelId, message);
     return NextResponse.json({ ok: true, job });
   } catch (error: any) {

@@ -23,4 +23,7 @@ test("video prompt Codex worker invokes codex exec and reports job status", () =
   assert.match(source, /assertNoEncodingDamage/);
   assert.match(source, /stripJsonBom/);
   assert.match(source, /VIDEO_PROMPT_CODEX_WORKER_TOKEN/);
+  assert.match(source, /VIDEO_PROMPT_CODEX_CONCURRENCY/);
+  assert.match(source, /activeTasks/);
+  assert.match(source, /Promise\.race\(activeTasks\)/);
 });

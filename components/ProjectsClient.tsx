@@ -24,6 +24,10 @@ import {
 
 const SHOW_DIRECTOR_MEMORY = false;
 const STORYBOARD_FAILED_GRACE_POLLS = 5;
+const CODEX_QUOTA_EXHAUSTED_CODE = "CODEX_QUOTA_EXHAUSTED";
+const CODEX_QUOTA_EXHAUSTED_DISPLAY_MESSAGE = "Codex 额度已用完或暂时受限，请恢复额度后再继续生成。";
+const CODEX_QUOTA_ERROR_PATTERN =
+  /CODEX_QUOTA_EXHAUSTED|Codex 额度已用完|insufficient[_\s-]?quota|usage limit|rate\s*limit|limit reached|billing|credits?|RESOURCE_EXHAUSTED|429/i;
 
 type ProjectSummary = {
   id: string;
@@ -248,6 +252,9 @@ function formatDate(value?: string) {
 }
 
 function getFriendlyProjectError(message: string) {
+  if (message.includes(CODEX_QUOTA_EXHAUSTED_CODE) || CODEX_QUOTA_ERROR_PATTERN.test(message)) {
+    return CODEX_QUOTA_EXHAUSTED_DISPLAY_MESSAGE;
+  }
   if (/endpoint is unavailable|Cannot GET|Not Found/i.test(message)) {
     return "项目详情接口暂时不可用。请重启 Nest API 后刷新页面。";
   }
@@ -818,7 +825,7 @@ export function ProjectsClient() {
       if (savedPanelIds.size > 0) {
         await reloadSelectedProject(project.id, selectedVersion?.id || version.id).catch(() => undefined);
       }
-      const message = err instanceof Error ? err.message : "镜头分镜图生成失败";
+      const message = getFriendlyProjectError(err instanceof Error ? err.message : "镜头分镜图生成失败");
       setStoryboardGenerationError(
         savedPanelIds.size > 0 ? `${message}。已保留 ${savedPanelIds.size} 张已完成分镜图。` : message,
       );
@@ -924,7 +931,7 @@ export function ProjectsClient() {
         `Seedance 合规优化完成并已应用到本段：${safetyResult.findings.length} 处风险记录，${safetyResult.changeSummary.length} 条修改说明。`,
       );
     } catch (err) {
-      setPromptSafetyError(err instanceof Error ? err.message : "Seedance 合规优化失败");
+      setPromptSafetyError(getFriendlyProjectError(err instanceof Error ? err.message : "Seedance 合规优化失败"));
     } finally {
       setPromptSafetyLoading(false);
     }

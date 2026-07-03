@@ -148,6 +148,34 @@ test("video prompt Codex jobs default to automatic duration and preserve source 
   }
 });
 
+test("video prompt Codex jobs claim the oldest pending task by default", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const first = await createVideoPromptCodexJob(
+      {
+        script: "第 1 段：老师在空教室里发现一张旧照片。",
+        duration: "15秒",
+      },
+      { rootDir },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await createVideoPromptCodexJob(
+      {
+        script: "第 2 段：走廊灯光闪烁，脚步声靠近。",
+        duration: "15秒",
+      },
+      { rootDir },
+    );
+
+    const claimed = await claimNextVideoPromptCodexJob({ rootDir });
+    assert.ok(claimed);
+    assert.equal(claimed.id, first.id);
+    assert.notEqual(claimed.id, second.id);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("stale running video prompt jobs can be reclaimed or failed", async () => {
   const rootDir = makeTempRoot();
   try {

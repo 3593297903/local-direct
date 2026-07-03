@@ -57,6 +57,19 @@ type VideoPromptCodexJob = {
   error?: string | null;
 };
 
+type VideoPromptPackCodexJob = {
+  id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  result?: {
+    segments: Array<{
+      episodeIndex: number;
+      outputPath: string;
+      result: AnalysisResult;
+    }>;
+  } | null;
+  error?: string | null;
+};
+
 type SeasonPackEpisodeResult = {
   episodeIndex: number;
   fileName: string;
@@ -80,6 +93,9 @@ type SeasonPackEpisodeInput = {
 type SeasonPackCodexJob = {
   id: string;
   status: "pending" | "running" | "completed" | "failed";
+  segmentCountMode?: SegmentCountMode;
+  requestedEpisodeCount?: number | null;
+  resolvedEpisodeCount?: number | null;
   episodeCount: number;
   result?: {
     episodes: SeasonPackEpisodeResult[];
@@ -129,8 +145,34 @@ type BatchPromptSection = {
 };
 
 type DurationMode = "auto" | "fixed";
+type SegmentCountMode = "fixed" | "auto";
+type BatchGenerationPhase = "planning" | "rendering" | "repairing" | "saving" | "completed" | "failed";
+type BatchSegmentStatus = "pending" | "running" | "repairing" | "completed" | "saving" | "saved" | "failed";
+
+type BatchSegmentProgress = {
+  index: number;
+  title?: string;
+  status: BatchSegmentStatus;
+  message?: string;
+};
+
+type BatchGenerationProgress = {
+  mode: SegmentCountMode;
+  phase: BatchGenerationPhase;
+  requestedCount: number | null;
+  resolvedSegmentCount: number | null;
+  completedCount: number;
+  runningCount: number;
+  pendingCount: number;
+  repairingCount: number;
+  savingCount: number;
+  currentMessage: string;
+  segments: BatchSegmentProgress[];
+};
 
 const MAX_EPISODE_BATCH_COUNT = 30;
+const BATCH_RENDER_PACK_SIZE = 4;
+const BATCH_RENDER_PACK_CONCURRENCY = 3;
 const BATCH_SINGLE_RENDER_CONCURRENCY = 3;
 const GENERIC_SEASON_TEMPLATE_PHRASES = [
   "人物、地点和关键物件按案件逻辑分层",
@@ -156,6 +198,11 @@ const REQUIRED_BATCH_SEGMENT_SHOT_FIELDS = [
   "lastFramePrompt",
   "negativePrompt",
 ] as const;
+
+const CODEX_QUOTA_EXHAUSTED_CODE = "CODEX_QUOTA_EXHAUSTED";
+const CODEX_QUOTA_EXHAUSTED_DISPLAY_MESSAGE = "Codex 额度已用完或暂时受限，请恢复额度后再继续生成。";
+const CODEX_QUOTA_ERROR_PATTERN =
+  /CODEX_QUOTA_EXHAUSTED|Codex 额度已用完|insufficient[_\s-]?quota|usage limit|rate\s*limit|limit reached|billing|credits?|RESOURCE_EXHAUSTED|429/i;
 
 const particleColors = [
   "rgba(129, 140, 248, 0.45)",
@@ -190,6 +237,14 @@ function particleStyle(particle: (typeof workspaceParticles)[number]) {
 
 function calculateStoryboardCodexTimeoutMs(job: StoryboardCodexJob) {
   return Math.max(30 * 60_000, job.panels.length * 8 * 60_000);
+}
+
+function formatUserFacingError(message: unknown, fallback = "生成失败") {
+  const text = typeof message === "string" ? message : message instanceof Error ? message.message : "";
+  if (text.includes(CODEX_QUOTA_EXHAUSTED_CODE) || CODEX_QUOTA_ERROR_PATTERN.test(text)) {
+    return CODEX_QUOTA_EXHAUSTED_DISPLAY_MESSAGE;
+  }
+  return text || fallback;
 }
 
 function ReferenceItemButton({ item, onSelect }: { item: KnowledgeItem; onSelect: (item: KnowledgeItem) => void }) {
@@ -605,6 +660,15 @@ function clampEpisodeCount(value: number) {
   return Math.min(MAX_EPISODE_BATCH_COUNT, Math.max(1, Math.round(value)));
 }
 
+function chunkEpisodesForRenderPacks<T>(items: T[], size = BATCH_RENDER_PACK_SIZE) {
+  const chunks: T[][] = [];
+  const chunkSize = Math.max(1, size);
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
+
 function buildBatchEpisodeScript(baseScript: string, episodeIndex: number, episodeCount: number) {
   const source = baseScript.trim();
   return [
@@ -708,6 +772,8 @@ export function DashboardClient() {
   const [durationSeconds, setDurationSeconds] = useState(15);
   const [durationPickerOpen, setDurationPickerOpen] = useState(false);
   const [episodeCount, setEpisodeCount] = useState(1);
+  const [segmentCountMode, setSegmentCountMode] = useState<SegmentCountMode>("fixed");
+  const [batchProgress, setBatchProgress] = useState<BatchGenerationProgress | null>(null);
   const [episodeCountPickerOpen, setEpisodeCountPickerOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState("");
   const [generationProgress, setGenerationProgress] = useState("");
@@ -777,6 +843,7 @@ export function DashboardClient() {
   }
 
   function updateEpisodeCount(value: number) {
+    setSegmentCountMode("fixed");
     setEpisodeCount(clampEpisodeCount(value));
   }
 
@@ -821,20 +888,51 @@ export function DashboardClient() {
     return data.job as VideoPromptCodexJob;
   }
 
+  async function createVideoPromptPackCodexJob(
+    segments: Array<{
+      episodeIndex: number;
+      title: string;
+      script: string;
+      renderInputScript: string;
+      duration: string;
+      shotCount: number;
+    }>,
+    projectId: string | undefined,
+  ) {
+    const res = await fetch("/api/video-prompt-packs/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: projectId || undefined,
+        segments,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.error || "Codex render pack job creation failed");
+    }
+    return data.job as VideoPromptPackCodexJob;
+  }
+
   async function createSeasonPackCodexJob(
     inputScript: string,
     inputDuration: string,
     projectId: string | undefined,
+    mode: SegmentCountMode,
+    requestedCount: number,
   ) {
+    const body: Record<string, unknown> = {
+      script: inputScript,
+      duration: inputDuration,
+      segmentCountMode: mode,
+      projectId: projectId || undefined,
+    };
+    if (mode === "fixed") body.episodeCount = requestedCount;
+
     const res = await fetch("/api/season-pack/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        script: inputScript,
-        duration: inputDuration,
-        episodeCount,
-        projectId: projectId || undefined,
-      }),
+      body: JSON.stringify(body),
     });
     const data = await res.json().catch(() => null);
     if (!res.ok || !data?.ok) {
@@ -843,9 +941,9 @@ export function DashboardClient() {
     return data.job as SeasonPackCodexJob;
   }
 
-  async function pollSeasonPackCodexJob(jobId: string) {
+  async function pollSeasonPackCodexJob(jobId: string, mode: SegmentCountMode, requestedCount: number) {
     const startedAt = Date.now();
-    const timeoutMs = Math.max(45 * 60_000, episodeCount * 3 * 60_000);
+    const timeoutMs = Math.max(45 * 60_000, (mode === "auto" ? MAX_EPISODE_BATCH_COUNT : requestedCount) * 3 * 60_000);
     let lastStatus = "";
 
     while (Date.now() - startedAt < timeoutMs) {
@@ -860,7 +958,9 @@ export function DashboardClient() {
         lastStatus = currentJob.status;
         setGenerationProgress(
           currentJob.status === "running"
-            ? `Codex 正在一次性生成 ${currentJob.episodeCount || episodeCount} 段视频提示词文件包...`
+            ? mode === "auto"
+              ? "Codex 正在分析原文结构并自动判断分段数量..."
+              : `Codex 正在一次性生成 ${currentJob.episodeCount || requestedCount} 段视频提示词文件包...`
             : `Codex 整段提示词任务状态：${currentJob.status}`,
         );
       }
@@ -872,6 +972,37 @@ export function DashboardClient() {
     }
 
     throw new Error("Codex 整段提示词任务等待超时，请确认 season-pack:codex-worker 正在运行。");
+  }
+
+  async function pollVideoPromptPackCodexJob(jobId: string, segmentCount: number) {
+    const startedAt = Date.now();
+    const timeoutMs = Math.max(30 * 60_000, segmentCount * 600_000);
+    let lastStatus = "";
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const res = await fetch(`/api/video-prompt-packs/jobs/${jobId}`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || "Codex render pack job read failed");
+      }
+
+      const currentJob = data.job as VideoPromptPackCodexJob;
+      if (currentJob.status !== lastStatus) {
+        lastStatus = currentJob.status;
+        setGenerationProgress(
+          currentJob.status === "running"
+            ? `Codex 正在本地生成 ${segmentCount} 段 Render Pack...`
+            : `Codex Render Pack 任务状态：${currentJob.status}`,
+        );
+      }
+      if (currentJob.status === "completed") return currentJob;
+      if (currentJob.status === "failed") {
+        throw new CodexVideoPromptJobFailedError(currentJob.error || "Codex render pack job failed");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+    }
+
+    throw new Error("Codex Render Pack 任务等待超时，请确认 video-prompt-pack:codex-worker 正在运行。");
   }
 
   async function pollVideoPromptCodexJob(jobId: string) {
@@ -1034,7 +1165,7 @@ export function DashboardClient() {
         `Seedance 合规优化完成：${safetyResult.findings.length} 处风险记录，${safetyResult.changeSummary.length} 条修改说明。`,
       );
     } catch (err) {
-      setPromptSafetyError(err instanceof Error ? err.message : "Seedance 合规优化失败");
+      setPromptSafetyError(formatUserFacingError(err, "Seedance 合规优化失败"));
     } finally {
       setPromptSafetyLoading(false);
     }
@@ -1076,16 +1207,63 @@ export function DashboardClient() {
     const completed: BatchPromptSection[] = [];
     let activeProjectId = resumeProjectId || "";
     let latestSave: ProjectSaveState | null = null;
+    const mode = segmentCountMode;
+    const requestedCount = mode === "auto" ? null : episodeCount;
+    let resolvedSegmentCount = requestedCount || null;
+    let segmentProgressItems: BatchSegmentProgress[] = [];
     setBatchGenerating(true);
 
-    setGenerationProgress(`正在创建 ${episodeCount} 段整段规划任务...`);
-    const job = await createSeasonPackCodexJob(script, selectedDurationValue(), activeProjectId || undefined);
+    function publishBatchProgress(phase: BatchGenerationPhase, currentMessage: string) {
+      const completedCount = segmentProgressItems.filter((item) => ["completed", "saving", "saved"].includes(item.status)).length;
+      const runningCount = segmentProgressItems.filter((item) => item.status === "running").length;
+      const repairingCount = segmentProgressItems.filter((item) => item.status === "repairing").length;
+      const savingCount = segmentProgressItems.filter((item) => item.status === "saving").length;
+      const pendingCount = segmentProgressItems.filter((item) => item.status === "pending").length;
+      setBatchProgress({
+        mode,
+        phase,
+        requestedCount,
+        resolvedSegmentCount,
+        completedCount,
+        runningCount,
+        pendingCount,
+        repairingCount,
+        savingCount,
+        currentMessage,
+        segments: segmentProgressItems,
+      });
+      setGenerationProgress(currentMessage);
+    }
+
+    function updateSegmentProgress(index: number, status: BatchSegmentStatus, message?: string) {
+      segmentProgressItems = segmentProgressItems.map((item) =>
+        item.index === index ? { ...item, status, message } : item,
+      );
+    }
+
+    publishBatchProgress(
+      "planning",
+      mode === "auto" ? "正在分析原文结构，自动判断适合生成多少段..." : `正在创建 ${episodeCount} 段整段规划任务...`,
+    );
+    const job = await createSeasonPackCodexJob(script, selectedDurationValue(), activeProjectId || undefined, mode, episodeCount);
     setGenerationProgress(`已创建整段规划任务 ${job.id}，请确认 season-pack:codex-worker 正在运行。`);
-    const seasonPackJob = await pollSeasonPackCodexJob(job.id);
+    publishBatchProgress("planning", `已创建整段规划任务 ${job.id}，请确认 season-pack:codex-worker 正在运行。`);
+    const seasonPackJob = await pollSeasonPackCodexJob(job.id, mode, episodeCount);
     const episodes = [...(seasonPackJob.result?.episodes || [])].sort((left, right) => left.episodeIndex - right.episodeIndex);
-    if (episodes.length !== episodeCount) {
+    resolvedSegmentCount = episodes.length;
+    if (mode === "fixed" && episodes.length !== episodeCount) {
       throw new Error(`整段规划任务完成但段数不完整：${episodes.length} / ${episodeCount}`);
     }
+    if (mode === "auto" && (episodes.length < 1 || episodes.length > MAX_EPISODE_BATCH_COUNT)) {
+      throw new Error(`自动分段任务完成但识别段数异常：${episodes.length}`);
+    }
+    segmentProgressItems = episodes.map((episode) => ({
+      index: episode.episodeIndex,
+      title: episode.input.title,
+      status: "pending" as const,
+      message: "等待单段质量生成",
+    }));
+    publishBatchProgress("rendering", `已识别 ${resolvedSegmentCount} 段，正在按单段质量逐段生成...`);
 
     type RenderedEpisode = {
       episodeIndex: number;
@@ -1095,9 +1273,7 @@ export function DashboardClient() {
       sourceText: string;
     };
 
-    const renderedEpisodes: Array<RenderedEpisode | undefined> = new Array(episodeCount);
-    let nextEpisodeToRender = 0;
-    const concurrency = Math.min(BATCH_SINGLE_RENDER_CONCURRENCY, episodes.length);
+    const renderedEpisodes: Array<RenderedEpisode | undefined> = new Array(resolvedSegmentCount);
 
     async function renderBatchSegmentWithQualityRepair(
       renderScript: string,
@@ -1117,6 +1293,8 @@ export function DashboardClient() {
         return episodeResult;
       } catch (error) {
         const reason = error instanceof Error ? error.message : "当前段未通过质量校验";
+        updateSegmentProgress(episodeIndex, "repairing", reason);
+        publishBatchProgress("repairing", `第 ${episodeIndex} / ${episodeCount} 段正在自动修复：${reason}`);
         const repairScript = buildBatchSegmentRepairScript(renderScript, episodeIndex, episodeCount, reason, episodeResult);
         const repairedRawResult = await requestAnalysisWithContext(
           repairScript,
@@ -1130,45 +1308,121 @@ export function DashboardClient() {
       }
     }
 
-    async function renderNextEpisode() {
-      while (nextEpisodeToRender < episodes.length) {
-        const renderIndex = nextEpisodeToRender;
-        nextEpisodeToRender += 1;
-        const episode = episodes[renderIndex];
-        const episodeIndex = episode.episodeIndex;
-        const episodeInput = episode.input;
-        const renderScript = buildBatchEpisodeRenderScript(episodeInput, episodeCount);
-        const renderDuration = episodeInput.duration || selectedDurationValue();
+    function storeRenderedEpisode(
+      episode: SeasonPackEpisodeResult,
+      episodeResult: AnalysisResult,
+    ) {
+      const episodeIndex = episode.episodeIndex;
+      const episodeInput = episode.input;
+      if (episodeInput.shotCount > 0 && episodeResult.storyboard.length !== episodeInput.shotCount) {
+        throw new Error(`第 ${episodeIndex} 段生成失败：规划要求 ${episodeInput.shotCount} 个镜头，但生成结果为 ${episodeResult.storyboard.length} 个镜头。`);
+      }
+      const fullVideoPrompt = buildVideoGenerationPromptText(episodeResult);
+      const episodeScript = episodeSourceText(script, episodeIndex, resolvedSegmentCount || episodes.length, episodeInput, episodeResult);
+      renderedEpisodes[episodeIndex - 1] = {
+        episodeIndex,
+        episodeInput,
+        result: episodeResult,
+        promptText: fullVideoPrompt,
+        sourceText: episodeScript,
+      };
+      setBatchResults(
+        renderedEpisodes
+          .filter((item): item is RenderedEpisode => Boolean(item))
+          .sort((left, right) => left.episodeIndex - right.episodeIndex)
+          .map((item) => ({
+            segment: { index: item.episodeIndex, text: item.sourceText },
+            result: item.result,
+            promptText: item.promptText,
+          })),
+      );
+      setResult(episodeResult);
+      updateSegmentProgress(episodeIndex, "completed", "已完成单段质量生成，等待保存");
+      publishBatchProgress("rendering", `第 ${episodeIndex} / ${resolvedSegmentCount} 段已生成，继续处理剩余分段...`);
+    }
 
-        setGenerationProgress(`正在按单集质量生成第 ${episodeIndex} / ${episodeCount} 段（并发 ${concurrency}）...`);
-        const episodeResult = await renderBatchSegmentWithQualityRepair(renderScript, renderDuration, episodeIndex, episodeCount);
-        if (episodeInput.shotCount > 0 && episodeResult.storyboard.length !== episodeInput.shotCount) {
-          throw new Error(`第 ${episodeIndex} 段生成失败：规划要求 ${episodeInput.shotCount} 个镜头，但单集生成结果为 ${episodeResult.storyboard.length} 个镜头。`);
-        }
-        const fullVideoPrompt = buildVideoGenerationPromptText(episodeResult);
-        const episodeScript = episodeSourceText(script, episodeIndex, episodeCount, episodeInput, episodeResult);
-        renderedEpisodes[episodeIndex - 1] = {
-          episodeIndex,
-          episodeInput,
-          result: episodeResult,
-          promptText: fullVideoPrompt,
-          sourceText: episodeScript,
+    async function renderSingleEpisodeWithQualityRepair(episode: SeasonPackEpisodeResult) {
+      const episodeIndex = episode.episodeIndex;
+      const episodeInput = episode.input;
+      const renderScript = buildBatchEpisodeRenderScript(episodeInput, resolvedSegmentCount || episodes.length);
+      const renderDuration = episodeInput.duration || selectedDurationValue();
+
+      updateSegmentProgress(episodeIndex, "repairing", "正在按单段质量生成修复");
+      publishBatchProgress("repairing", `正在按单段质量生成第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
+      const episodeResult = await renderBatchSegmentWithQualityRepair(renderScript, renderDuration, episodeIndex, resolvedSegmentCount || episodes.length);
+      storeRenderedEpisode(episode, episodeResult);
+    }
+
+    async function renderPackedSegmentsWithQualityRepair(packEpisodes: SeasonPackEpisodeResult[]) {
+      const packLabel = packEpisodes.map((episode) => episode.episodeIndex).join(", ");
+      const packSegments = packEpisodes.map((episode) => {
+        const episodeInput = episode.input;
+        return {
+          episodeIndex: episode.episodeIndex,
+          title: episodeInput.title,
+          script: episodeInput.sourceText || script,
+          renderInputScript: buildBatchEpisodeRenderScript(episodeInput, resolvedSegmentCount || episodes.length),
+          duration: episodeInput.duration || selectedDurationValue(),
+          shotCount: episodeInput.shotCount,
         };
-        setBatchResults(
-          renderedEpisodes
-            .filter((item): item is RenderedEpisode => Boolean(item))
-            .sort((left, right) => left.episodeIndex - right.episodeIndex)
-            .map((item) => ({
-              segment: { index: item.episodeIndex, text: item.sourceText },
-              result: item.result,
-              promptText: item.promptText,
-            })),
+      });
+
+      for (const episode of packEpisodes) {
+        updateSegmentProgress(episode.episodeIndex, "running", `Render Pack 生成中：${packLabel}`);
+      }
+      publishBatchProgress("rendering", `正在本地并发生成 Render Pack：第 ${packLabel} 段...`);
+
+      try {
+        const packJob = await createVideoPromptPackCodexJob(packSegments, activeProjectId || undefined);
+        const renderPackJob = await pollVideoPromptPackCodexJob(packJob.id, packSegments.length);
+        const packResults = new Map(
+          (renderPackJob.result?.segments || []).map((segment) => [segment.episodeIndex, segment.result] as const),
         );
-        setResult(episodeResult);
+
+        for (const episode of packEpisodes) {
+          const episodeIndex = episode.episodeIndex;
+          const episodeInput = episode.input;
+          const renderDuration = episodeInput.duration || selectedDurationValue();
+          const rawResult = packResults.get(episodeIndex);
+          if (!rawResult) {
+            updateSegmentProgress(episodeIndex, "repairing", "Render Pack 缺少本段结果，转为单段修复");
+            await renderSingleEpisodeWithQualityRepair(episode);
+            continue;
+          }
+          const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, resolvedSegmentCount || episodes.length, rawResult, renderDuration);
+          try {
+            assertBatchSegmentQuality(script, episodeIndex, episodeResult, renderDuration);
+            storeRenderedEpisode(episode, episodeResult);
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : "Render Pack 结果未通过单段质量校验";
+            updateSegmentProgress(episodeIndex, "repairing", reason);
+            publishBatchProgress("repairing", `第 ${episodeIndex} / ${resolvedSegmentCount} 段 Render Pack 未过质量闸，正在单段重修：${reason}`);
+            await renderSingleEpisodeWithQualityRepair(episode);
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "Render Pack 生成失败";
+        publishBatchProgress("repairing", `Render Pack 第 ${packLabel} 段失败，正在逐段降级修复：${reason}`);
+        for (const episode of packEpisodes) {
+          updateSegmentProgress(episode.episodeIndex, "repairing", reason);
+          await renderSingleEpisodeWithQualityRepair(episode);
+        }
       }
     }
 
-    await Promise.all(Array.from({ length: concurrency }, () => renderNextEpisode()));
+    const renderPacks = chunkEpisodesForRenderPacks(episodes, BATCH_RENDER_PACK_SIZE);
+    let nextPackToRender = 0;
+    const renderPackConcurrency = Math.min(BATCH_RENDER_PACK_CONCURRENCY, renderPacks.length);
+
+    async function renderNextPack() {
+      while (nextPackToRender < renderPacks.length) {
+        const packIndex = nextPackToRender;
+        nextPackToRender += 1;
+        await renderPackedSegmentsWithQualityRepair(renderPacks[packIndex]);
+      }
+    }
+
+    await Promise.all(Array.from({ length: renderPackConcurrency }, () => renderNextPack()));
 
     for (const rendered of renderedEpisodes) {
       if (!rendered) {
@@ -1179,7 +1433,8 @@ export function DashboardClient() {
       const episodeScript = rendered.sourceText;
       const fullVideoPrompt = rendered.promptText;
 
-      setGenerationProgress(`正在保存第 ${episodeIndex} / ${episodeCount} 段...`);
+      updateSegmentProgress(episodeIndex, "saving", "正在保存到项目");
+      publishBatchProgress("saving", `正在保存第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
       const save = await saveAnalysisProject(episodeScript, episodeResult, fullVideoPrompt, activeProjectId || undefined, undefined);
       if (!save.saved || !save.projectId || !save.versionId) {
         throw new Error(`第 ${episodeIndex} 段已生成，但项目保存失败：${save.reason || "未返回保存结果"}`);
@@ -1198,6 +1453,8 @@ export function DashboardClient() {
       });
       setBatchResults([...completed]);
       setResult(episodeResult);
+      updateSegmentProgress(episodeIndex, "saved", "已保存");
+      publishBatchProgress("saving", `已保存第 ${episodeIndex} / ${resolvedSegmentCount} 段。`);
     }
 
     if (latestSave?.versionId) {
@@ -1205,7 +1462,7 @@ export function DashboardClient() {
       creatingNewEpisodeRef.current = false;
       setCreatingNewEpisode(false);
     }
-    setGenerationProgress(`已生成 ${completed.length} 段，并按顺序保存到同一个项目。`);
+    publishBatchProgress("completed", `已生成 ${completed.length} 段，并按顺序保存到同一个项目。`);
   }
 
   async function handlePromptFileUpload(event: ChangeEvent<HTMLInputElement>) {
@@ -1218,6 +1475,7 @@ export function DashboardClient() {
     setResult(null);
     setProjectSave(null);
     setBatchResults([]);
+    setBatchProgress(null);
     setGenerationProgress("正在读取文案...");
 
     try {
@@ -1241,7 +1499,7 @@ export function DashboardClient() {
       setUploadedFileName(file.name);
       setGenerationProgress(`已导入 ${file.name}，约 ${cleanText.length} 字。生成时会按当前段数和时长设置处理。`);
     } catch (err: any) {
-      setError(err?.message || "文案文件读取失败");
+      setError(formatUserFacingError(err?.message, "文案文件读取失败"));
       setGenerationProgress("");
     } finally {
       setUploadingText(false);
@@ -1262,9 +1520,10 @@ export function DashboardClient() {
     setDurationPickerOpen(false);
     setEpisodeCountPickerOpen(false);
     setBatchResults([]);
+    setBatchProgress(null);
 
     try {
-      if (episodeCount > 1) {
+      if (segmentCountMode === "auto" || episodeCount > 1) {
         await runBatchEpisodeGeneration();
         return;
       }
@@ -1285,7 +1544,7 @@ export function DashboardClient() {
     } catch (err: any) {
       const message = err?.message === "Failed to fetch"
         ? "本地服务暂时无响应，请确认开发服务器正在运行，或重启后再试。"
-        : err?.message || "分析失败";
+        : formatUserFacingError(err, "分析失败");
       setError(message);
     } finally {
       setLoading(false);
@@ -1492,7 +1751,7 @@ export function DashboardClient() {
       });
       setGenerationProgress("镜头分镜图生成完成，已保存到镜头资产。");
     } catch (err: any) {
-      setImageError(err.message || "镜头分镜图生成失败");
+      setImageError(formatUserFacingError(err, "镜头分镜图生成失败"));
     } finally {
       setImageLoading(false);
     }
@@ -1631,21 +1890,32 @@ export function DashboardClient() {
                   onClick={() => setEpisodeCountPickerOpen((open) => !open)}
                 >
                   <Film className="h-3.5 w-3.5" />
-                  {episodeCount} 段
+                  {segmentCountMode === "auto" ? "自动" : `${episodeCount} 段`}
                 </button>
                 {episodeCountPickerOpen && (
                   <div className="duration-popover" role="dialog" aria-label="选择生成段数">
                     <div className="mb-3 flex items-center justify-between gap-4">
                       <span className="text-sm font-semibold text-slate-300">生成段数</span>
-                      <span className="text-sm font-bold text-slate-200">{episodeCount} 段</span>
+                      <span className="text-sm font-bold text-slate-200">{segmentCountMode === "auto" ? "自动" : `${episodeCount} 段`}</span>
                     </div>
+                    <button
+                      type="button"
+                      className={`mb-2 w-full rounded-lg border px-3 py-2 text-xs font-semibold transition ${
+                        segmentCountMode === "auto"
+                          ? "border-cyan-200/60 bg-cyan-300/16 text-cyan-50"
+                          : "border-white/10 bg-white/[0.03] text-slate-400 hover:text-slate-100"
+                      }`}
+                      onClick={() => setSegmentCountMode("auto")}
+                    >
+                      自动判断段数
+                    </button>
                     <div className="grid grid-cols-5 gap-2">
                       {[1, 3, 5, 10, 30].map((count) => (
                         <button
                           key={count}
                           type="button"
                           className={`rounded-lg border px-2 py-2 text-xs font-semibold transition ${
-                            episodeCount === count
+                            segmentCountMode === "fixed" && episodeCount === count
                               ? "border-cyan-200/60 bg-cyan-300/16 text-cyan-50"
                               : "border-white/10 bg-white/[0.03] text-slate-400 hover:text-slate-100"
                           }`}
@@ -1656,7 +1926,7 @@ export function DashboardClient() {
                       ))}
                     </div>
                     <p className="mt-3 text-[11px] leading-5 text-slate-500">
-                      批量生成会按顺序逐段保存到同一个项目，后一段会读取前面已保存的项目记忆。
+                      自动模式会先分析小说章节或原文结构，识别适合的段数；固定模式会严格按你选择的段数生成。每段默认不超过 15 秒。
                     </p>
                     <input
                       type="range"
@@ -1664,8 +1934,9 @@ export function DashboardClient() {
                       max="30"
                       step="1"
                       value={episodeCount}
+                      disabled={segmentCountMode === "auto"}
                       onChange={(e) => updateEpisodeCount(Number(e.target.value))}
-                      className="duration-slider mt-3"
+                      className={`duration-slider mt-3 ${segmentCountMode === "auto" ? "opacity-45" : ""}`}
                     />
                     <div className="mt-2 flex justify-between text-[11px] text-slate-500">
                       <span>1 段</span>
@@ -1692,6 +1963,50 @@ export function DashboardClient() {
           <div className="mt-4 flex w-full max-w-5xl items-center gap-3 rounded-xl border border-violet-300/18 bg-violet-500/10 px-4 py-3 text-sm text-violet-50">
             {(uploadingText || loading || batchGenerating) && <Loader2 className="h-4 w-4 animate-spin" />}
             <span>{generationProgress || "正在生成..."}</span>
+          </div>
+        )}
+        {batchProgress && (
+          <div className="mt-4 w-full max-w-5xl rounded-xl border border-cyan-300/18 bg-slate-950/70 p-4 text-sm text-slate-200">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="text-xs uppercase tracking-wide text-cyan-200/70">Segment Batch Progress</div>
+                <div className="mt-1 font-semibold text-white">{batchProgress.currentMessage}</div>
+              </div>
+              <div className="text-xs text-slate-400">
+                {batchProgress.mode === "auto" ? "自动分段" : `固定 ${batchProgress.requestedCount || episodeCount} 段`}
+                {batchProgress.resolvedSegmentCount ? ` · 已识别 ${batchProgress.resolvedSegmentCount} 段` : ""}
+              </div>
+            </div>
+            <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-5">
+              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">完成 {batchProgress.completedCount}</span>
+              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">生成中 {batchProgress.runningCount}</span>
+              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">修复 {batchProgress.repairingCount}</span>
+              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">保存 {batchProgress.savingCount}</span>
+              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">等待 {batchProgress.pendingCount}</span>
+            </div>
+            {batchProgress.segments.length > 0 && (
+              <div className="mt-3 flex max-h-32 flex-wrap gap-2 overflow-y-auto pr-1">
+                {batchProgress.segments.map((segment) => (
+                  <span
+                    key={segment.index}
+                    title={segment.message || segment.title || ""}
+                    className={`rounded-lg border px-2.5 py-1 text-xs ${
+                      segment.status === "saved" || segment.status === "completed"
+                        ? "border-emerald-300/20 bg-emerald-300/10 text-emerald-50"
+                        : segment.status === "running" || segment.status === "saving"
+                          ? "border-cyan-300/20 bg-cyan-300/10 text-cyan-50"
+                          : segment.status === "repairing"
+                            ? "border-amber-300/20 bg-amber-300/10 text-amber-50"
+                            : segment.status === "failed"
+                              ? "border-red-300/20 bg-red-300/10 text-red-50"
+                              : "border-white/10 bg-white/[0.03] text-slate-400"
+                    }`}
+                  >
+                    第 {segment.index} 段 · {segment.status}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         )}
         {error && <p className="mt-4 w-full max-w-5xl rounded-xl border border-red-400/20 bg-red-500/10 p-3 text-sm text-red-100">{error}</p>}

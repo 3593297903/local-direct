@@ -27,6 +27,11 @@ test("video prompt Codex job API exposes create, poll, claim, complete, and fail
   const claimRoute = readFileSync(routes[2], "utf8");
   assert.match(claimRoute, /claimNextVideoPromptCodexJob/);
   assert.match(claimRoute, /VIDEO_PROMPT_CODEX_WORKER_TOKEN/);
+  assert.match(
+    claimRoute,
+    /VIDEO_PROMPT_CODEX_ORDER\s*===\s*"newest"\s*\?\s*"newest"\s*:\s*"oldest"/,
+    "video prompt worker should claim oldest jobs unless newest is explicitly requested",
+  );
 
   const completeRoute = readFileSync(routes[3], "utf8");
   assert.match(completeRoute, /completeVideoPromptCodexJob/);

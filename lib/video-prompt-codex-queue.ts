@@ -134,7 +134,8 @@ export async function claimNextVideoPromptCodexJob(options: ClaimOptions = {}) {
     ),
   );
 
-  const direction = options.order === "oldest" ? 1 : -1;
+  const order = options.order === "newest" ? "newest" : "oldest";
+  const direction = order === "oldest" ? 1 : -1;
   const next = recoverableJobs
     .filter((job) => job.status === "pending")
     .sort((left, right) => direction * (Date.parse(left.createdAt) - Date.parse(right.createdAt)))[0];
@@ -155,7 +156,7 @@ export async function claimNextVideoPromptCodexJob(options: ClaimOptions = {}) {
 export async function completeVideoPromptCodexJob(jobId: string, options: QueueOptions = {}) {
   const rootDir = resolveRootDir(options);
   const job = await readJob(rootDir, jobId);
-  const result = await readOutputJson(job.outputPath, job.script);
+  const result = await readVideoPromptOutputJson(job.outputPath, job.script);
   const now = new Date().toISOString();
   const updated: VideoPromptCodexJob = {
     ...job,
@@ -263,7 +264,7 @@ async function syncJobFromOutputFile(job: VideoPromptCodexJob) {
   return {
     ...job,
     status: "completed" as const,
-    result: await readOutputJson(job.outputPath, job.script),
+    result: await readVideoPromptOutputJson(job.outputPath, job.script),
     error: null,
     completedAt: job.completedAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -323,7 +324,7 @@ async function ensureQueueDirs(rootDir: string) {
   await mkdir(resultDir(rootDir), { recursive: true });
 }
 
-async function readOutputJson(filePath: string, sourceText = "") {
+export async function readVideoPromptOutputJson(filePath: string, sourceText = "") {
   try {
     const result = normalizeAnalysisResultShape(JSON.parse(stripJsonBom(await readFile(filePath, "utf8"))) as Record<string, unknown>);
     validateAnalysisResultShape(result);
@@ -428,7 +429,7 @@ async function isValidOutputJson(filePath: string, sourceText = "") {
   try {
     const fileStat = await stat(filePath);
     if (!fileStat.isFile() || fileStat.size <= 0) return false;
-    await readOutputJson(filePath, sourceText);
+    await readVideoPromptOutputJson(filePath, sourceText);
     return true;
   } catch {
     return false;

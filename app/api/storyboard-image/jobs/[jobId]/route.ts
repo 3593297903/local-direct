@@ -1,12 +1,18 @@
 import { NextResponse } from "next/server";
-import { getStoryboardCodexJob } from "@/lib/storyboard-codex-queue";
+import { failStoryboardCodexJob, getStoryboardCodexJob } from "@/lib/storyboard-codex-queue";
+import { getCodexRuntimeState } from "@/lib/codex-runtime-state";
 
 export const runtime = "nodejs";
 
 export async function GET(_request: Request, context: { params: Promise<{ jobId: string }> }) {
   try {
     const params = await context.params;
-    const job = await getStoryboardCodexJob(params.jobId);
+    let job = await getStoryboardCodexJob(params.jobId);
+    const codexState = await getCodexRuntimeState();
+    if (!codexState.available && (job.status === "pending" || job.status === "running")) {
+      job = await failStoryboardCodexJob(params.jobId, codexState.message);
+      return NextResponse.json({ ok: true, job, codexUnavailable: codexState });
+    }
     return NextResponse.json({ ok: true, job });
   } catch (error: any) {
     return NextResponse.json(

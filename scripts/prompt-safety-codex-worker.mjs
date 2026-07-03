@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.PROMPT_SAFETY_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -119,30 +120,39 @@ async function runCodex(task) {
 
   console.log(`Running codex exec for prompt safety job ${task.id}.`);
   await new Promise((resolve, reject) => {
+    let capturedOutput = "";
     const child = spawn(command, args, {
       cwd: rootDir,
       env: process.env,
       shell: shouldRunCodexThroughShell(command),
-      stdio: ["pipe", "inherit", "inherit"],
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: false,
     });
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
       child.kill();
-      reject(new Error(`codex exec timed out after ${taskTimeoutMs}ms`));
+      reject(new Error(buildCodexFailureMessage(`codex exec timed out after ${taskTimeoutMs}ms`, capturedOutput)));
     }, taskTimeoutMs);
 
     child.stdin.end(buildCodexPrompt(task), "utf8");
+    child.stdout?.on("data", (chunk) => {
+      capturedOutput = appendCapturedOutput(capturedOutput, chunk);
+      process.stdout.write(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      capturedOutput = appendCapturedOutput(capturedOutput, chunk);
+      process.stderr.write(chunk);
+    });
     child.on("error", (error) => {
       clearTimeout(timeout);
-      reject(error);
+      reject(new Error(buildCodexFailureMessage(error.message, capturedOutput)));
     });
     child.on("exit", (code) => {
       clearTimeout(timeout);
       if (timedOut) return;
       if (code === 0) resolve();
-      else reject(new Error(`codex exec exited with code ${code}`));
+      else reject(new Error(buildCodexFailureMessage(`codex exec exited with code ${code}`, capturedOutput)));
     });
   });
 }

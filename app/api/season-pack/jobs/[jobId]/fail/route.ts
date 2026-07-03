@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { failSeasonPackCodexJob } from "@/lib/season-pack-codex-queue";
+import { isCodexQuotaExhaustedMessage, markCodexQuotaExhausted } from "@/lib/codex-runtime-state";
 
 export const runtime = "nodejs";
 
@@ -18,6 +19,9 @@ export async function POST(request: Request, context: { params: Promise<{ jobId:
     const params = await context.params;
     const body = await request.json().catch(() => ({}));
     const message = typeof body?.message === "string" ? body.message : undefined;
+    if (isCodexQuotaExhaustedMessage(message)) {
+      await markCodexQuotaExhausted("season-pack", message);
+    }
     const job = await failSeasonPackCodexJob(params.jobId, message);
     return NextResponse.json({ ok: true, job });
   } catch (error: any) {

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.SEASON_PACK_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -101,30 +102,39 @@ async function runCodex(task) {
 
   console.log(`Running codex exec for season pack job ${task.id}.`);
   await new Promise((resolve, reject) => {
+    let capturedOutput = "";
     const child = spawn(command, args, {
       cwd: rootDir,
       env: process.env,
       shell: shouldRunCodexThroughShell(command),
-      stdio: ["pipe", "inherit", "inherit"],
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: false,
     });
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
       child.kill();
-      reject(new Error(`codex exec timed out after ${taskTimeoutMs}ms`));
+      reject(new Error(buildCodexFailureMessage(`codex exec timed out after ${taskTimeoutMs}ms`, capturedOutput)));
     }, taskTimeoutMs);
 
     child.stdin.end(buildCodexPrompt(task), "utf8");
+    child.stdout?.on("data", (chunk) => {
+      capturedOutput = appendCapturedOutput(capturedOutput, chunk);
+      process.stdout.write(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      capturedOutput = appendCapturedOutput(capturedOutput, chunk);
+      process.stderr.write(chunk);
+    });
     child.on("error", (error) => {
       clearTimeout(timeout);
-      reject(error);
+      reject(new Error(buildCodexFailureMessage(error.message, capturedOutput)));
     });
     child.on("exit", (code) => {
       clearTimeout(timeout);
       if (timedOut) return;
       if (code === 0) resolve();
-      else reject(new Error(`codex exec exited with code ${code}`));
+      else reject(new Error(buildCodexFailureMessage(`codex exec exited with code ${code}`, capturedOutput)));
     });
   });
 }
@@ -153,9 +163,11 @@ function codexMessagePath(task) {
 }
 
 async function assertSeasonPackOutput(task) {
-  await assertJsonFile(task.manifestPath, "manifest.json");
+  const manifestRaw = await assertJsonFile(task.manifestPath, "manifest.json");
+  const manifest = JSON.parse(stripJsonBom(manifestRaw));
+  const episodeCount = resolveEpisodeCount(task, manifest);
   await assertJsonFile(task.seasonPlanPath, "season-plan.json");
-  for (let episodeIndex = 1; episodeIndex <= task.episodeCount; episodeIndex += 1) {
+  for (let episodeIndex = 1; episodeIndex <= episodeCount; episodeIndex += 1) {
     const fileName = `episode-${String(episodeIndex).padStart(3, "0")}.json`;
     const filePath = path.join(task.episodesDir, fileName);
     const raw = await assertJsonFile(filePath, fileName);
@@ -171,6 +183,29 @@ async function assertSeasonPackOutput(task) {
     }
     assertNoEncodingDamage(raw, `${task.script || ""}\n${task.prompt || ""}`);
   }
+}
+
+function resolveEpisodeCount(task, manifest) {
+  if (task.segmentCountMode !== "auto") return task.episodeCount;
+
+  const manifestCount =
+    positiveInteger(manifest?.episodeCount, 0)
+    || positiveInteger(manifest?.resolvedEpisodeCount, 0)
+    || positiveInteger(manifest?.segmentCount, 0);
+  const generatedEpisodes = Array.isArray(manifest?.generatedEpisodes)
+    ? manifest.generatedEpisodes
+        .map((value) => positiveInteger(value, 0))
+        .filter(Boolean)
+    : [];
+  const generatedCount = generatedEpisodes.length;
+  const resolvedCount = manifestCount || generatedCount || positiveInteger(task.resolvedEpisodeCount, 0);
+  if (!resolvedCount || resolvedCount < 1 || resolvedCount > 30) {
+    throw new Error("Automatic season pack manifest must resolve between 1 and 30 segments");
+  }
+  if (generatedCount > 0 && manifestCount && generatedCount !== manifestCount) {
+    throw new Error("Automatic season pack manifest episodeCount does not match generatedEpisodes");
+  }
+  return resolvedCount;
 }
 
 async function assertJsonFile(filePath, label) {

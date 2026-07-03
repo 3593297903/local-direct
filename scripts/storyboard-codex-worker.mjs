@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.STORYBOARD_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -162,6 +163,7 @@ async function runCodex(task) {
   await new Promise((resolve, reject) => {
     const logStream = fs.createWriteStream(logPath, { flags: "a" });
     logStream.write(`\n[${new Date().toISOString()}] codex exec started for ${task.id}\n`);
+    let capturedOutput = "";
     const child = spawn(command, args, {
       cwd: rootDir,
       env: {
@@ -187,14 +189,16 @@ async function runCodex(task) {
     const timeout = setTimeout(() => {
       timedOut = true;
       terminateProcessTree(child);
-      settle(new Error(`codex exec timed out after ${taskTimeoutMs}ms`));
+      settle(new Error(buildCodexFailureMessage(`codex exec timed out after ${taskTimeoutMs}ms`, capturedOutput)));
     }, taskTimeoutMs);
 
     child.stdout?.on("data", (chunk) => {
+      capturedOutput = appendCapturedOutput(capturedOutput, chunk);
       process.stdout.write(chunk);
       logStream.write(chunk);
     });
     child.stderr?.on("data", (chunk) => {
+      capturedOutput = appendCapturedOutput(capturedOutput, chunk);
       process.stderr.write(chunk);
       logStream.write(chunk);
     });
@@ -205,7 +209,7 @@ async function runCodex(task) {
     child.on("exit", (code) => {
       if (timedOut) return;
       if (code === 0) settle();
-      else settle(new Error(`codex exec exited with code ${code}`));
+      else settle(new Error(buildCodexFailureMessage(`codex exec exited with code ${code}`, capturedOutput)));
     });
   });
 }

@@ -343,6 +343,40 @@ export async function failStoryboardCodexPanel(
   });
 }
 
+export async function failStoryboardCodexJob(
+  jobId: string,
+  message: string | undefined,
+  options: QueueOptions = {},
+) {
+  const rootDir = resolveRootDir(options);
+  return withQueueLock(rootDir, async () => {
+    const job = await readJob(rootDir, jobId);
+    const now = new Date().toISOString();
+    const baseMessage = message || "Codex storyboard generation failed";
+    const panels = job.panels.map((panel) => {
+      if (panel.status === "completed") return panel;
+      return {
+        ...panel,
+        status: "failed" as const,
+        imageUrl: null,
+        error: baseMessage,
+        startedAt: undefined,
+        completedAt: undefined,
+        updatedAt: now,
+      };
+    });
+    const updated = applyJobStatus({
+      ...job,
+      panels,
+      status: "failed",
+      error: baseMessage,
+      updatedAt: now,
+    });
+    await writeJob(rootDir, updated);
+    return updated;
+  });
+}
+
 function buildStoryboardPanelPrompt(
   input: CreateStoryboardCodexJobInput,
   shot: StoryboardCodexShotInput,

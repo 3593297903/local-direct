@@ -2,12 +2,14 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.VIDEO_PROMPT_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
 const pollMs = positiveInteger(process.env.VIDEO_PROMPT_CODEX_POLL_MS, 2500);
 const idleLogMs = positiveInteger(process.env.VIDEO_PROMPT_CODEX_IDLE_LOG_MS, 30_000);
 const taskTimeoutMs = positiveInteger(process.env.VIDEO_PROMPT_CODEX_TASK_TIMEOUT_MS, 20 * 60_000);
+const concurrency = Math.max(1, Math.min(5, positiveInteger(process.env.VIDEO_PROMPT_CODEX_CONCURRENCY, 2)));
 const workerToken = process.env.VIDEO_PROMPT_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-video-prompt-codex", "codex-messages");
 
@@ -15,19 +17,37 @@ console.log("Local Director video prompt Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
 console.log(`Poll interval: ${pollMs}ms`);
 console.log(`Task timeout: ${taskTimeoutMs}ms`);
+console.log(`Concurrency: ${concurrency}`);
 
 let lastIdleLogAt = 0;
+const activeTasks = new Set();
 
 while (true) {
   try {
-    const task = await claimTask();
-    if (!task) {
+    while (activeTasks.size < concurrency) {
+      const task = await claimTask();
+      if (!task) break;
+
+      const taskPromise = processTask(task)
+        .catch((error) => {
+          console.error(error instanceof Error ? error.message : error);
+        })
+        .finally(() => {
+          activeTasks.delete(taskPromise);
+        });
+      activeTasks.add(taskPromise);
+    }
+
+    if (!activeTasks.size) {
       logIdle();
       await delay(pollMs);
       continue;
     }
-
-    await processTask(task);
+    if (activeTasks.size >= concurrency) {
+      await Promise.race(activeTasks);
+      continue;
+    }
+    await delay(pollMs);
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
     await delay(pollMs);
@@ -117,30 +137,39 @@ async function runCodex(task) {
 
   console.log(`Running codex exec for video prompt job ${task.id}.`);
   await new Promise((resolve, reject) => {
+    let capturedOutput = "";
     const child = spawn(command, args, {
       cwd: rootDir,
       env: process.env,
       shell: shouldRunCodexThroughShell(command),
-      stdio: ["pipe", "inherit", "inherit"],
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: false,
     });
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
       child.kill();
-      reject(new Error(`codex exec timed out after ${taskTimeoutMs}ms`));
+      reject(new Error(buildCodexFailureMessage(`codex exec timed out after ${taskTimeoutMs}ms`, capturedOutput)));
     }, taskTimeoutMs);
 
     child.stdin.end(buildCodexPrompt(task), "utf8");
+    child.stdout?.on("data", (chunk) => {
+      capturedOutput = appendCapturedOutput(capturedOutput, chunk);
+      process.stdout.write(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      capturedOutput = appendCapturedOutput(capturedOutput, chunk);
+      process.stderr.write(chunk);
+    });
     child.on("error", (error) => {
       clearTimeout(timeout);
-      reject(error);
+      reject(new Error(buildCodexFailureMessage(error.message, capturedOutput)));
     });
     child.on("exit", (code) => {
       clearTimeout(timeout);
       if (timedOut) return;
       if (code === 0) resolve();
-      else reject(new Error(`codex exec exited with code ${code}`));
+      else reject(new Error(buildCodexFailureMessage(`codex exec exited with code ${code}`, capturedOutput)));
     });
   });
 }

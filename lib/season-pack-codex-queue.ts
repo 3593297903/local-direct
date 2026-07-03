@@ -3,11 +3,13 @@ import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export type SeasonPackCodexJobStatus = "pending" | "running" | "completed" | "failed";
+export type SeasonPackSegmentCountMode = "fixed" | "auto";
 
 export type CreateSeasonPackCodexJobInput = {
   projectId?: string;
   script: string;
-  episodeCount: number;
+  episodeCount?: number;
+  segmentCountMode?: SeasonPackSegmentCountMode;
   duration?: string;
   contentType?: string;
   style?: string;
@@ -44,6 +46,9 @@ export type SeasonPackCodexJob = {
   id: string;
   projectId: string | null;
   script: string;
+  segmentCountMode: SeasonPackSegmentCountMode;
+  requestedEpisodeCount: number | null;
+  resolvedEpisodeCount: number | null;
   episodeCount: number;
   duration: string;
   contentType: string;
@@ -152,11 +157,17 @@ export async function createSeasonPackCodexJob(
   const contentType = input.contentType || "short drama / general";
   const style = input.style || "auto match script tone";
   const projectMemory = input.projectMemory || "";
+  const segmentCountMode: SeasonPackSegmentCountMode = input.segmentCountMode === "auto" ? "auto" : "fixed";
+  const requestedEpisodeCount = segmentCountMode === "auto" ? null : input.episodeCount || 1;
+  const episodeCount = requestedEpisodeCount || 0;
   const job: SeasonPackCodexJob = {
     id: jobId,
     projectId: input.projectId || null,
     script: input.script,
-    episodeCount: input.episodeCount,
+    segmentCountMode,
+    requestedEpisodeCount,
+    resolvedEpisodeCount: null,
+    episodeCount,
     duration,
     contentType,
     style,
@@ -167,6 +178,8 @@ export async function createSeasonPackCodexJob(
       contentType,
       style,
       projectMemory,
+      segmentCountMode,
+      episodeCount,
     }, { packDir, episodesDir, manifestPath, seasonPlanPath }),
     status: "pending",
     packDir,
@@ -202,7 +215,8 @@ export async function claimNextSeasonPackCodexJob(options: ClaimOptions = {}) {
     ),
   );
 
-  const direction = options.order === "oldest" ? 1 : -1;
+  const order = options.order === "newest" ? "newest" : "oldest";
+  const direction = order === "oldest" ? 1 : -1;
   const next = recoverableJobs
     .filter((job) => job.status === "pending")
     .sort((left, right) => direction * (Date.parse(left.createdAt) - Date.parse(right.createdAt)))[0];
@@ -225,8 +239,11 @@ export async function completeSeasonPackCodexJob(jobId: string, options: QueueOp
   const job = await readJob(rootDir, jobId);
   const result = await readSeasonPackResult(job);
   const now = new Date().toISOString();
+  const resolvedEpisodeCount = result.episodes.length;
   const updated: SeasonPackCodexJob = {
     ...job,
+    episodeCount: job.segmentCountMode === "auto" ? resolvedEpisodeCount : job.episodeCount,
+    resolvedEpisodeCount,
     status: "completed",
     result,
     error: null,
@@ -255,12 +272,29 @@ export async function failSeasonPackCodexJob(
 }
 
 function buildSeasonPackCodexPrompt(
-  input: Required<Pick<CreateSeasonPackCodexJobInput, "script" | "episodeCount" | "duration" | "contentType" | "style" | "projectMemory">> & {
+  input: {
     projectId?: string;
+    script: string;
+    episodeCount: number;
+    segmentCountMode: SeasonPackSegmentCountMode;
+    duration: string;
+    contentType: string;
+    style: string;
+    projectMemory: string;
   },
   paths: { packDir: string; episodesDir: string; manifestPath: string; seasonPlanPath: string },
 ) {
-  const exampleLast = episodeFileName(input.episodeCount);
+  const isAuto = input.segmentCountMode === "auto";
+  const exampleLast = episodeFileName(isAuto ? MAX_EPISODE_COUNT : input.episodeCount);
+  const segmentCountInstruction = isAuto
+    ? "You must decide the best segment count between 1 and 30 from the source structure. Every resolved segment must be 15 seconds or less unless the source explicitly asks for a shorter duration."
+    : `You must write exactly ${input.episodeCount} segment JSON files.`;
+  const filePatternInstruction = isAuto
+    ? `Segment files keep the compatibility filename pattern episode-001.json through the resolved final file, never beyond ${exampleLast}.`
+    : `Segment files keep the compatibility filename pattern episode-001.json through ${exampleLast}.`;
+  const requiredEpisodeFilesInstruction = isAuto
+    ? "- one segment file per resolved segment in the episodes directory. The resolved count must be 1-30 and must match manifest.generatedEpisodes."
+    : `- ${input.episodeCount} segment files in the episodes directory.`;
   return [
     "You are running Local Director season planning from a local Codex CLI worker.",
     "Use one long-context pass to understand the complete source script and produce a planning file pack.",
@@ -268,8 +302,8 @@ function buildSeasonPackCodexPrompt(
     "This task only creates Story Bible, Segment Chain, and per-segment input packs for the normal single-segment renderer.",
     "Do not call network providers. Do not open a browser. Do not ask the user for follow-up input.",
     "",
-    `You must write exactly ${input.episodeCount} segment JSON files.`,
-    `Segment files keep the compatibility filename pattern episode-001.json through ${exampleLast}.`,
+    segmentCountInstruction,
+    filePatternInstruction,
     "Each file must contain one strict Segment Input Pack JSON object, not a final prompt result.",
     "For compatibility this object is also called an Episode Input Pack in older code, but user-facing text must say segment / 段.",
     "Every Segment Input Pack must include: episodeIndex, title, sourceText, duration, contentType, style, storyBible, episodeChain, blueprint, shotCount, and renderInputScript.",
@@ -284,7 +318,7 @@ function buildSeasonPackCodexPrompt(
     "Required file pack:",
     "- manifest.json with episodeCount, generatedEpisodes, and status.",
     "- season-plan.json with storyBible, episodeChain, characters, scenes, props, visualStyle, cameraLanguage, lockedRules, and one plan item per segment.",
-    `- ${input.episodeCount} segment files in the episodes directory.`,
+    requiredEpisodeFilesInstruction,
     "",
     "Planning rules:",
     "- Build one stable Story Bible from the full source and Project memory.",
@@ -292,7 +326,9 @@ function buildSeasonPackCodexPrompt(
     "- Keep all segments consistent with the same Story Bible and ID references.",
     "- If Project memory is provided, continue from it and do not reset existing characters, settings, or tone.",
     "- If Project memory is empty, infer a new project bible from the full source script.",
-    "- Split the source into the requested number of video segments by meaning and order. These are Local Director segments, not story episodes.",
+    isAuto
+      ? "- Auto mode: split the source into the best number of Local Director video segments by meaning and order. Choose enough segments to preserve concrete events, but keep every segment focused and <=15 seconds."
+      : "- Split the source into the requested number of video segments by meaning and order. These are Local Director segments, not story episodes.",
     "- If the source script already contains explicit segment headings such as 第1段 / 第2段, preserve that segment count and order.",
     "- If the source contains labels such as 原剧本第二集 / 第三集, keep them only as internal source metadata and never write them into final title, sourceText, or renderInputScript.",
     "- If a source segment contains explicit 镜头 lines or time-range shot lines such as 0s-4s｜镜头1 or 00:00-00:04｜镜头1, use that count only when it fits the duration density rules below.",
@@ -308,7 +344,8 @@ function buildSeasonPackCodexPrompt(
     "- renderInputScript must not contain final workflow.fullVideoPrompt or final storyboard JSON.",
     "",
     `Project ID: ${input.projectId || "new project"}`,
-    `Segment count: ${input.episodeCount}`,
+    `Segment count mode: ${input.segmentCountMode}`,
+    `Segment count: ${isAuto ? "auto" : input.episodeCount}`,
     `Duration: ${input.duration}`,
     `Content type: ${input.contentType}`,
     `Style: ${input.style}`,
@@ -340,11 +377,15 @@ async function syncAndSaveJob(rootDir: string, job: SeasonPackCodexJob) {
 async function syncJobFromOutputFiles(job: SeasonPackCodexJob) {
   if (job.status === "completed") return job;
   if (!(await isValidSeasonPack(job))) return job;
+  const result = await readSeasonPackResult(job);
+  const resolvedEpisodeCount = result.episodes.length;
 
   return {
     ...job,
+    episodeCount: job.segmentCountMode === "auto" ? resolvedEpisodeCount : job.episodeCount,
+    resolvedEpisodeCount,
     status: "completed" as const,
-    result: await readSeasonPackResult(job),
+    result,
     error: null,
     completedAt: job.completedAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -407,13 +448,15 @@ async function ensureQueueDirs(rootDir: string) {
 async function readSeasonPackResult(job: SeasonPackCodexJob): Promise<SeasonPackCodexJobResult> {
   const episodes: SeasonPackEpisodeResult[] = [];
   const sourceContext = parseSeasonSourceContext(job.script);
-  for (let episodeIndex = 1; episodeIndex <= job.episodeCount; episodeIndex += 1) {
+  const manifest = await readOptionalJson(job.manifestPath);
+  const episodeCount = resolveSeasonPackEpisodeCount(job, manifest);
+  for (let episodeIndex = 1; episodeIndex <= episodeCount; episodeIndex += 1) {
     const fileName = episodeFileName(episodeIndex);
     const filePath = path.join(job.episodesDir, fileName);
     const input = await readOutputJson(filePath, {
       sourceText: job.script,
       episodeIndex,
-      episodeCount: job.episodeCount,
+      episodeCount,
       duration: job.duration,
       contentType: job.contentType,
       style: job.style,
@@ -423,7 +466,7 @@ async function readSeasonPackResult(job: SeasonPackCodexJob): Promise<SeasonPack
   }
 
   return {
-    manifest: await readOptionalJson(job.manifestPath),
+    manifest,
     seasonPlan: await readOptionalJson(job.seasonPlanPath),
     episodes,
   };
@@ -478,6 +521,34 @@ async function isValidSeasonPack(job: SeasonPackCodexJob) {
   } catch {
     return false;
   }
+}
+
+function resolveSeasonPackEpisodeCount(job: SeasonPackCodexJob, manifest: Record<string, unknown> | null) {
+  const mode = job.segmentCountMode === "auto" ? "auto" : "fixed";
+  if (mode === "fixed") return job.episodeCount;
+
+  const manifestCount = normalizePositiveInteger(manifest?.episodeCount)
+    || normalizePositiveInteger(manifest?.resolvedEpisodeCount)
+    || normalizePositiveInteger(manifest?.segmentCount);
+  const generatedEpisodes = Array.isArray(manifest?.generatedEpisodes)
+    ? manifest.generatedEpisodes
+        .map((value) => normalizePositiveInteger(value))
+        .filter((value): value is number => Boolean(value))
+    : [];
+  const generatedCount = generatedEpisodes.length;
+  const resolvedCount = manifestCount || generatedCount || normalizePositiveInteger(job.resolvedEpisodeCount);
+  if (!resolvedCount || resolvedCount < 1 || resolvedCount > MAX_EPISODE_COUNT) {
+    throw new SeasonPackCodexQueueError("Automatic season pack manifest must resolve between 1 and 30 segments");
+  }
+  if (generatedCount > 0 && manifestCount && generatedCount !== manifestCount) {
+    throw new SeasonPackCodexQueueError("Automatic season pack manifest episodeCount does not match generatedEpisodes");
+  }
+  return resolvedCount;
+}
+
+function normalizePositiveInteger(value: unknown) {
+  const number = typeof value === "number" ? value : Number.parseInt(String(value || ""), 10);
+  return Number.isInteger(number) && number > 0 ? number : 0;
 }
 
 function stripJsonBom(value: string) {
@@ -1148,7 +1219,18 @@ function validateCreateInput(input: CreateSeasonPackCodexJobInput) {
   if (script.length > MAX_SCRIPT_LENGTH) {
     throw new SeasonPackCodexQueueError("Script is too long for one Codex season pack job");
   }
-  if (!Number.isInteger(input.episodeCount) || input.episodeCount < 1 || input.episodeCount > MAX_EPISODE_COUNT) {
+  const segmentCountMode = input.segmentCountMode === "auto" ? "auto" : "fixed";
+  const requestedCount = input.episodeCount;
+  if (segmentCountMode === "auto") {
+    if (
+      requestedCount !== undefined
+      && (!Number.isInteger(requestedCount) || requestedCount < 1 || requestedCount > MAX_EPISODE_COUNT)
+    ) {
+      throw new SeasonPackCodexQueueError("Episode count must be between 1 and 30");
+    }
+    return;
+  }
+  if (!Number.isInteger(requestedCount) || requestedCount === undefined || requestedCount < 1 || requestedCount > MAX_EPISODE_COUNT) {
     throw new SeasonPackCodexQueueError("Episode count must be between 1 and 30");
   }
 }
