@@ -218,6 +218,41 @@ type StoryboardCodexJob = {
   error: string | null;
 };
 
+type VisualAssetCodexTask = {
+  id: string;
+  jobId: string;
+  entityId: string;
+  entityType: "CHARACTER" | "SCENE" | "PROP" | "STYLE" | string;
+  entityName: string;
+  entityKey: string;
+  assetType: "CHARACTER_TURNAROUND" | "SCENE_KEYART" | "PROP_SHEET" | string;
+  mode: "initial" | "regenerate" | "edit_text" | "edit_image" | string;
+  prompt: string;
+  size: string;
+  quality: string;
+  status: "pending" | "running" | "completed" | "failed";
+  imageUrl: string | null;
+  error: string | null;
+  attempts?: number;
+  sourceImagePath?: string | null;
+  codexLogPath?: string | null;
+};
+
+type VisualAssetCodexJob = {
+  id: string;
+  projectId: string;
+  versionId: string;
+  entityId: string;
+  entityType: "CHARACTER" | "SCENE" | "PROP" | "STYLE" | string;
+  entityName: string;
+  entityKey: string;
+  assetType: "CHARACTER_TURNAROUND" | "SCENE_KEYART" | "PROP_SHEET" | string;
+  mode: "initial" | "regenerate" | "edit_text" | "edit_image" | string;
+  status: "pending" | "running" | "completed" | "failed";
+  task: VisualAssetCodexTask;
+  error: string | null;
+};
+
 type PromptSafetyOptimizationResult = {
   targetModel: string;
   status: "PASSED" | "OPTIMIZED" | "BLOCKED_NEEDS_USER_EDIT";
@@ -473,6 +508,12 @@ function getVisualEntityStatusLabel(status?: string | null) {
   return "候选";
 }
 
+function getVisualAssetTypeForEntity(entityType?: string | null): "CHARACTER_TURNAROUND" | "SCENE_KEYART" | "PROP_SHEET" {
+  if (entityType === "CHARACTER") return "CHARACTER_TURNAROUND";
+  if (entityType === "PROP") return "PROP_SHEET";
+  return "SCENE_KEYART";
+}
+
 function getRetryingStoryboardPanelCount(job: StoryboardCodexJob) {
   return job.panels.filter((panel) => panel.status === "pending" && Boolean(panel.error)).length;
 }
@@ -507,6 +548,9 @@ export function ProjectsClient() {
   const [promptSafetyLoading, setPromptSafetyLoading] = useState(false);
   const [promptSafetyMessage, setPromptSafetyMessage] = useState("");
   const [promptSafetyError, setPromptSafetyError] = useState("");
+  const [visualAssetGeneratingEntityId, setVisualAssetGeneratingEntityId] = useState("");
+  const [visualAssetGenerationMessage, setVisualAssetGenerationMessage] = useState("");
+  const [visualAssetGenerationError, setVisualAssetGenerationError] = useState("");
 
   const selectedVersion = useMemo(() => {
     if (!project) return null;
@@ -842,6 +886,119 @@ export function ProjectsClient() {
   async function regenerateShotStoryboard(shot: ProjectShot) {
     if (!selectedVersion) return;
     await runProjectStoryboardGeneration(selectedVersion, [shot]);
+  }
+
+  async function createVisualAssetCodexJob(entity: ProjectVisualEntity) {
+    if (!project || !selectedVersion) throw new Error("项目详情未加载完成");
+    const entityAssets = getEntityVisualAssets(project, entity);
+    const res = await fetch("/api/visual-asset-image/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: project.id,
+        versionId: selectedVersion.id,
+        entityId: entity.id,
+        entityType: entity.type,
+        entityName: entity.name,
+        entityKey: entity.key,
+        canonicalPrompt: entity.canonicalPrompt || undefined,
+        visualLock: entity.visualLock || undefined,
+        negativeLock: entity.negativeLock || undefined,
+        mode: entityAssets.length ? "regenerate" : "initial",
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) throw new Error(data?.error || "视觉资产图任务创建失败");
+    return data.job as VisualAssetCodexJob;
+  }
+
+  async function pollVisualAssetCodexJob(jobId: string) {
+    const startedAt = Date.now();
+    const timeoutMs = 30 * 60_000;
+    const pollMs = 2500;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const res = await fetch(`/api/visual-asset-image/jobs/${jobId}`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "视觉资产图任务查询失败");
+
+      const job = data.job as VisualAssetCodexJob;
+      setVisualAssetGenerationMessage(
+        job.status === "running"
+          ? `正在生成 ${job.entityName} 的资产图...`
+          : `视觉资产图任务状态：${job.status}`,
+      );
+      if (job.status === "completed") return job;
+      if (job.status === "failed") {
+        throw new Error(job.error || job.task?.error || "视觉资产图生成失败");
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, pollMs));
+    }
+
+    throw new Error("视觉资产图任务等待超时，请确认 visual-asset:codex-worker 正在运行。");
+  }
+
+  async function saveGeneratedVisualAsset(entity: ProjectVisualEntity, job: VisualAssetCodexJob) {
+    if (!project || !selectedVersion || !job.task?.imageUrl) return;
+    const existingAssets = getEntityVisualAssets(project, entity);
+    const assetType = getVisualAssetTypeForEntity(entity.type);
+    const res = await fetch("/api/projects/visual-assets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: project.id,
+        versionId: selectedVersion.id,
+        visualAssets: [
+          {
+            type: assetType,
+            name: `${entity.name} ${assetType === "CHARACTER_TURNAROUND" ? "角色三视图" : assetType === "PROP_SHEET" ? "道具图" : "场景图"}`,
+            entityId: entity.id,
+            variantKey: `${entity.key || entity.id}-${job.mode}-${Date.now()}`,
+            prompt: job.task.prompt || "",
+            imageUrl: job.task.imageUrl,
+            status: "COMPLETED",
+            isPrimary: existingAssets.length === 0,
+            locked: entity.status === "LOCKED",
+            metadata: {
+              source: "codex-imagegen",
+              generatedFrom: "project-asset-library",
+              jobId: job.id,
+              taskId: job.task.id,
+              entityType: entity.type,
+              entityKey: entity.key,
+              assetType,
+              mode: job.mode,
+              size: job.task.size,
+              quality: job.task.quality,
+              attempts: job.task.attempts,
+              sourceImagePath: job.task.sourceImagePath,
+              codexLogPath: job.task.codexLogPath,
+            },
+          },
+        ],
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) throw new Error(data?.error || "视觉资产图保存失败");
+  }
+
+  async function generateProjectVisualEntityAsset(entity: ProjectVisualEntity) {
+    if (!project || !selectedVersion || visualAssetGeneratingEntityId) return;
+    setVisualAssetGeneratingEntityId(entity.id);
+    setVisualAssetGenerationError("");
+    setVisualAssetGenerationMessage(`已创建 ${entity.name} 的资产图任务，请确认 visual-asset:codex-worker 正在运行。`);
+
+    try {
+      const job = await createVisualAssetCodexJob(entity);
+      const completedJob = await pollVisualAssetCodexJob(job.id);
+      await saveGeneratedVisualAsset(entity, completedJob);
+      await reloadSelectedProject(project.id, selectedVersion.id);
+      setVisualAssetGenerationMessage(`${entity.name} 的资产图已生成并保存到资产库。`);
+    } catch (err) {
+      setVisualAssetGenerationError(getFriendlyProjectError(err instanceof Error ? err.message : "视觉资产图生成失败"));
+    } finally {
+      setVisualAssetGeneratingEntityId("");
+    }
   }
 
   async function createPromptSafetyCodexJob(
@@ -1627,6 +1784,18 @@ export function ProjectsClient() {
                     </div>
                   </div>
 
+                  {(visualAssetGenerationMessage || visualAssetGenerationError) && (
+                    <div
+                      className={`mb-5 rounded-2xl border px-4 py-3 text-sm ${
+                        visualAssetGenerationError
+                          ? "border-red-400/25 bg-red-500/10 text-red-100"
+                          : "border-cyan-300/16 bg-cyan-300/[0.07] text-cyan-50"
+                      }`}
+                    >
+                      {visualAssetGenerationError || visualAssetGenerationMessage}
+                    </div>
+                  )}
+
                   <div className="projects-asset-tabs mb-5 flex flex-wrap gap-2" role="tablist" aria-label="资产库分类">
                     {projectAssetLibrarySections.map((section) => {
                       const Icon = section.icon;
@@ -1652,6 +1821,7 @@ export function ProjectsClient() {
                     {activeAssetLibrarySection.entities.map((entity) => {
                       const entityAssets = getEntityVisualAssets(project, entity);
                       const primaryAsset = getPrimaryEntityAsset(project, entity);
+                      const isVisualAssetGenerating = visualAssetGeneratingEntityId === entity.id;
 
                       return (
                         <article key={entity.id} className="projects-asset-card">
@@ -1684,6 +1854,15 @@ export function ProjectsClient() {
                             <p className="mt-3 line-clamp-3 text-xs leading-5 text-slate-400">
                               {entity.visualLock || entity.canonicalPrompt || entity.negativeLock || "等待生成或确认视觉锁定。"}
                             </p>
+                            <button
+                              type="button"
+                              onClick={() => generateProjectVisualEntityAsset(entity)}
+                              disabled={Boolean(visualAssetGeneratingEntityId)}
+                              className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl border border-cyan-300/18 bg-cyan-300/[0.08] px-3 py-2 text-xs font-semibold text-cyan-50 transition hover:bg-cyan-300/[0.14] disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {isVisualAssetGenerating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ImageIcon className="h-3.5 w-3.5" />}
+                              {isVisualAssetGenerating ? "生成中" : primaryAsset?.imageUrl ? "重新生成" : "生成资产图"}
+                            </button>
                           </div>
                         </article>
                       );
