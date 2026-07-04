@@ -34,6 +34,32 @@ export type SeasonPackEpisodeInput = {
   blueprint: unknown;
   shotCount: number;
   renderInputScript: string;
+  beatIds?: string[];
+  beatRange?: {
+    start: number;
+    end: number;
+  };
+  targetDurationSeconds?: number;
+  lockedSegmentPlan?: LockedSeasonSegment;
+};
+
+export type SeasonPackBeat = {
+  id: string;
+  summary: string;
+  sourceText: string;
+  estimatedDurationSeconds: number;
+  shotCount: number;
+};
+
+export type LockedSeasonSegment = {
+  segmentIndex: number;
+  title: string;
+  beatStart: number;
+  beatEnd: number;
+  beatIds: string[];
+  estimatedDurationSeconds: number;
+  shotCount: number;
+  sourceText: string;
 };
 
 export type SeasonPackCodexJobResult = {
@@ -98,6 +124,7 @@ type OutputJsonContext = {
   contentType: string;
   style: string;
   sourceContext: SeasonSourceContext;
+  lockedSegment?: LockedSeasonSegment;
 };
 
 const TASK_ROOT = ".tmp-season-pack-codex";
@@ -317,11 +344,17 @@ function buildSeasonPackCodexPrompt(
     "",
     "Required file pack:",
     "- manifest.json with episodeCount, generatedEpisodes, and status.",
-    "- season-plan.json with storyBible, episodeChain, characters, scenes, props, visualStyle, cameraLanguage, lockedRules, and one plan item per segment.",
+    "- season-plan.json with storyBible, episodeChain, characters, scenes, props, visualStyle, cameraLanguage, lockedRules, beats, and one plan item per segment.",
     requiredEpisodeFilesInstruction,
     "",
     "Planning rules:",
     "- Build one stable Story Bible from the full source and Project memory.",
+    "- First extract a global ordered beats array. Each beat must include id, summary, sourceText, estimatedDurationSeconds, and shotCount.",
+    "- Treat beats as the source of truth for segmentation. The program will repack beats into locked segments with a hard 15 second limit before render.",
+    "- Do not let the downstream render worker decide whether a shot should move to the next segment. All moving/splitting belongs to this planning stage.",
+    "- If one beat is longer than 15 seconds, split it into smaller beat items before writing season-plan.json.",
+    "- Include a segments or lockedSegments array when possible: segmentIndex, title, beatStart, beatEnd, beatIds, estimatedDurationSeconds, shotCount, and sourceText.",
+    "- Every segment must be <=15 seconds. Ideal segment duration is 9-14.8 seconds. Segments under 7 seconds should be merged with a neighbor unless they are a deliberate hook.",
     "- Build one Segment Chain covering every requested segment: startState, endState, carriedHooks, resolvedHooks, nextBridge, timelinePosition.",
     "- Keep all segments consistent with the same Story Bible and ID references.",
     "- If Project memory is provided, continue from it and do not reset existing characters, settings, or tone.",
@@ -449,7 +482,11 @@ async function readSeasonPackResult(job: SeasonPackCodexJob): Promise<SeasonPack
   const episodes: SeasonPackEpisodeResult[] = [];
   const sourceContext = parseSeasonSourceContext(job.script);
   const manifest = await readOptionalJson(job.manifestPath);
-  const episodeCount = resolveSeasonPackEpisodeCount(job, manifest);
+  const rawSeasonPlan = await readOptionalJson(job.seasonPlanPath);
+  const lockedSeasonPlan = buildLockedSeasonPlan(rawSeasonPlan);
+  const episodeCount = resolveSeasonPackEpisodeCount(job, manifest, lockedSeasonPlan.segments.length);
+  validateLockedSeasonPlanCount(lockedSeasonPlan.segments, episodeCount);
+  const lockedSegmentsByIndex = new Map(lockedSeasonPlan.segments.map((segment) => [segment.segmentIndex, segment]));
   for (let episodeIndex = 1; episodeIndex <= episodeCount; episodeIndex += 1) {
     const fileName = episodeFileName(episodeIndex);
     const filePath = path.join(job.episodesDir, fileName);
@@ -461,13 +498,14 @@ async function readSeasonPackResult(job: SeasonPackCodexJob): Promise<SeasonPack
       contentType: job.contentType,
       style: job.style,
       sourceContext,
+      lockedSegment: lockedSegmentsByIndex.get(episodeIndex),
     });
     episodes.push({ episodeIndex, fileName, input });
   }
 
   return {
     manifest,
-    seasonPlan: await readOptionalJson(job.seasonPlanPath),
+    seasonPlan: seasonPlanWithLockedSegments(rawSeasonPlan, lockedSeasonPlan),
     episodes,
   };
 }
@@ -523,7 +561,207 @@ async function isValidSeasonPack(job: SeasonPackCodexJob) {
   }
 }
 
-function resolveSeasonPackEpisodeCount(job: SeasonPackCodexJob, manifest: Record<string, unknown> | null) {
+function buildLockedSeasonPlan(seasonPlan: Record<string, unknown> | null) {
+  const beats = normalizeSeasonPlanBeats(seasonPlan);
+  const segments = beats.length ? packBeatsIntoLockedSegments(beats) : normalizeSeasonPlanSegments(seasonPlan);
+  return { beats, segments };
+}
+
+function normalizeSeasonPlanBeats(seasonPlan: Record<string, unknown> | null): SeasonPackBeat[] {
+  const rawBeats = Array.isArray(seasonPlan?.beats) ? seasonPlan.beats : [];
+  return rawBeats.flatMap((rawBeat, index) => {
+    if (!rawBeat || typeof rawBeat !== "object") return [];
+    const beat = rawBeat as Record<string, unknown>;
+    const id = cleanString(beat.id) || `B${String(index + 1).padStart(3, "0")}`;
+    const summary = cleanString(beat.summary) || cleanString(beat.title) || cleanString(beat.event) || `Beat ${index + 1}`;
+    const sourceText = cleanString(beat.sourceText) || cleanString(beat.text) || summary;
+    const estimatedDurationSeconds = normalizeBeatDurationSeconds(
+      beat.estimatedDurationSeconds ?? beat.durationSeconds ?? beat.duration,
+    );
+    const shotCount = normalizeShotCount(beat.shotCount) || inferBeatShotCount(estimatedDurationSeconds);
+    return splitOversizedBeat({
+      id,
+      summary,
+      sourceText,
+      estimatedDurationSeconds,
+      shotCount,
+    });
+  });
+}
+
+function splitOversizedBeat(beat: SeasonPackBeat): SeasonPackBeat[] {
+  if (beat.estimatedDurationSeconds <= 15) return [beat];
+  const partCount = Math.ceil(beat.estimatedDurationSeconds / 12);
+  const partDuration = roundDurationSeconds(beat.estimatedDurationSeconds / partCount);
+  const partShotCount = Math.max(1, Math.ceil(beat.shotCount / partCount));
+  return Array.from({ length: partCount }, (_, index) => ({
+    ...beat,
+    id: `${beat.id}-${index + 1}`,
+    summary: `${beat.summary} (${index + 1}/${partCount})`,
+    estimatedDurationSeconds: partDuration,
+    shotCount: partShotCount,
+  }));
+}
+
+function packBeatsIntoLockedSegments(beats: SeasonPackBeat[]): LockedSeasonSegment[] {
+  const segments: LockedSeasonSegment[] = [];
+  let current: SeasonPackBeat[] = [];
+  let currentDuration = 0;
+
+  function flushCurrent() {
+    if (!current.length) return;
+    const segmentIndex = segments.length + 1;
+    const duration = roundDurationSeconds(current.reduce((sum, beat) => sum + beat.estimatedDurationSeconds, 0));
+    segments.push({
+      segmentIndex,
+      title: `第 ${segmentIndex} 段：${current[0].summary}`,
+      beatStart: beats.indexOf(current[0]) + 1,
+      beatEnd: beats.indexOf(current[current.length - 1]) + 1,
+      beatIds: current.map((beat) => beat.id),
+      estimatedDurationSeconds: duration,
+      shotCount: lockedSegmentShotCount(duration, current),
+      sourceText: current.map((beat) => `${beat.id}: ${beat.sourceText}`).join("\n"),
+    });
+    current = [];
+    currentDuration = 0;
+  }
+
+  for (const beat of beats) {
+    const nextDuration = roundDurationSeconds(currentDuration + beat.estimatedDurationSeconds);
+    if (current.length && nextDuration > 15) {
+      flushCurrent();
+    }
+    current.push(beat);
+    currentDuration = roundDurationSeconds(currentDuration + beat.estimatedDurationSeconds);
+  }
+  flushCurrent();
+  return mergeShortLockedSegments(segments);
+}
+
+function mergeShortLockedSegments(segments: LockedSeasonSegment[]) {
+  if (segments.length < 2) return segments;
+  const merged: LockedSeasonSegment[] = [];
+  for (const segment of segments) {
+    const previous = merged[merged.length - 1];
+    const combinedDuration = previous
+      ? roundDurationSeconds(previous.estimatedDurationSeconds + segment.estimatedDurationSeconds)
+      : 0;
+    if (previous && segment.estimatedDurationSeconds < 7 && combinedDuration <= 15) {
+      previous.beatEnd = segment.beatEnd;
+      previous.beatIds = [...previous.beatIds, ...segment.beatIds];
+      previous.estimatedDurationSeconds = combinedDuration;
+      previous.shotCount = Math.min(5, Math.max(previous.shotCount, segment.shotCount, minimumShotCountForDuration(`${combinedDuration}秒`)));
+      previous.sourceText = `${previous.sourceText}\n${segment.sourceText}`;
+      continue;
+    }
+    merged.push({ ...segment, segmentIndex: merged.length + 1 });
+  }
+  return merged.map((segment, index) => ({
+    ...segment,
+    segmentIndex: index + 1,
+    title: segment.title.replace(/^第\s*\d+\s*段/, `第 ${index + 1} 段`),
+  }));
+}
+
+function normalizeSeasonPlanSegments(seasonPlan: Record<string, unknown> | null): LockedSeasonSegment[] {
+  const rawSegments = Array.isArray(seasonPlan?.lockedSegments)
+    ? seasonPlan.lockedSegments
+    : Array.isArray(seasonPlan?.segments)
+      ? seasonPlan.segments
+      : [];
+  return rawSegments.flatMap((rawSegment, index) => {
+    if (!rawSegment || typeof rawSegment !== "object") return [];
+    const segment = rawSegment as Record<string, unknown>;
+    const hasLockedSegmentFields = Array.isArray(segment.beatIds)
+      || segment.beatStart !== undefined
+      || segment.beatEnd !== undefined
+      || segment.estimatedDurationSeconds !== undefined
+      || segment.targetDurationSeconds !== undefined
+      || segment.durationSeconds !== undefined
+      || segment.sourceText !== undefined;
+    if (!hasLockedSegmentFields) return [];
+    const estimatedDurationSeconds = normalizeBeatDurationSeconds(
+      segment.estimatedDurationSeconds ?? segment.targetDurationSeconds ?? segment.durationSeconds ?? segment.duration,
+    );
+    if (estimatedDurationSeconds > 15) {
+      throw new SeasonPackCodexQueueError(`Locked segment ${index + 1} exceeds 15 seconds`);
+    }
+    const beatIds = Array.isArray(segment.beatIds)
+      ? segment.beatIds.map((value) => cleanString(value)).filter(Boolean)
+      : [];
+    return [{
+      segmentIndex: normalizePositiveInteger(segment.segmentIndex) || index + 1,
+      title: cleanString(segment.title) || `第 ${index + 1} 段`,
+      beatStart: normalizePositiveInteger(segment.beatStart) || index + 1,
+      beatEnd: normalizePositiveInteger(segment.beatEnd) || index + 1,
+      beatIds,
+      estimatedDurationSeconds,
+      shotCount: normalizeShotCount(segment.shotCount) || minimumShotCountForDuration(`${estimatedDurationSeconds}秒`) || 4,
+      sourceText: cleanString(segment.sourceText) || cleanString(segment.summary) || beatIds.join(", "),
+    }];
+  });
+}
+
+function seasonPlanWithLockedSegments(
+  seasonPlan: Record<string, unknown> | null,
+  lockedSeasonPlan: { beats: SeasonPackBeat[]; segments: LockedSeasonSegment[] },
+) {
+  if (!lockedSeasonPlan.segments.length) return seasonPlan;
+  return {
+    ...(seasonPlan || {}),
+    beats: lockedSeasonPlan.beats.length ? lockedSeasonPlan.beats : seasonPlan?.beats,
+    lockedSegments: lockedSeasonPlan.segments,
+    segmentPlanMode: "beat_locked",
+    segmentDurationLimitSeconds: 15,
+  };
+}
+
+function validateLockedSeasonPlanCount(segments: LockedSeasonSegment[], episodeCount: number) {
+  if (!segments.length) return;
+  if (segments.length !== episodeCount) {
+    throw new SeasonPackCodexQueueError(
+      `Locked SegmentPlan count ${segments.length} does not match resolved segment count ${episodeCount}`,
+    );
+  }
+  for (const segment of segments) {
+    if (segment.estimatedDurationSeconds > 15) {
+      throw new SeasonPackCodexQueueError(`Locked segment ${segment.segmentIndex} exceeds 15 seconds`);
+    }
+  }
+}
+
+function normalizeBeatDurationSeconds(value: unknown) {
+  const seconds = typeof value === "number" ? value : parseDurationSeconds(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return 3;
+  return roundDurationSeconds(seconds);
+}
+
+function inferBeatShotCount(seconds: number) {
+  if (seconds <= 4) return 1;
+  if (seconds <= 8) return 2;
+  return 3;
+}
+
+function lockedSegmentShotCount(duration: number, beats: SeasonPackBeat[]) {
+  const minimum = minimumShotCountForDuration(`${duration}秒`) || 2;
+  const maximum = maximumShotCountForDuration(`${duration}秒`) || 5;
+  const fromBeats = beats.reduce((sum, beat) => sum + beat.shotCount, 0);
+  return Math.min(maximum, Math.max(minimum, fromBeats));
+}
+
+function roundDurationSeconds(value: number) {
+  return Number(value.toFixed(1));
+}
+
+function durationLabelFromSeconds(value: number) {
+  return `${formatSeconds(value)}秒`;
+}
+
+function resolveSeasonPackEpisodeCount(
+  job: SeasonPackCodexJob,
+  manifest: Record<string, unknown> | null,
+  lockedSegmentCount = 0,
+) {
   const mode = job.segmentCountMode === "auto" ? "auto" : "fixed";
   if (mode === "fixed") return job.episodeCount;
 
@@ -536,7 +774,7 @@ function resolveSeasonPackEpisodeCount(job: SeasonPackCodexJob, manifest: Record
         .filter((value): value is number => Boolean(value))
     : [];
   const generatedCount = generatedEpisodes.length;
-  const resolvedCount = manifestCount || generatedCount || normalizePositiveInteger(job.resolvedEpisodeCount);
+  const resolvedCount = manifestCount || lockedSegmentCount || generatedCount || normalizePositiveInteger(job.resolvedEpisodeCount);
   if (!resolvedCount || resolvedCount < 1 || resolvedCount > MAX_EPISODE_COUNT) {
     throw new SeasonPackCodexQueueError("Automatic season pack manifest must resolve between 1 and 30 segments");
   }
@@ -574,10 +812,13 @@ function validateEncodingQuality(result: Record<string, unknown>, sourceText: st
 
 function normalizeEpisodeInputPack(result: Record<string, unknown>, context: OutputJsonContext): SeasonPackEpisodeInput {
   const sourceSegment = context.sourceContext.segments.get(context.episodeIndex);
-  const title = normalizeSegmentTitle(cleanString(result.title), context.episodeIndex)
+  const lockedSegment = context.lockedSegment;
+  const title = normalizeSegmentTitle(lockedSegment?.title || "", context.episodeIndex)
+    || normalizeSegmentTitle(cleanString(result.title), context.episodeIndex)
     || (sourceSegment ? `第${context.episodeIndex}段｜${sourceSegment.title}` : "")
     || `第${context.episodeIndex}段`;
-  const duration = cleanString(result.duration)
+  const duration = (lockedSegment ? durationLabelFromSeconds(lockedSegment.estimatedDurationSeconds) : "")
+    || cleanString(result.duration)
     || sourceSegment?.duration
     || normalizeDurationLabel(context.duration)
     || "15秒";
@@ -589,10 +830,12 @@ function normalizeEpisodeInputPack(result: Record<string, unknown>, context: Out
     || inferStyleFromSource(context.sourceText)
     || normalizeLooseLabel(context.style)
     || "电影级写实";
-  const sourceText = cleanSourceEpisodeLabels(cleanString(result.sourceText)
+  const sourceText = cleanSourceEpisodeLabels(lockedSegment?.sourceText
+    || cleanString(result.sourceText)
     || extractSeasonSourceSegmentText(context.sourceText, context.episodeIndex)
     || context.sourceText);
-  const shotCount = normalizeShotCount(result.shotCount)
+  const shotCount = lockedSegment?.shotCount
+    || normalizeShotCount(result.shotCount)
     || sourceSegment?.shotCount
     || minimumShotCountForDuration(duration)
     || minimumShotCountForDuration(context.duration)
@@ -613,8 +856,20 @@ function normalizeEpisodeInputPack(result: Record<string, unknown>, context: Out
     blueprint,
     shotCount,
     renderInputScript: "",
+    beatIds: lockedSegment?.beatIds,
+    beatRange: lockedSegment
+      ? {
+        start: lockedSegment.beatStart,
+        end: lockedSegment.beatEnd,
+      }
+      : undefined,
+    targetDurationSeconds: lockedSegment?.estimatedDurationSeconds,
+    lockedSegmentPlan: lockedSegment,
   };
-  partial.renderInputScript = normalizeRenderInputScript(cleanSourceEpisodeLabels(cleanString(result.renderInputScript) || buildEpisodeRenderInputScript(partial)));
+  partial.renderInputScript = appendLockedSegmentPlan(
+    normalizeRenderInputScript(cleanSourceEpisodeLabels(cleanString(result.renderInputScript) || buildEpisodeRenderInputScript(partial))),
+    lockedSegment,
+  );
   return partial;
 }
 
@@ -645,6 +900,14 @@ function validateEpisodeInputPack(
   }
   if (!Number.isInteger(input.shotCount) || input.shotCount < 1) {
     throw new SeasonPackCodexQueueError("Season pack episode input pack is missing shotCount");
+  }
+  if (context.lockedSegment && parseDurationSeconds(input.duration) > 15) {
+    throw new SeasonPackCodexQueueError(`Season pack episode ${context.episodeIndex} exceeds locked 15 second segment duration`);
+  }
+  if (context.lockedSegment && input.shotCount !== context.lockedSegment.shotCount) {
+    throw new SeasonPackCodexQueueError(
+      `Season pack episode ${context.episodeIndex} shotCount ${input.shotCount} does not match locked SegmentPlan shotCount ${context.lockedSegment.shotCount}`,
+    );
   }
   const sourceSegment = context.sourceContext.segments.get(context.episodeIndex);
   const maximumShotCount = maximumShotCountForDuration(input.duration || context.duration);
@@ -1205,6 +1468,24 @@ function normalizeRenderInputScript(value: string) {
   return /单集渲染输入/.test(normalized)
     ? normalized
     : `单集渲染输入：\n${normalized}`;
+}
+
+function appendLockedSegmentPlan(value: string, lockedSegment: LockedSeasonSegment | undefined) {
+  if (!lockedSegment) return value;
+  const lockedPlanText = [
+    "",
+    "LOCKED SEGMENT PLAN / 全局 Beat 排程锁：",
+    `Segment index: ${lockedSegment.segmentIndex}`,
+    `Beat range: ${lockedSegment.beatStart}-${lockedSegment.beatEnd}`,
+    `Beat ids: ${lockedSegment.beatIds.join(", ")}`,
+    `Target duration: ${durationLabelFromSeconds(lockedSegment.estimatedDurationSeconds)} (must not exceed 15 seconds)`,
+    `Shot count lock: ${lockedSegment.shotCount}`,
+    "Locked source beats:",
+    lockedSegment.sourceText,
+    "",
+    "Rendering rule: use only this locked beat range for the current segment. Do not move content into another segment during render. If the segment cannot fit within the locked duration, fail quality validation instead of inventing a new split.",
+  ].join("\n");
+  return value.includes("LOCKED SEGMENT PLAN") ? value : `${value}\n${lockedPlanText}`;
 }
 
 function formatSeconds(value: number) {

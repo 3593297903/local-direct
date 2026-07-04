@@ -192,6 +192,123 @@ test("creates automatic season planning jobs and resolves segment count from the
   }
 });
 
+test("packs season plan beats into locked segments before render input generation", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createSeasonPackCodexJob(
+      {
+        script: [
+          "A long source chapter with five ordered visual beats.",
+          "Beat A: morning street grass.",
+          "Beat B: ants cross dust.",
+          "Beat C: market returns.",
+          "Beat D: office suppresses the case.",
+          "Beat E: the investigator notices a contradiction.",
+        ].join("\n"),
+        segmentCountMode: "auto",
+        duration: "auto",
+      },
+      { rootDir },
+    );
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(
+      claimed.manifestPath,
+      JSON.stringify({ segmentCountMode: "auto", episodeCount: 2, generatedEpisodes: [1, 2], status: "completed" }, null, 2),
+      "utf8",
+    );
+    writeFileSync(
+      claimed.seasonPlanPath,
+      JSON.stringify(
+        {
+          storyBible: { title: "Beat Pack" },
+          beats: [
+            { id: "B001", summary: "morning street grass", estimatedDurationSeconds: 5, shotCount: 2 },
+            { id: "B002", summary: "ants cross dust", estimatedDurationSeconds: 6, shotCount: 2 },
+            { id: "B003", summary: "market returns", estimatedDurationSeconds: 3, shotCount: 1 },
+            { id: "B004", summary: "office suppresses the case", estimatedDurationSeconds: 5, shotCount: 2 },
+            { id: "B005", summary: "investigator notices contradiction", estimatedDurationSeconds: 4, shotCount: 2 },
+          ],
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { sourceText: "", duration: "", shotCount: 4, renderInputScript: "" }), null, 2), "utf8");
+    writeFileSync(path.join(claimed.episodesDir, "episode-002.json"), JSON.stringify(sampleEpisodeInput(2, { sourceText: "", duration: "", shotCount: 4, renderInputScript: "" }), null, 2), "utf8");
+
+    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result.seasonPlan.lockedSegments.length, 2);
+    assert.deepEqual(completed.result.seasonPlan.lockedSegments[0].beatIds, ["B001", "B002", "B003"]);
+    assert.equal(completed.result.episodes[0].input.duration, "14秒");
+    assert.equal(completed.result.episodes[1].input.duration, "9秒");
+    assert.match(completed.result.episodes[0].input.renderInputScript, /LOCKED SEGMENT PLAN/);
+    assert.match(completed.result.episodes[0].input.renderInputScript, /B001/);
+    assert.match(completed.result.episodes[0].input.renderInputScript, /B003/);
+    assert.doesNotMatch(completed.result.episodes[0].input.renderInputScript, /B004/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("prefers locked season segments over legacy generic segments", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createSeasonPackCodexJob(
+      {
+        script: "A short source chapter with one planned video segment.",
+        segmentCountMode: "auto",
+        duration: "auto",
+      },
+      { rootDir },
+    );
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(
+      claimed.manifestPath,
+      JSON.stringify({ segmentCountMode: "auto", episodeCount: 1, generatedEpisodes: [1], status: "completed" }, null, 2),
+      "utf8",
+    );
+    writeFileSync(
+      claimed.seasonPlanPath,
+      JSON.stringify(
+        {
+          segments: [{ title: "legacy generic segment" }],
+          lockedSegments: [
+            {
+              segmentIndex: 1,
+              title: "第1段｜锁定段",
+              beatStart: 1,
+              beatEnd: 1,
+              beatIds: ["B001"],
+              estimatedDurationSeconds: 8,
+              shotCount: 3,
+              sourceText: "B001: locked source beat",
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { sourceText: "", duration: "", shotCount: 3, renderInputScript: "" }), null, 2), "utf8");
+
+    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    assert.equal(completed.result.episodes[0].input.title, "第1段｜锁定段");
+    assert.equal(completed.result.episodes[0].input.duration, "8秒");
+    assert.match(completed.result.episodes[0].input.renderInputScript, /B001/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("season pack Codex jobs claim the oldest pending task by default", async () => {
   const rootDir = makeTempRoot();
   try {
