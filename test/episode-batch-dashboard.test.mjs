@@ -28,6 +28,12 @@ test("dashboard can generate multiple project segments through a season pack job
   assert.match(dashboardSource, /pollVideoPromptPackCodexJob/);
   assert.match(dashboardSource, /\/api\/video-prompt-packs\/jobs/);
   assert.match(dashboardSource, /renderPackedSegmentsWithQualityRepair/);
+  assert.match(dashboardSource, /sanitizeBatchSegmentOutput/);
+  assert.match(dashboardSource, /sanitizeBatchSegmentText/);
+  assert.match(dashboardSource, /classifyBatchRepairReason/);
+  assert.match(dashboardSource, /batchRepairReasonLabel/);
+  assert.match(dashboardSource, /SLOW_RENDER_PACK_WARNING_MS/);
+  assert.match(dashboardSource, /renderPackDurationMs/);
   assert.match(dashboardSource, /isRecoverableRenderPackError/);
   assert.match(dashboardSource, /STRICT_UTF8_RENDER_PACK_MODE/);
   assert.match(dashboardSource, /createVideoPromptPackCodexJob\(packSegments, activeProjectId \|\| undefined, STRICT_UTF8_RENDER_PACK_MODE\)/);
@@ -60,6 +66,9 @@ test("dashboard can generate multiple project segments through a season pack job
     dashboardSource,
     /const episodeResult = normalizeBatchEpisodeResult/,
   );
+  assert.match(dashboardSource, /sanitizeBatchSegmentOutput\(normalized\)/);
+  assert.match(dashboardSource, /JSON\.stringify\(result\)/);
+  assert.match(dashboardSource, /segmentTerminologyPattern/);
   assert.match(dashboardSource, /assertBatchSegmentQuality/);
   assert.match(dashboardSource, /renderBatchSegmentWithQualityRepair/);
   assert.match(dashboardSource, /buildBatchSegmentRepairScript/);
