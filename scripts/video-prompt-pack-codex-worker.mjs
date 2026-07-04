@@ -8,7 +8,7 @@ const apiBaseUrl = (process.env.VIDEO_PROMPT_PACK_CODEX_API_BASE_URL || "http://
 const pollMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_POLL_MS, 2500);
 const idleLogMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_IDLE_LOG_MS, 30_000);
 const taskTimeoutMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_TASK_TIMEOUT_MS, 30 * 60_000);
-const concurrency = Math.max(1, Math.min(4, positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_CONCURRENCY, 3)));
+const concurrency = Math.max(1, Math.min(4, positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_CONCURRENCY, 4)));
 const workerToken = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-video-prompt-pack-codex", "codex-messages");
 

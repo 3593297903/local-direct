@@ -551,11 +551,27 @@ export function ProjectsClient() {
   const [visualAssetGeneratingEntityId, setVisualAssetGeneratingEntityId] = useState("");
   const [visualAssetGenerationMessage, setVisualAssetGenerationMessage] = useState("");
   const [visualAssetGenerationError, setVisualAssetGenerationError] = useState("");
+  const [promptDownloadPanelOpen, setPromptDownloadPanelOpen] = useState(false);
+  const [promptDownloadRangeStart, setPromptDownloadRangeStart] = useState(1);
+  const [promptDownloadRangeEnd, setPromptDownloadRangeEnd] = useState(1);
 
   const selectedVersion = useMemo(() => {
     if (!project) return null;
     return project.versions.find((version) => version.id === selectedVersionId) || project.versions[0] || null;
   }, [project, selectedVersionId]);
+
+  const sortedProjectVersions = useMemo(
+    () => [...(project?.versions || [])].sort((a, b) => a.versionNumber - b.versionNumber),
+    [project],
+  );
+  const minPromptDownloadVersion = sortedProjectVersions[0]?.versionNumber || 1;
+  const maxPromptDownloadVersion = sortedProjectVersions[sortedProjectVersions.length - 1]?.versionNumber || 1;
+
+  useEffect(() => {
+    if (!selectedVersion) return;
+    setPromptDownloadRangeStart(selectedVersion.versionNumber || 1);
+    setPromptDownloadRangeEnd(selectedVersion.versionNumber || 1);
+  }, [selectedVersion?.id]);
 
   const projectAssetLibrarySections = useMemo(
     () => [
@@ -683,20 +699,69 @@ export function ProjectsClient() {
     await navigator.clipboard.writeText(buildPromptText(selectedVersion));
   }
 
-  async function downloadDocx() {
-    if (!selectedVersion) return;
+  function clampPromptDownloadRangeValue(value: number) {
+    if (!Number.isFinite(value)) return selectedVersion?.versionNumber || minPromptDownloadVersion;
+    return Math.min(maxPromptDownloadVersion, Math.max(minPromptDownloadVersion, Math.round(value)));
+  }
+
+  function getPromptDownloadVersions() {
+    const start = Math.min(promptDownloadRangeStart, promptDownloadRangeEnd);
+    const end = Math.max(promptDownloadRangeStart, promptDownloadRangeEnd);
+    return sortedProjectVersions.filter((version) => version.versionNumber >= start && version.versionNumber <= end);
+  }
+
+  function setPromptDownloadRange(range: "current" | "all" | "first5" | "last5") {
+    if (!sortedProjectVersions.length) return;
+    if (range === "current" && selectedVersion) {
+      setPromptDownloadRangeStart(selectedVersion.versionNumber);
+      setPromptDownloadRangeEnd(selectedVersion.versionNumber);
+      return;
+    }
+    if (range === "all") {
+      setPromptDownloadRangeStart(minPromptDownloadVersion);
+      setPromptDownloadRangeEnd(maxPromptDownloadVersion);
+      return;
+    }
+
+    const targetVersions = range === "first5" ? sortedProjectVersions.slice(0, 5) : sortedProjectVersions.slice(-5);
+    setPromptDownloadRangeStart(targetVersions[0]?.versionNumber || minPromptDownloadVersion);
+    setPromptDownloadRangeEnd(targetVersions[targetVersions.length - 1]?.versionNumber || maxPromptDownloadVersion);
+  }
+
+  async function downloadPromptDocx(mode: "complete" | "review") {
+    if (!project || !selectedVersion) return;
+    const promptDownloadVersions = getPromptDownloadVersions();
+    const sections = promptDownloadVersions
+      .map((version) => ({
+        heading: `${version.title} 第${version.versionNumber}段`,
+        originalText: mode === "review" ? version.originalScript : "",
+        promptText: buildPromptText(version),
+      }))
+      .filter((section) => section.promptText.trim());
+
+    if (!sections.length) {
+      setProjectDetailError("所选范围内没有可下载的提示词。");
+      return;
+    }
+
+    const downloadStart = Math.min(...promptDownloadVersions.map((version) => version.versionNumber));
+    const downloadEnd = Math.max(...promptDownloadVersions.map((version) => version.versionNumber));
+    const selectedSegmentDownloadTitle = `${selectedVersion.title}-第${selectedVersion.versionNumber}段`;
+    const downloadKindTitle = mode === "review" ? "审阅版" : "完整提示词";
+    let downloadTitle = `${project.title}-第${downloadStart}-${downloadEnd}段-${downloadKindTitle}`;
+    if (downloadStart === downloadEnd) {
+      downloadTitle =
+        promptDownloadVersions[0]?.id === selectedVersion.id
+          ? `${selectedSegmentDownloadTitle}-${downloadKindTitle}`
+          : `${project.title}-第${downloadStart}段-${downloadKindTitle}`;
+    }
+
     const res = await fetch("/api/prompt-docx", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        title: `${selectedVersion.title}-第${selectedVersion.versionNumber}段`,
-        sections: [
-          {
-            heading: `${selectedVersion.title} 第${selectedVersion.versionNumber}段`,
-            originalText: selectedVersion.originalScript,
-            promptText: buildPromptText(selectedVersion),
-          },
-        ],
+        title: downloadTitle,
+        sections,
       }),
     });
     if (!res.ok) {
@@ -709,11 +774,12 @@ export function ProjectsClient() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${selectedVersion.title}-第${selectedVersion.versionNumber}段.docx`;
+    link.download = `${downloadTitle}.docx`;
     document.body.appendChild(link);
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
+    setPromptDownloadPanelOpen(false);
   }
 
   function storyboardCodexPanels(job: StoryboardCodexJob) {
@@ -1224,6 +1290,10 @@ export function ProjectsClient() {
     }
   }
 
+  const promptDownloadVersions = getPromptDownloadVersions();
+  const promptDownloadStartDisplay = Math.min(promptDownloadRangeStart, promptDownloadRangeEnd);
+  const promptDownloadEndDisplay = Math.max(promptDownloadRangeStart, promptDownloadRangeEnd);
+
   return (
     <div className="projects-page-shell relative min-h-[calc(100vh-4rem)] text-slate-100">
       {listError && (
@@ -1463,14 +1533,108 @@ export function ProjectsClient() {
                     复制提示词
                   </button>
                   <button
-                    onClick={downloadDocx}
+                    onClick={() => setPromptDownloadPanelOpen((open) => !open)}
                     className="projects-action-button"
+                    aria-expanded={promptDownloadPanelOpen}
                   >
                     <Download className="h-4 w-4" />
-                    下载 DOCX
+                    下载提示词
                   </button>
                 </div>
               </div>
+
+              {promptDownloadPanelOpen && (
+                <div className="rounded-2xl border border-cyan-300/15 bg-cyan-300/[0.06] p-4">
+                  <div className="flex flex-wrap items-end justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold uppercase tracking-wide text-cyan-200/70">Prompt DOCX</div>
+                      <div className="mt-1 text-sm font-bold text-white">选择要下载的提示词范围</div>
+                      <p className="mt-1 text-xs leading-5 text-slate-400">
+                        当前项目共 {project.versions.length} 段，将下载第 {promptDownloadStartDisplay} -{" "}
+                        {promptDownloadEndDisplay} 段，共 {promptDownloadVersions.length} 段。
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setPromptDownloadRange("current")}
+                        className="rounded-xl border border-white/10 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-cyan-200/40 hover:text-cyan-50"
+                      >
+                        当前段
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPromptDownloadRange("all")}
+                        className="rounded-xl border border-white/10 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-cyan-200/40 hover:text-cyan-50"
+                      >
+                        全部
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPromptDownloadRange("first5")}
+                        className="rounded-xl border border-white/10 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-cyan-200/40 hover:text-cyan-50"
+                      >
+                        前 5 段
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPromptDownloadRange("last5")}
+                        className="rounded-xl border border-white/10 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-cyan-200/40 hover:text-cyan-50"
+                      >
+                        后 5 段
+                      </button>
+                    </div>
+                  </div>
+                  <div className="mt-4 flex flex-wrap items-end gap-3">
+                    <label className="min-w-28 text-xs font-semibold text-slate-300">
+                      起始段
+                      <input
+                        type="number"
+                        min={minPromptDownloadVersion}
+                        max={maxPromptDownloadVersion}
+                        value={promptDownloadRangeStart}
+                        onChange={(event) =>
+                          setPromptDownloadRangeStart(clampPromptDownloadRangeValue(Number(event.target.value)))
+                        }
+                        className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm font-semibold text-white outline-none transition focus:border-cyan-200/60"
+                      />
+                    </label>
+                    <label className="min-w-28 text-xs font-semibold text-slate-300">
+                      结束段
+                      <input
+                        type="number"
+                        min={minPromptDownloadVersion}
+                        max={maxPromptDownloadVersion}
+                        value={promptDownloadRangeEnd}
+                        onChange={(event) =>
+                          setPromptDownloadRangeEnd(clampPromptDownloadRangeValue(Number(event.target.value)))
+                        }
+                        className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm font-semibold text-white outline-none transition focus:border-cyan-200/60"
+                      />
+                    </label>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => downloadPromptDocx("complete")}
+                        disabled={!promptDownloadVersions.length}
+                        className="projects-action-button projects-action-primary disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <Download className="h-4 w-4" />
+                        下载完整提示词
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => downloadPromptDocx("review")}
+                        disabled={!promptDownloadVersions.length}
+                        className="projects-action-button disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <Download className="h-4 w-4" />
+                        下载审阅版
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {(storyboardGenerationMessage || storyboardGenerationError) && (
                 <div

@@ -19,7 +19,7 @@ test("dashboard can generate multiple project segments through a season pack job
   assert.match(dashboardSource, /pollSeasonPackCodexJob/);
   assert.match(dashboardSource, /\/api\/season-pack\/jobs/);
   assert.match(dashboardSource, /BATCH_RENDER_PACK_SIZE = 4/);
-  assert.match(dashboardSource, /BATCH_RENDER_PACK_CONCURRENCY = 3/);
+  assert.match(dashboardSource, /BATCH_RENDER_PACK_CONCURRENCY = 4/);
   assert.match(dashboardSource, /type VideoPromptPackCodexJob/);
   assert.match(dashboardSource, /createVideoPromptPackCodexJob/);
   assert.match(dashboardSource, /pollVideoPromptPackCodexJob/);

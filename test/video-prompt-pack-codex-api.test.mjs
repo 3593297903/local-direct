@@ -41,7 +41,7 @@ test("video prompt render pack worker runs bounded concurrent pack tasks", () =>
   const worker = readFileSync("scripts/video-prompt-pack-codex-worker.mjs", "utf8");
 
   assert.match(worker, /VIDEO_PROMPT_PACK_CODEX_CONCURRENCY/);
-  assert.match(worker, /positiveInteger\(process\.env\.VIDEO_PROMPT_PACK_CODEX_CONCURRENCY,\s*3\)/);
+  assert.match(worker, /positiveInteger\(process\.env\.VIDEO_PROMPT_PACK_CODEX_CONCURRENCY,\s*4\)/);
   assert.match(worker, /activeTasks/);
   assert.match(worker, /Promise\.race\(activeTasks\)/);
   assert.match(worker, /\/api\/video-prompt-packs\/jobs\/claim/);

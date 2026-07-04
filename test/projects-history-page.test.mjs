@@ -60,7 +60,9 @@ test("projects page shows saved prompt history and supports resume editing", () 
   assert.match(client, /storyboardImageUrl/);
   assert.match(client, /vd_resume_script/);
   assert.match(client, /vd_resume_version_id/);
-  assert.match(client, /下载 DOCX/);
+  assert.match(client, /下载提示词/);
+  assert.match(client, /下载完整提示词/);
+  assert.match(client, /下载审阅版/);
 });
 
 test("projects page puts global project actions in the project list toolbar", () => {
