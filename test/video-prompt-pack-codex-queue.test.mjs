@@ -180,3 +180,33 @@ test("video prompt render pack jobs claim the oldest pending task by default", a
     rmSync(rootDir, { recursive: true, force: true });
   }
 });
+
+test("strict UTF-8 render pack mode is persisted and hardens the Codex prompt", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptPackCodexJob(
+      {
+        mode: "strictUtf8",
+        segments: [
+          {
+            episodeIndex: 1,
+            title: "Strict UTF-8 Segment",
+            script: "这是一段中文源文案，用来验证严格 UTF-8 输出。",
+            renderInputScript: "Render this segment with full single-segment quality and preserve Chinese text.",
+            duration: "15 seconds",
+            shotCount: 4,
+          },
+        ],
+      },
+      { rootDir },
+    );
+
+    assert.equal(job.mode, "strictUtf8");
+    assert.match(job.prompt, /STRICT_UTF8_RECOVERY_MODE/);
+    assert.match(job.prompt, /fs\.writeFileSync/);
+    assert.match(job.prompt, /Do not use PowerShell Set-Content/);
+    assert.match(job.prompt, /excessive question marks/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});

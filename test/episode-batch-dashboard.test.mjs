@@ -28,7 +28,14 @@ test("dashboard can generate multiple project segments through a season pack job
   assert.match(dashboardSource, /pollVideoPromptPackCodexJob/);
   assert.match(dashboardSource, /\/api\/video-prompt-packs\/jobs/);
   assert.match(dashboardSource, /renderPackedSegmentsWithQualityRepair/);
+  assert.match(dashboardSource, /isRecoverableRenderPackError/);
+  assert.match(dashboardSource, /STRICT_UTF8_RENDER_PACK_MODE/);
+  assert.match(dashboardSource, /createVideoPromptPackCodexJob\(packSegments, activeProjectId \|\| undefined, STRICT_UTF8_RENDER_PACK_MODE\)/);
+  assert.match(dashboardSource, /allowSplitFallback = true/);
+  assert.match(dashboardSource, /splitRenderPacks/);
   assert.match(dashboardSource, /runSegmentRepairPool/);
+  assert.match(dashboardSource, /queueReadySegmentSaves/);
+  assert.match(dashboardSource, /nextSegmentToSave/);
   assert.match(dashboardSource, /chunkEpisodesForRenderPacks/);
   assert.match(dashboardSource, /segmentCountMode/);
   assert.match(dashboardSource, /segmentCountMode === "auto" \|\| episodeCount > 1/);
@@ -61,6 +68,7 @@ test("dashboard can generate multiple project segments through a season pack job
     dashboardSource,
     /saveAnalysisProject\(episodeScript, episodeResult, fullVideoPrompt, activeProjectId \|\| undefined, undefined\)/,
   );
+  assert.match(dashboardSource, /await saveChain/);
   assert.match(dashboardSource, /第 \{item\.segment\.index\} 段/);
   assert.match(dashboardSource, /\{episodeCount\} 段/);
   assert.doesNotMatch(

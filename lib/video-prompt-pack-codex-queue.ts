@@ -16,6 +16,7 @@ export type VideoPromptPackSegmentInput = {
 
 export type CreateVideoPromptPackCodexJobInput = {
   projectId?: string;
+  mode?: VideoPromptPackCodexMode;
   segments: VideoPromptPackSegmentInput[];
 };
 
@@ -35,6 +36,7 @@ export type VideoPromptPackCodexResult = {
 export type VideoPromptPackCodexJob = {
   id: string;
   projectId: string | null;
+  mode: VideoPromptPackCodexMode;
   segments: VideoPromptPackSegmentTask[];
   prompt: string;
   status: VideoPromptPackCodexJobStatus;
@@ -45,6 +47,8 @@ export type VideoPromptPackCodexJob = {
   startedAt?: string;
   completedAt?: string;
 };
+
+export type VideoPromptPackCodexMode = "standard" | "strictUtf8";
 
 type QueueOptions = {
   rootDir?: string;
@@ -84,11 +88,13 @@ export async function createVideoPromptPackCodexJob(
       outputPath: path.join(resultDir(rootDir), fileSegment(jobId), outputFileName),
     };
   });
+  const mode = input.mode === "strictUtf8" ? "strictUtf8" : "standard";
   const job: VideoPromptPackCodexJob = {
     id: jobId,
     projectId: input.projectId || null,
+    mode,
     segments,
-    prompt: buildVideoPromptPackCodexPrompt(jobId, segments),
+    prompt: buildVideoPromptPackCodexPrompt(jobId, segments, mode),
     status: "pending",
     result: null,
     error: null,
@@ -171,7 +177,11 @@ export async function failVideoPromptPackCodexJob(
   return updated;
 }
 
-function buildVideoPromptPackCodexPrompt(jobId: string, segments: VideoPromptPackSegmentTask[]) {
+function buildVideoPromptPackCodexPrompt(
+  jobId: string,
+  segments: VideoPromptPackSegmentTask[],
+  mode: VideoPromptPackCodexMode,
+) {
   const segmentInstructions = segments.flatMap((segment) => [
     `Segment ${segment.episodeIndex}: ${segment.title}`,
     `Duration: ${segment.duration}`,
@@ -181,6 +191,18 @@ function buildVideoPromptPackCodexPrompt(jobId: string, segments: VideoPromptPac
     segment.renderInputScript,
     "",
   ]);
+  const strictUtf8Instructions =
+    mode === "strictUtf8"
+      ? [
+          "",
+          "STRICT_UTF8_RECOVERY_MODE:",
+          "- A previous Render Pack attempt likely produced damaged Chinese JSON with excessive question marks.",
+          "- You must write JSON only from a Node.js script or node -e code using fs.writeFileSync(outputPath, JSON.stringify(result, null, 2), \"utf8\").",
+          "- Do not use PowerShell Set-Content, Out-File, shell redirection, cmd echo, or here-strings for file writing.",
+          "- After writing each file, read it back with fs.readFileSync(outputPath, \"utf8\"), parse JSON, and reject output that has replacement characters or excessive question marks.",
+          "- Preserve Chinese text as Chinese characters.",
+        ]
+      : [];
 
   return [
     "You are handling a Local Director Render Pack task from a local Codex CLI worker.",
@@ -200,6 +222,7 @@ function buildVideoPromptPackCodexPrompt(jobId: string, segments: VideoPromptPac
     "- Write all JSON files as UTF-8.",
     "- Prefer Node.js fs.writeFileSync(outputPath, JSON.stringify(result, null, 2), \"utf8\").",
     "- Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
+    ...strictUtf8Instructions,
     "",
     `Render Pack ID: ${jobId}`,
     `Pack size: ${segments.length}`,
@@ -296,7 +319,11 @@ async function listJobs(rootDir: string) {
 
 async function readJob(rootDir: string, jobId: string): Promise<VideoPromptPackCodexJob> {
   try {
-    return JSON.parse(await readFile(jobPath(rootDir, jobId), "utf8")) as VideoPromptPackCodexJob;
+    const job = JSON.parse(await readFile(jobPath(rootDir, jobId), "utf8")) as VideoPromptPackCodexJob;
+    return {
+      ...job,
+      mode: job.mode === "strictUtf8" ? "strictUtf8" : "standard",
+    };
   } catch (error) {
     throw new VideoPromptPackCodexQueueError(
       (error as NodeJS.ErrnoException).code === "ENOENT"
@@ -375,4 +402,3 @@ function createId(prefix: string) {
 function fileSegment(value: string) {
   return path.basename(String(value || "").replace(/[\\/:*?"<>|]+/g, "-"));
 }
-

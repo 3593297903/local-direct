@@ -146,6 +146,7 @@ type BatchPromptSection = {
 
 type DurationMode = "auto" | "fixed";
 type SegmentCountMode = "fixed" | "auto";
+type RenderPackCodexMode = "standard" | "strictUtf8";
 type BatchGenerationPhase = "planning" | "rendering" | "repairing" | "saving" | "completed" | "failed";
 type BatchSegmentStatus = "pending" | "running" | "repairing" | "completed" | "saving" | "saved" | "failed";
 
@@ -174,6 +175,7 @@ const MAX_EPISODE_BATCH_COUNT = 30;
 const BATCH_RENDER_PACK_SIZE = 4;
 const BATCH_RENDER_PACK_CONCURRENCY = 4;
 const BATCH_SINGLE_RENDER_CONCURRENCY = 3;
+const STRICT_UTF8_RENDER_PACK_MODE: RenderPackCodexMode = "strictUtf8";
 const GENERIC_SEASON_TEMPLATE_PHRASES = [
   "人物、地点和关键物件按案件逻辑分层",
   "缓慢推进后停住",
@@ -898,12 +900,14 @@ export function DashboardClient() {
       shotCount: number;
     }>,
     projectId: string | undefined,
+    mode: RenderPackCodexMode = "standard",
   ) {
     const res = await fetch("/api/video-prompt-packs/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectId: projectId || undefined,
+        mode,
         segments,
       }),
     });
@@ -977,6 +981,12 @@ export function DashboardClient() {
   function isMissingLockedSeasonPlanError(error: unknown) {
     const message = error instanceof Error ? error.message : String(error || "");
     return /locked beat plan|beats|lockedSegments|SegmentPlan/i.test(message);
+  }
+
+  function isRecoverableRenderPackError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error || "");
+    if (!message || CODEX_QUOTA_ERROR_PATTERN.test(message)) return false;
+    return /encoding|question marks|replacement characters|JSON|parse|missing|optimizedScript|workflow\.fullVideoPrompt|storyboard|did not produce|output file/i.test(message);
   }
 
   async function pollVideoPromptPackCodexJob(jobId: string, segmentCount: number) {
@@ -1211,7 +1221,7 @@ export function DashboardClient() {
   async function runBatchEpisodeGeneration() {
     const completed: BatchPromptSection[] = [];
     let activeProjectId = resumeProjectId || "";
-    let latestSave: ProjectSaveState | null = null;
+    const latestSaveRef: { current: ProjectSaveState | null } = { current: null };
     const mode = segmentCountMode;
     const requestedCount = mode === "auto" ? null : episodeCount;
     let resolvedSegmentCount = requestedCount || null;
@@ -1298,6 +1308,10 @@ export function DashboardClient() {
     const renderedEpisodes: Array<RenderedEpisode | undefined> = new Array(resolvedSegmentCount);
     const repairQueue: Array<{ episode: SeasonPackEpisodeResult; reason: string }> = [];
     const queuedRepairIndexes = new Set<number>();
+    const queuedSaveIndexes = new Set<number>();
+    let nextSegmentToSave = 1;
+    let saveChain = Promise.resolve();
+    let saveError: Error | null = null;
 
     async function renderBatchSegmentWithQualityRepair(
       renderScript: string,
@@ -1332,6 +1346,50 @@ export function DashboardClient() {
       }
     }
 
+    function queueReadySegmentSaves() {
+      while (nextSegmentToSave <= renderedEpisodes.length) {
+        const rendered = renderedEpisodes[nextSegmentToSave - 1];
+        if (!rendered || queuedSaveIndexes.has(nextSegmentToSave)) break;
+
+        const queuedIndex = nextSegmentToSave;
+        queuedSaveIndexes.add(queuedIndex);
+        nextSegmentToSave += 1;
+
+        saveChain = saveChain.then(async () => {
+          const episodeIndex = rendered.episodeIndex;
+          const episodeResult = rendered.result;
+          const episodeScript = rendered.sourceText;
+          const fullVideoPrompt = rendered.promptText;
+
+          updateSegmentProgress(episodeIndex, "saving", "正在保存到项目");
+          publishBatchProgress("saving", `正在保存第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
+          const save = await saveAnalysisProject(episodeScript, episodeResult, fullVideoPrompt, activeProjectId || undefined, undefined);
+          if (!save.saved || !save.projectId || !save.versionId) {
+            throw new Error(`第 ${episodeIndex} 段已生成，但项目保存失败：${save.reason || "未返回保存结果"}`);
+          }
+
+          activeProjectId = save.projectId;
+          latestSaveRef.current = save;
+          setProjectSave(save);
+          setResumeProjectId(save.projectId);
+          setResumeVersionId(save.versionId);
+
+          completed.push({
+            segment: { index: episodeIndex, text: episodeScript },
+            result: episodeResult,
+            promptText: fullVideoPrompt,
+          });
+          setBatchResults([...completed]);
+          setResult(episodeResult);
+          updateSegmentProgress(episodeIndex, "saved", "已保存");
+          publishBatchProgress("saving", `已保存第 ${episodeIndex} / ${resolvedSegmentCount} 段。`);
+        }).catch((error) => {
+          saveError = error instanceof Error ? error : new Error(String(error));
+          throw saveError;
+        });
+      }
+    }
+
     function storeRenderedEpisode(
       episode: SeasonPackEpisodeResult,
       episodeResult: AnalysisResult,
@@ -1363,6 +1421,7 @@ export function DashboardClient() {
       setResult(episodeResult);
       updateSegmentProgress(episodeIndex, "completed", "已完成单段质量生成，等待保存");
       publishBatchProgress("rendering", `第 ${episodeIndex} / ${resolvedSegmentCount} 段已生成，继续处理剩余分段...`);
+      queueReadySegmentSaves();
     }
 
     async function renderSingleEpisodeWithQualityRepair(episode: SeasonPackEpisodeResult) {
@@ -1403,7 +1462,7 @@ export function DashboardClient() {
       await Promise.all(Array.from({ length: repairConcurrency }, () => repairNextSegment()));
     }
 
-    async function renderPackedSegmentsWithQualityRepair(packEpisodes: SeasonPackEpisodeResult[]) {
+    async function renderPackedSegmentsWithQualityRepair(packEpisodes: SeasonPackEpisodeResult[], allowSplitFallback = true) {
       const packLabel = packEpisodes.map((episode) => episode.episodeIndex).join(", ");
       const packSegments = packEpisodes.map((episode) => {
         const episodeInput = episode.input;
@@ -1423,8 +1482,38 @@ export function DashboardClient() {
       publishBatchProgress("rendering", `正在本地并发生成 Render Pack：第 ${packLabel} 段...`);
 
       try {
-        const packJob = await createVideoPromptPackCodexJob(packSegments, activeProjectId || undefined);
-        const renderPackJob = await pollVideoPromptPackCodexJob(packJob.id, packSegments.length);
+        async function runRenderPack(mode: RenderPackCodexMode) {
+          const packJob = await createVideoPromptPackCodexJob(packSegments, activeProjectId || undefined, mode);
+          return pollVideoPromptPackCodexJob(packJob.id, packSegments.length);
+        }
+
+        let renderPackJob: VideoPromptPackCodexJob;
+        try {
+          renderPackJob = await runRenderPack("standard");
+        } catch (error) {
+          if (!isRecoverableRenderPackError(error)) throw error;
+          const reason = error instanceof Error ? error.message : "Render Pack failed with a recoverable output error";
+          publishBatchProgress(
+            "rendering",
+            `Render Pack 第 ${packLabel} 段输出异常，正在用 strict UTF-8 模式整包重试：${reason}`,
+          );
+          try {
+            renderPackJob = await createVideoPromptPackCodexJob(packSegments, activeProjectId || undefined, STRICT_UTF8_RENDER_PACK_MODE)
+              .then((packJob) => pollVideoPromptPackCodexJob(packJob.id, packSegments.length));
+          } catch (strictError) {
+            if (allowSplitFallback && packEpisodes.length > 2 && isRecoverableRenderPackError(strictError)) {
+              const splitAt = Math.ceil(packEpisodes.length / 2);
+              const splitRenderPacks = [packEpisodes.slice(0, splitAt), packEpisodes.slice(splitAt)].filter((pack) => pack.length);
+              publishBatchProgress(
+                "repairing",
+                `Render Pack 第 ${packLabel} 段 strict UTF-8 重试仍失败，正在拆成 ${splitRenderPacks.length} 个小包继续生成。`,
+              );
+              await Promise.all(splitRenderPacks.map((splitPack) => renderPackedSegmentsWithQualityRepair(splitPack, false)));
+              return;
+            }
+            throw strictError;
+          }
+        }
         const packResults = new Map(
           (renderPackJob.result?.segments || []).map((segment) => [segment.episodeIndex, segment.result] as const),
         );
@@ -1476,37 +1565,13 @@ export function DashboardClient() {
       if (!rendered) {
         throw new Error("有分段未完成单集质量生成，请重新生成。");
       }
-      const episodeIndex = rendered.episodeIndex;
-      const episodeResult = rendered.result;
-      const episodeScript = rendered.sourceText;
-      const fullVideoPrompt = rendered.promptText;
-
-      updateSegmentProgress(episodeIndex, "saving", "正在保存到项目");
-      publishBatchProgress("saving", `正在保存第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
-      const save = await saveAnalysisProject(episodeScript, episodeResult, fullVideoPrompt, activeProjectId || undefined, undefined);
-      if (!save.saved || !save.projectId || !save.versionId) {
-        throw new Error(`第 ${episodeIndex} 段已生成，但项目保存失败：${save.reason || "未返回保存结果"}`);
-      }
-
-      activeProjectId = save.projectId;
-      latestSave = save;
-      setProjectSave(save);
-      setResumeProjectId(save.projectId);
-      setResumeVersionId(save.versionId);
-
-      completed.push({
-        segment: { index: episodeIndex, text: episodeScript },
-        result: episodeResult,
-        promptText: fullVideoPrompt,
-      });
-      setBatchResults([...completed]);
-      setResult(episodeResult);
-      updateSegmentProgress(episodeIndex, "saved", "已保存");
-      publishBatchProgress("saving", `已保存第 ${episodeIndex} / ${resolvedSegmentCount} 段。`);
     }
+    queueReadySegmentSaves();
+    await saveChain;
+    if (saveError) throw saveError;
 
-    if (latestSave?.versionId) {
-      setResumeVersionId(latestSave.versionId);
+    if (latestSaveRef.current?.versionId) {
+      setResumeVersionId(latestSaveRef.current.versionId);
       creatingNewEpisodeRef.current = false;
       setCreatingNewEpisode(false);
     }
