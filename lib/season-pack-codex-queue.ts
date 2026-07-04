@@ -691,7 +691,7 @@ function normalizeSeasonPlanSegments(seasonPlan: Record<string, unknown> | null)
       : [];
     return [{
       segmentIndex: normalizePositiveInteger(segment.segmentIndex) || index + 1,
-      title: cleanString(segment.title) || `第 ${index + 1} 段`,
+      title: cleanString(segment.title),
       beatStart: normalizePositiveInteger(segment.beatStart) || index + 1,
       beatEnd: normalizePositiveInteger(segment.beatEnd) || index + 1,
       beatIds,
@@ -717,7 +717,11 @@ function seasonPlanWithLockedSegments(
 }
 
 function validateLockedSeasonPlanCount(segments: LockedSeasonSegment[], episodeCount: number) {
-  if (!segments.length) return;
+  if (!segments.length) {
+    throw new SeasonPackCodexQueueError(
+      "Season pack output is missing a locked beat plan: season-plan.json must include beats or lockedSegments before rendering",
+    );
+  }
   if (segments.length !== episodeCount) {
     throw new SeasonPackCodexQueueError(
       `Locked SegmentPlan count ${segments.length} does not match resolved segment count ${episodeCount}`,
@@ -1481,7 +1485,7 @@ function appendLockedSegmentPlan(value: string, lockedSegment: LockedSeasonSegme
     `Target duration: ${durationLabelFromSeconds(lockedSegment.estimatedDurationSeconds)} (must not exceed 15 seconds)`,
     `Shot count lock: ${lockedSegment.shotCount}`,
     "Locked source beats:",
-    lockedSegment.sourceText,
+    cleanSourceEpisodeLabels(lockedSegment.sourceText),
     "",
     "Rendering rule: use only this locked beat range for the current segment. Do not move content into another segment during render. If the segment cannot fit within the locked duration, fail quality validation instead of inventing a new split.",
   ].join("\n");

@@ -974,6 +974,11 @@ export function DashboardClient() {
     throw new Error("Codex 整段提示词任务等待超时，请确认 season-pack:codex-worker 正在运行。");
   }
 
+  function isMissingLockedSeasonPlanError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error || "");
+    return /locked beat plan|beats|lockedSegments|SegmentPlan/i.test(message);
+  }
+
   async function pollVideoPromptPackCodexJob(jobId: string, segmentCount: number) {
     const startedAt = Date.now();
     const timeoutMs = Math.max(30 * 60_000, segmentCount * 600_000);
@@ -1245,10 +1250,27 @@ export function DashboardClient() {
       "planning",
       mode === "auto" ? "正在分析原文结构，自动判断适合生成多少段..." : `正在创建 ${episodeCount} 段整段规划任务...`,
     );
-    const job = await createSeasonPackCodexJob(script, selectedDurationValue(), activeProjectId || undefined, mode, episodeCount);
-    setGenerationProgress(`已创建整段规划任务 ${job.id}，请确认 season-pack:codex-worker 正在运行。`);
-    publishBatchProgress("planning", `已创建整段规划任务 ${job.id}，请确认 season-pack:codex-worker 正在运行。`);
-    const seasonPackJob = await pollSeasonPackCodexJob(job.id, mode, episodeCount);
+
+    async function runSeasonPackPlanningWithLockedRetry() {
+      let lastError: unknown = null;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const job = await createSeasonPackCodexJob(script, selectedDurationValue(), activeProjectId || undefined, mode, episodeCount);
+        setGenerationProgress(`已创建整段规划任务 ${job.id}，请确认 season-pack:codex-worker 正在运行。`);
+        publishBatchProgress("planning", `已创建整段规划任务 ${job.id}，请确认 season-pack:codex-worker 正在运行。`);
+        try {
+          return await pollSeasonPackCodexJob(job.id, mode, episodeCount);
+        } catch (error) {
+          lastError = error;
+          if (attempt >= 2 || !isMissingLockedSeasonPlanError(error)) {
+            throw error;
+          }
+          publishBatchProgress("planning", "分段锁定失败，正在重新规划全局 Beat 排程...");
+        }
+      }
+      throw lastError instanceof Error ? lastError : new Error("分段锁定失败，请重新生成。");
+    }
+
+    const seasonPackJob = await runSeasonPackPlanningWithLockedRetry();
     const episodes = [...(seasonPackJob.result?.episodes || [])].sort((left, right) => left.episodeIndex - right.episodeIndex);
     resolvedSegmentCount = episodes.length;
     if (mode === "fixed" && episodes.length !== episodeCount) {
@@ -1274,6 +1296,8 @@ export function DashboardClient() {
     };
 
     const renderedEpisodes: Array<RenderedEpisode | undefined> = new Array(resolvedSegmentCount);
+    const repairQueue: Array<{ episode: SeasonPackEpisodeResult; reason: string }> = [];
+    const queuedRepairIndexes = new Set<number>();
 
     async function renderBatchSegmentWithQualityRepair(
       renderScript: string,
@@ -1353,6 +1377,32 @@ export function DashboardClient() {
       storeRenderedEpisode(episode, episodeResult);
     }
 
+    function queueSegmentRepair(episode: SeasonPackEpisodeResult, reason: string) {
+      if (renderedEpisodes[episode.episodeIndex - 1] || queuedRepairIndexes.has(episode.episodeIndex)) return;
+      queuedRepairIndexes.add(episode.episodeIndex);
+      repairQueue.push({ episode, reason });
+      updateSegmentProgress(episode.episodeIndex, "repairing", reason);
+    }
+
+    async function runSegmentRepairPool() {
+      if (!repairQueue.length) return;
+      publishBatchProgress("repairing", `正在并发重修 ${repairQueue.length} 段，最多同时 ${BATCH_SINGLE_RENDER_CONCURRENCY} 段...`);
+
+      let nextRepairIndex = 0;
+      const repairConcurrency = Math.min(BATCH_SINGLE_RENDER_CONCURRENCY, repairQueue.length);
+
+      async function repairNextSegment() {
+        while (nextRepairIndex < repairQueue.length) {
+          const repairIndex = nextRepairIndex;
+          nextRepairIndex += 1;
+          const { episode } = repairQueue[repairIndex];
+          await renderSingleEpisodeWithQualityRepair(episode);
+        }
+      }
+
+      await Promise.all(Array.from({ length: repairConcurrency }, () => repairNextSegment()));
+    }
+
     async function renderPackedSegmentsWithQualityRepair(packEpisodes: SeasonPackEpisodeResult[]) {
       const packLabel = packEpisodes.map((episode) => episode.episodeIndex).join(", ");
       const packSegments = packEpisodes.map((episode) => {
@@ -1385,8 +1435,7 @@ export function DashboardClient() {
           const renderDuration = episodeInput.duration || selectedDurationValue();
           const rawResult = packResults.get(episodeIndex);
           if (!rawResult) {
-            updateSegmentProgress(episodeIndex, "repairing", "Render Pack 缺少本段结果，转为单段修复");
-            await renderSingleEpisodeWithQualityRepair(episode);
+            queueSegmentRepair(episode, "Render Pack 缺少本段结果，转为单段修复");
             continue;
           }
           const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, resolvedSegmentCount || episodes.length, rawResult, renderDuration);
@@ -1395,17 +1444,15 @@ export function DashboardClient() {
             storeRenderedEpisode(episode, episodeResult);
           } catch (error) {
             const reason = error instanceof Error ? error.message : "Render Pack 结果未通过单段质量校验";
-            updateSegmentProgress(episodeIndex, "repairing", reason);
             publishBatchProgress("repairing", `第 ${episodeIndex} / ${resolvedSegmentCount} 段 Render Pack 未过质量闸，正在单段重修：${reason}`);
-            await renderSingleEpisodeWithQualityRepair(episode);
+            queueSegmentRepair(episode, reason);
           }
         }
       } catch (error) {
         const reason = error instanceof Error ? error.message : "Render Pack 生成失败";
         publishBatchProgress("repairing", `Render Pack 第 ${packLabel} 段失败，正在逐段降级修复：${reason}`);
         for (const episode of packEpisodes) {
-          updateSegmentProgress(episode.episodeIndex, "repairing", reason);
-          await renderSingleEpisodeWithQualityRepair(episode);
+          queueSegmentRepair(episode, reason);
         }
       }
     }
@@ -1423,6 +1470,7 @@ export function DashboardClient() {
     }
 
     await Promise.all(Array.from({ length: renderPackConcurrency }, () => renderNextPack()));
+    await runSegmentRepairPool();
 
     for (const rendered of renderedEpisodes) {
       if (!rendered) {

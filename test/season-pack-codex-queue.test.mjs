@@ -103,6 +103,32 @@ function structuredSourceWithFourShots() {
   ].join("\n");
 }
 
+function writeLockedSeasonPlan(claimed, episodeCount, options = {}) {
+  const shotCounts = options.shotCounts || [];
+  const durations = options.durations || [];
+  const sourceTexts = options.sourceTexts || [];
+  const titles = options.titles || [];
+  const lockedSegments = Array.from({ length: episodeCount }, (_, index) => {
+    const segmentIndex = index + 1;
+    const duration = durations[index] ?? 12;
+    return {
+      segmentIndex,
+      title: titles[index] ?? "",
+      beatStart: segmentIndex,
+      beatEnd: segmentIndex,
+      beatIds: [`B${String(segmentIndex).padStart(3, "0")}`],
+      estimatedDurationSeconds: duration,
+      shotCount: shotCounts[index] ?? 4,
+      sourceText: sourceTexts[index] ?? `Locked source beat ${segmentIndex}`,
+    };
+  });
+  writeFileSync(
+    claimed.seasonPlanPath,
+    JSON.stringify({ storyBible: { title: "Locked Plan" }, lockedSegments }, null, 2),
+    "utf8",
+  );
+}
+
 test("creates, claims, and completes a season planning job from per-episode input packs", async () => {
   const rootDir = makeTempRoot();
   try {
@@ -131,7 +157,10 @@ test("creates, claims, and completes a season planning job from per-episode inpu
 
     mkdirSync(claimed.episodesDir, { recursive: true });
     writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 2, generatedEpisodes: [1, 2] }, null, 2), "utf8");
-    writeFileSync(claimed.seasonPlanPath, JSON.stringify({ storyBible: { title: "测试" }, episodeChain: [{ index: 1 }, { index: 2 }] }, null, 2), "utf8");
+    writeLockedSeasonPlan(claimed, 2, {
+      titles: [sampleEpisodeInput(1).title, sampleEpisodeInput(2).title],
+      sourceTexts: [sampleEpisodeInput(1).sourceText, sampleEpisodeInput(2).sourceText],
+    });
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
     writeFileSync(path.join(claimed.episodesDir, "episode-002.json"), JSON.stringify(sampleEpisodeInput(2), null, 2), "utf8");
 
@@ -178,7 +207,7 @@ test("creates automatic season planning jobs and resolves segment count from the
       JSON.stringify({ segmentCountMode: "auto", episodeCount: 2, generatedEpisodes: [1, 2], status: "completed" }, null, 2),
       "utf8",
     );
-    writeFileSync(claimed.seasonPlanPath, JSON.stringify({ storyBible: { title: "Auto" }, episodeChain: [{ index: 1 }, { index: 2 }] }, null, 2), "utf8");
+    writeLockedSeasonPlan(claimed, 2);
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
     writeFileSync(path.join(claimed.episodesDir, "episode-002.json"), JSON.stringify(sampleEpisodeInput(2), null, 2), "utf8");
 
@@ -309,6 +338,37 @@ test("prefers locked season segments over legacy generic segments", async () => 
   }
 });
 
+test("rejects season planning output without locked beats or locked segments", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createSeasonPackCodexJob(
+      {
+        script: "A source chapter that must be converted through a locked beat plan.",
+        episodeCount: 1,
+      },
+      { rootDir },
+    );
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 1, generatedEpisodes: [1] }, null, 2), "utf8");
+    writeFileSync(
+      claimed.seasonPlanPath,
+      JSON.stringify({ storyBible: { title: "Legacy plan" }, episodeChain: [{ index: 1 }] }, null, 2),
+      "utf8",
+    );
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
+
+    await assert.rejects(
+      () => completeSeasonPackCodexJob(claimed.id, { rootDir }),
+      /locked beat plan|beats|lockedSegments/i,
+    );
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("season pack Codex jobs claim the oldest pending task by default", async () => {
   const rootDir = makeTempRoot();
   try {
@@ -358,6 +418,11 @@ test("fills episode input metadata and render script from structured source", as
     });
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 1, {
+      durations: [13],
+      sourceTexts: [structuredSourceWithFourShots()],
+      shotCounts: [4],
+    });
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(input, null, 2), "utf8");
 
     const completed = await completeSeasonPackCodexJob(job.id, { rootDir });
@@ -388,6 +453,7 @@ test("rejects season pack output that still writes final AnalysisResult JSON", a
     assert.ok(claimed);
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 1);
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleFinalAnalysisResult(1), null, 2), "utf8");
 
     await assert.rejects(
@@ -413,6 +479,7 @@ test("rejects season planning that compresses explicit source shot count", async
     assert.ok(claimed);
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 1, { shotCounts: [3] });
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { shotCount: 3 }), null, 2), "utf8");
 
     await assert.rejects(
@@ -439,6 +506,7 @@ test("recognizes colon episode headings and timecode shot lines before validatin
     assert.ok(claimed);
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 1, { shotCounts: [2] });
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { shotCount: 2 }), null, 2), "utf8");
 
     await assert.rejects(
@@ -469,6 +537,7 @@ test("caps short source segments at five planned shots unless dense mode exists"
     assert.ok(claimed);
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 1, { shotCounts: [8] });
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { shotCount: 8 }), null, 2), "utf8");
 
     await assert.rejects(
@@ -493,6 +562,9 @@ test("removes source episode labels from render input while preserving segment n
     assert.ok(claimed);
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 1, {
+      sourceTexts: [source],
+    });
     writeFileSync(
       path.join(claimed.episodesDir, "episode-001.json"),
       JSON.stringify(sampleEpisodeInput(1, {
@@ -529,6 +601,7 @@ test("rejects compact one-shot season input packs when no explicit source shot l
     assert.ok(claimed);
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 1, { shotCounts: [1] });
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { shotCount: 1 }), null, 2), "utf8");
 
     await assert.rejects(
@@ -554,6 +627,7 @@ test("rejects poisoned render input text", async () => {
     assert.ok(claimed);
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 1, { shotCounts: [4] });
     writeFileSync(
       path.join(claimed.episodesDir, "episode-001.json"),
       JSON.stringify(sampleEpisodeInput(1, { shotCount: 4, renderInputScript: "undefined：错误输入" }), null, 2),
@@ -590,6 +664,7 @@ test("does not complete a season pack job when an expected episode file is missi
     assert.ok(claimed);
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 2);
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
 
     await assert.rejects(

@@ -17,14 +17,18 @@ test("dashboard can generate multiple project segments through a season pack job
   assert.match(dashboardSource, /runBatchEpisodeGeneration/);
   assert.match(dashboardSource, /createSeasonPackCodexJob/);
   assert.match(dashboardSource, /pollSeasonPackCodexJob/);
+  assert.match(dashboardSource, /runSeasonPackPlanningWithLockedRetry/);
+  assert.match(dashboardSource, /isMissingLockedSeasonPlanError/);
   assert.match(dashboardSource, /\/api\/season-pack\/jobs/);
   assert.match(dashboardSource, /BATCH_RENDER_PACK_SIZE = 4/);
   assert.match(dashboardSource, /BATCH_RENDER_PACK_CONCURRENCY = 4/);
+  assert.match(dashboardSource, /BATCH_SINGLE_RENDER_CONCURRENCY = 3/);
   assert.match(dashboardSource, /type VideoPromptPackCodexJob/);
   assert.match(dashboardSource, /createVideoPromptPackCodexJob/);
   assert.match(dashboardSource, /pollVideoPromptPackCodexJob/);
   assert.match(dashboardSource, /\/api\/video-prompt-packs\/jobs/);
   assert.match(dashboardSource, /renderPackedSegmentsWithQualityRepair/);
+  assert.match(dashboardSource, /runSegmentRepairPool/);
   assert.match(dashboardSource, /chunkEpisodesForRenderPacks/);
   assert.match(dashboardSource, /segmentCountMode/);
   assert.match(dashboardSource, /segmentCountMode === "auto" \|\| episodeCount > 1/);
