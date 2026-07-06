@@ -3,6 +3,11 @@
 import { useEffect, useMemo, useState } from "react";
 import type { AnalysisResult } from "@/types";
 import {
+  analyzeSegmentPromptQuality,
+  summarizeSegmentPromptQuality,
+  type SegmentPromptQualityIssue,
+} from "@/lib/segment-prompt-quality";
+import {
   BookOpen,
   Boxes,
   Building2,
@@ -20,6 +25,7 @@ import {
   ShieldCheck,
   Trash2,
   UserRound,
+  Wrench,
 } from "lucide-react";
 
 const SHOW_DIRECTOR_MEMORY = false;
@@ -273,6 +279,13 @@ type PromptSafetyCodexJob = {
   id: string;
   status: "pending" | "running" | "completed" | "failed";
   result?: PromptSafetyOptimizationResult | null;
+  error?: string | null;
+};
+
+type VideoPromptCodexJob = {
+  id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  result?: Record<string, unknown> | null;
   error?: string | null;
 };
 
@@ -548,6 +561,10 @@ export function ProjectsClient() {
   const [promptSafetyLoading, setPromptSafetyLoading] = useState(false);
   const [promptSafetyMessage, setPromptSafetyMessage] = useState("");
   const [promptSafetyError, setPromptSafetyError] = useState("");
+  const [promptRepairInstruction, setPromptRepairInstruction] = useState("");
+  const [promptRepairLoading, setPromptRepairLoading] = useState(false);
+  const [promptRepairMessage, setPromptRepairMessage] = useState("");
+  const [promptRepairError, setPromptRepairError] = useState("");
   const [visualAssetGeneratingEntityId, setVisualAssetGeneratingEntityId] = useState("");
   const [visualAssetGenerationMessage, setVisualAssetGenerationMessage] = useState("");
   const [visualAssetGenerationError, setVisualAssetGenerationError] = useState("");
@@ -566,11 +583,41 @@ export function ProjectsClient() {
   );
   const minPromptDownloadVersion = sortedProjectVersions[0]?.versionNumber || 1;
   const maxPromptDownloadVersion = sortedProjectVersions[sortedProjectVersions.length - 1]?.versionNumber || 1;
+  const projectPromptQualityItems = useMemo(
+    () =>
+      sortedProjectVersions.map((version) => {
+        const qualityIssues = analyzeSegmentPromptQuality({
+          segmentNumber: version.versionNumber,
+          title: version.title,
+          duration: version.duration,
+          fullVideoPrompt: buildPromptText(version),
+          optimizedScript: version.optimizedScript || version.originalScript,
+          shots: version.shots as unknown as Array<Record<string, unknown>>,
+        });
+        return {
+          version,
+          qualityIssues,
+          summary: summarizeSegmentPromptQuality(qualityIssues),
+        };
+      }),
+    [sortedProjectVersions],
+  );
+  const selectedVersionQualityIssues = useMemo(
+    () => projectPromptQualityItems.find((item) => item.version.id === selectedVersion?.id)?.qualityIssues || [],
+    [projectPromptQualityItems, selectedVersion?.id],
+  );
+  const projectPromptQualityIssueCount = projectPromptQualityItems.reduce(
+    (count, item) => count + item.summary.totalCount,
+    0,
+  );
 
   useEffect(() => {
     if (!selectedVersion) return;
     setPromptDownloadRangeStart(selectedVersion.versionNumber || 1);
     setPromptDownloadRangeEnd(selectedVersion.versionNumber || 1);
+    setPromptRepairInstruction("");
+    setPromptRepairMessage("");
+    setPromptRepairError("");
   }, [selectedVersion?.id]);
 
   const projectAssetLibrarySections = useMemo(
@@ -1160,6 +1207,162 @@ export function ProjectsClient() {
     }
   }
 
+  function formatPromptQualityIssue(issue: SegmentPromptQualityIssue) {
+    const target = issue.shotNumber ? `镜头 ${issue.shotNumber}` : "本段";
+    return `${target}｜${issue.label}：${issue.detail}`;
+  }
+
+  function buildProjectPromptRepairScript(
+    sourceResult: AnalysisResult,
+    currentPromptText: string,
+    qualityIssues: SegmentPromptQualityIssue[],
+    repairInstruction: string,
+  ) {
+    const issueText = qualityIssues.length
+      ? qualityIssues.map((issue, index) => `${index + 1}. ${formatPromptQualityIssue(issue)}`).join("\n")
+      : "用户主动要求优化当前段。";
+
+    return [
+      `你正在修复 Local Director 已保存的第 ${selectedVersion?.versionNumber || 1} 段视频提示词。`,
+      "",
+      "修复边界：",
+      "1. 只修当前段，不新增段，不删除段，不改项目标题，不改段号。",
+      "2. 保留原剧情、人物关系、段尾承接、时长上限和镜头顺序。",
+      "3. 不重写成新故事，不输出解释、报告、Markdown 或修改清单。",
+      "4. 如果没有台词，dialogue 必须写“无”。",
+      "5. 用户侧统一使用“段”，不要写“集 / 本集 / 单集 / 剧集”。",
+      "6. 修复后仍然输出完整 AnalysisResult JSON。",
+      "",
+      "检测到的问题：",
+      issueText,
+      "",
+      "用户想怎么修改：",
+      repairInstruction.trim() || "按检测到的问题修复硬错误，并保持原提示词质量和内容厚度。",
+      "",
+      "当前完整提示词：",
+      currentPromptText,
+      "",
+      "当前结构化结果 JSON：",
+      JSON.stringify(sourceResult, null, 2),
+    ].join("\n");
+  }
+
+  async function createProjectPromptRepairCodexJob(
+    sourceResult: AnalysisResult,
+    repairInstruction: string,
+    qualityIssues: SegmentPromptQualityIssue[],
+  ) {
+    if (!project || !selectedVersion) throw new Error("请选择要修复的项目段落。");
+    const currentPromptText = buildPromptText(selectedVersion);
+    const res = await fetch("/api/video-prompt/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId: project.id,
+        versionId: selectedVersion.id,
+        script: buildProjectPromptRepairScript(sourceResult, currentPromptText, qualityIssues, repairInstruction),
+        contentType: selectedVersion.contentType || project.contentType || undefined,
+        style: selectedVersion.style || project.style || undefined,
+        duration: selectedVersion.duration || project.duration || "auto",
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) throw new Error(data?.error || "本段提示词修复任务创建失败");
+    return data.job as VideoPromptCodexJob;
+  }
+
+  async function pollProjectPromptRepairCodexJob(jobId: string) {
+    const startedAt = Date.now();
+    const timeoutMs = 20 * 60_000;
+    let lastStatus = "";
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const res = await fetch(`/api/video-prompt/jobs/${jobId}`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "本段提示词修复任务读取失败");
+
+      const currentJob = data.job as VideoPromptCodexJob;
+      if (currentJob.status !== lastStatus) {
+        lastStatus = currentJob.status;
+        setPromptRepairMessage(
+          currentJob.status === "running"
+            ? "Codex 正在本地修复本段视频提示词..."
+            : `本段提示词修复任务状态：${currentJob.status}`,
+        );
+      }
+      if (currentJob.status === "completed") return currentJob;
+      if (currentJob.status === "failed") throw new Error(currentJob.error || "本段提示词修复任务失败");
+      await new Promise((resolve) => window.setTimeout(resolve, 2500));
+    }
+
+    throw new Error("本段提示词修复任务等待超时，请确认 video-prompt:codex-worker 正在运行。");
+  }
+
+  function assertProjectPromptRepairResult(value: unknown): AnalysisResult {
+    const result = value as AnalysisResult | null | undefined;
+    if (!result || typeof result !== "object") throw new Error("修复完成但没有返回结构化结果。");
+    if (!Array.isArray(result.storyboard) || !result.storyboard.length) {
+      throw new Error("修复结果缺少 storyboard。");
+    }
+    if (!result.optimizedScript || !result.workflow?.fullVideoPrompt) {
+      throw new Error("修复结果缺少 optimizedScript 或 workflow.fullVideoPrompt。");
+    }
+    return result;
+  }
+
+  async function runProjectPromptRepair() {
+    if (!project || !selectedVersion || promptRepairLoading) return;
+    setPromptRepairLoading(true);
+    setPromptRepairError("");
+    setPromptRepairMessage("已创建本段提示词修复准备任务，请确认 video-prompt:codex-worker 正在运行。");
+
+    try {
+      const sourceResult = buildAnalysisResultFromProjectVersion(project, selectedVersion);
+      const job = await createProjectPromptRepairCodexJob(
+        sourceResult,
+        promptRepairInstruction,
+        selectedVersionQualityIssues,
+      );
+      const completedJob = await pollProjectPromptRepairCodexJob(job.id);
+      const repairedResult = assertProjectPromptRepairResult(completedJob.result);
+      const repairedPromptText = buildAnalysisResultPromptText(repairedResult);
+      const repairedIssues = analyzeSegmentPromptQuality({
+        segmentNumber: selectedVersion.versionNumber,
+        title: repairedResult.title,
+        duration: repairedResult.duration,
+        fullVideoPrompt: repairedPromptText,
+        optimizedScript: repairedResult.optimizedScript,
+        shots: repairedResult.storyboard as unknown as Array<Record<string, unknown>>,
+      });
+      const blockingIssues = repairedIssues.filter((issue) => issue.severity === "blocking");
+      if (blockingIssues.length) {
+        throw new Error(`修复结果仍有硬错误：${blockingIssues.map(formatPromptQualityIssue).join("；")}`);
+      }
+
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: project.id,
+          versionId: selectedVersion.id,
+          originalScript: selectedVersion.originalScript,
+          result: repairedResult,
+          fullVideoPrompt: repairedPromptText,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "本段提示词修复结果保存失败");
+
+      await reloadSelectedProject(project.id, selectedVersion.id);
+      setPromptRepairInstruction("");
+      setPromptRepairMessage("本段提示词已修复并保存。");
+    } catch (err) {
+      setPromptRepairError(getFriendlyProjectError(err instanceof Error ? err.message : "本段提示词修复失败"));
+    } finally {
+      setPromptRepairLoading(false);
+    }
+  }
+
   function toggleProjectChecked(projectId: string) {
     setCheckedProjectIds((ids) =>
       ids.includes(projectId) ? ids.filter((id) => id !== projectId) : [...ids, projectId],
@@ -1518,6 +1721,14 @@ export function ProjectsClient() {
                     {promptSafetyLoading ? "正在合规优化" : "Seedance 合规优化"}
                   </button>
                   <button
+                    onClick={runProjectPromptRepair}
+                    disabled={promptRepairLoading || promptSafetyLoading}
+                    className="projects-action-button disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {promptRepairLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wrench className="h-4 w-4" />}
+                    {promptRepairLoading ? "正在修复本段" : "修复本段"}
+                  </button>
+                  <button
                     onClick={deleteSelectedEpisode}
                     disabled={deletingEpisode}
                     className="projects-action-button projects-action-danger disabled:cursor-not-allowed disabled:opacity-60"
@@ -1657,6 +1868,69 @@ export function ProjectsClient() {
                   }`}
                 >
                   {promptSafetyError || promptSafetyMessage}
+                </div>
+              )}
+
+              {(promptRepairMessage || promptRepairError) && (
+                <div
+                  className={`rounded-2xl border px-4 py-3 text-sm ${
+                    promptRepairError
+                      ? "border-red-400/25 bg-red-500/10 text-red-100"
+                      : "border-cyan-300/18 bg-cyan-400/10 text-cyan-50"
+                  }`}
+                >
+                  {promptRepairError || promptRepairMessage}
+                </div>
+              )}
+
+              {projectDetailView === "episodes" && (
+                <div className="rounded-2xl border border-cyan-300/12 bg-black/20 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-sm font-bold text-white">
+                        <Wrench className="h-4 w-4 text-cyan-100" />
+                        提示词质量检查
+                      </div>
+                      <p className="mt-1 text-xs leading-5 text-slate-400">
+                        当前项目有 {projectPromptQualityIssueCount} 条本地检查建议；本段有 {selectedVersionQualityIssues.length} 条。
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={runProjectPromptRepair}
+                      disabled={promptRepairLoading}
+                      className="projects-action-button disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {promptRepairLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wrench className="h-4 w-4" />}
+                      修复本段
+                    </button>
+                  </div>
+                  {selectedVersionQualityIssues.length > 0 && (
+                    <div className="mt-3 grid gap-2 text-xs leading-5 text-slate-300 sm:grid-cols-2">
+                      {selectedVersionQualityIssues.slice(0, 6).map((issue) => (
+                        <div
+                          key={`${issue.code}-${issue.field || "segment"}-${issue.shotNumber || 0}`}
+                          className={`rounded-xl border px-3 py-2 ${
+                            issue.severity === "blocking"
+                              ? "border-red-300/20 bg-red-500/10 text-red-100"
+                              : "border-amber-200/20 bg-amber-400/10 text-amber-50"
+                          }`}
+                        >
+                          {formatPromptQualityIssue(issue)}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <label className="mt-3 block text-xs font-semibold text-slate-300">
+                    你想怎么修改
+                    <textarea
+                      value={promptRepairInstruction}
+                      onChange={(event) => setPromptRepairInstruction(event.target.value)}
+                      rows={3}
+                      placeholder="例如：保留剧情，只把第 3 镜头的画面写得更具体；修掉同上、undefined 或集数术语。"
+                      className="mt-2 w-full resize-y rounded-2xl border border-white/10 bg-black/30 px-3 py-2 text-sm leading-6 text-white outline-none transition placeholder:text-slate-600 focus:border-cyan-200/60"
+                    />
+                  </label>
                 </div>
               )}
 
