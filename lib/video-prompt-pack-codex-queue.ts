@@ -88,7 +88,7 @@ export async function createVideoPromptPackCodexJob(
       outputPath: path.join(resultDir(rootDir), fileSegment(jobId), outputFileName),
     };
   });
-  const mode = input.mode === "strictUtf8" ? "strictUtf8" : "standard";
+  const mode = input.mode === "standard" ? "standard" : "strictUtf8";
   const job: VideoPromptPackCodexJob = {
     id: jobId,
     projectId: input.projectId || null,
@@ -214,6 +214,9 @@ function buildVideoPromptPackCodexPrompt(
     "- Each JSON must be a complete Local Director AnalysisResult, not a summary and not a combined array.",
     "- Each JSON must include title, contentType, duration, style, diagnosis, optimizedScript, workflow.fullVideoPrompt, workflow.fullNegativePrompt, workflow.concisePrompt, and storyboard.",
     "- Every storyboard shot must include shotNumber, timeRange, scene, visual, shotType, composition, cameraMovement, lighting, sound, dialogue, emotion, transition, shotPurpose, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt.",
+    "- Keep single-segment quality: a 4-shot segment should usually have workflow.fullVideoPrompt with at least 1400 meaningful Chinese characters; 3-shot segments should usually have at least 1100.",
+    "- Do not make thin shots. visual, composition, lighting, sound, shotPurpose, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt must be concrete, shootable text instead of short labels.",
+    "- videoPrompt must describe the full moving image for that shot with action, space, camera behavior, light, sound, emotion, and continuity. Do not output one-sentence summaries.",
     "- Do not use 同上, 如上, 略, 参考上一段, continue as above, or any placeholder that depends on another segment.",
     "- If there is no spoken line, dialogue must be a concrete no-dialogue value such as \"无\" or \"none\".",
     "- Preserve the specific render script, shot count lock, Story Bible continuity, and source events for each segment.",

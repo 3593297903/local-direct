@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
-test("dashboard season pack integration renders each episode with the single-episode generator", async () => {
+test("dashboard season pack integration renders each segment with the single-segment generator", async () => {
   const dashboardSource = await readFile(join(process.cwd(), "components", "DashboardClient.tsx"), "utf8");
 
   assert.match(dashboardSource, /type SeasonPackCodexJob/);

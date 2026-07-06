@@ -47,7 +47,7 @@ function sampleEpisodeInput(index, overrides = {}) {
       keyEvents: ["空间建立", "动作推进", "情绪转折", "段尾钩子"],
     },
     shotCount: 4,
-    renderInputScript: `第${index}段单段渲染输入：按单集质量生成完整 AnalysisResult，严格输出 4 个镜头。`,
+    renderInputScript: `第${index}段单段渲染输入：按单段质量生成完整 AnalysisResult，严格输出 4 个镜头。`,
     ...overrides,
   };
 }
@@ -168,7 +168,8 @@ test("creates, claims, and completes a season planning job from per-episode inpu
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.episodes.length, 2);
     assert.equal(completed.result.episodes[0].episodeIndex, 1);
-    assert.match(completed.result.episodes[1].input.renderInputScript, /单集渲染输入/);
+    assert.match(completed.result.episodes[1].input.renderInputScript, /单段渲染输入/);
+    assert.doesNotMatch(completed.result.episodes[1].input.renderInputScript, /单集渲染输入/);
 
     const reloaded = await getSeasonPackCodexJob(job.id, { rootDir });
     assert.equal(reloaded.status, "completed");

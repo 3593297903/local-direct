@@ -210,3 +210,33 @@ test("strict UTF-8 render pack mode is persisted and hardens the Codex prompt", 
     rmSync(rootDir, { recursive: true, force: true });
   }
 });
+
+test("video prompt render pack jobs default to strict UTF-8 mode", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptPackCodexJob(
+      {
+        segments: [
+          {
+            episodeIndex: 1,
+            title: "Default strict segment",
+            script: "中文源文案需要稳定 UTF-8 输出。",
+            renderInputScript: "Render this segment with complete single-segment quality.",
+            duration: "15 seconds",
+            shotCount: 4,
+          },
+        ],
+      },
+      { rootDir },
+    );
+
+    assert.equal(job.mode, "strictUtf8");
+    assert.match(job.prompt, /STRICT_UTF8_RECOVERY_MODE/);
+    assert.match(job.prompt, /1400 meaningful Chinese characters/);
+    assert.match(job.prompt, /3-shot segments should usually have at least 1100/);
+    assert.match(job.prompt, /Do not make thin shots/);
+    assert.match(job.prompt, /videoPrompt must describe the full moving image/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});

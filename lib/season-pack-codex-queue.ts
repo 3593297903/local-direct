@@ -334,7 +334,7 @@ function buildSeasonPackCodexPrompt(
     "Each file must contain one strict Segment Input Pack JSON object, not a final prompt result.",
     "For compatibility this object is also called an Episode Input Pack in older code, but user-facing text must say segment / 段.",
     "Every Segment Input Pack must include: episodeIndex, title, sourceText, duration, contentType, style, storyBible, episodeChain, blueprint, shotCount, and renderInputScript.",
-    "Do not include workflow.fullVideoPrompt. Do not include storyboard. The downstream single-episode renderer will create those.",
+    "Do not include workflow.fullVideoPrompt. Do not include storyboard. The downstream single-segment renderer will create those.",
     "",
     "Write these files as UTF-8 with Node.js fs.writeFileSync. Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
     `Pack directory: ${paths.packDir}`,
@@ -373,7 +373,7 @@ function buildSeasonPackCodexPrompt(
     "- contentType and style must be concrete Chinese text inferred from the full source and project memory; never leave them blank.",
     "- renderInputScript is the exact script that will be sent to the normal single-segment renderer. It must be compact but complete.",
     "- renderInputScript must include: Story Bible summary, Segment Chain item, Segment Blueprint, original sourceText, shotCount lock, style lock, continuity rules, and a clear instruction to generate a full Local Director single-segment AnalysisResult.",
-    "- renderInputScript must say 第 N 段, 本段, and 单集渲染输入. It must not say 第 N 集 or 本集.",
+    "- renderInputScript must say 第 N 段, 本段, and 单段渲染输入. It must not say 第 N 集, 本集, or 单集.",
     "- renderInputScript must not contain final workflow.fullVideoPrompt or final storyboard JSON.",
     "",
     `Project ID: ${input.projectId || "new project"}`,
@@ -938,9 +938,9 @@ function validateEpisodeInputPack(
 
 function buildEpisodeRenderInputScript(input: SeasonPackEpisodeInput) {
   return [
-    `你正在为 Local Director 生成第 ${input.episodeIndex} 段的单集视频提示词。`,
+    `你正在为 Local Director 生成第 ${input.episodeIndex} 段的视频提示词。`,
     "",
-    "单集渲染输入：必须按普通单集生成的质量和结构输出完整 AnalysisResult。",
+    "单段渲染输入：必须按普通单段生成的质量和结构输出完整 AnalysisResult。",
     "不要输出摘要版，不要压缩镜头，不要省略镜头字段。",
     "最终标题、核心主题和完整视频提示词都必须使用“段”，不要写“第N集”或“本集”。",
     "",
@@ -963,7 +963,7 @@ function buildEpisodeRenderInputScript(input: SeasonPackEpisodeInput) {
     input.sourceText,
     "",
     "生成要求：",
-    "1. 使用和单集生成完全相同的质量标准，输出完整视频生成提示词和逐镜头分镜。",
+    "1. 使用和单段独立生成完全相同的质量标准，输出完整视频生成提示词和逐镜头分镜。",
     "2. 保留本段原文案的关键事件、人物关系、时间线、道具线索和情绪推进。",
     "3. 读取 Story Bible 和 Segment Chain 保持跨段连续性，但不要提前泄露后续内容。",
     "4. 每个镜头必须包含时间范围、景别、机位/构图、运镜、画面、光影、声音/台词、情绪、转场、镜头目的、firstFramePrompt、videoPrompt、lastFramePrompt、negativePrompt。",
@@ -1468,10 +1468,10 @@ function cleanSourceEpisodeLabels(value: string) {
 function normalizeRenderInputScript(value: string) {
   const text = cleanString(value);
   if (!text) return "";
-  const normalized = text.replace(/单段渲染输入/g, "单集渲染输入");
-  return /单集渲染输入/.test(normalized)
+  const normalized = text.replace(/单集渲染输入/g, "单段渲染输入").replace(/普通单集生成/g, "普通单段生成");
+  return /单段渲染输入/.test(normalized)
     ? normalized
-    : `单集渲染输入：\n${normalized}`;
+    : `单段渲染输入：\n${normalized}`;
 }
 
 function appendLockedSegmentPlan(value: string, lockedSegment: LockedSeasonSegment | undefined) {
