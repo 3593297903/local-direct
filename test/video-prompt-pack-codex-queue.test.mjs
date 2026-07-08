@@ -77,6 +77,21 @@ test("creates, claims, and completes a video prompt render pack job with indepen
             renderInputScript: "Render segment one with full single-segment quality.",
             duration: "15 seconds",
             shotCount: 4,
+            segmentContract: {
+              segmentIndex: 1,
+              title: "Segment 1",
+              sourceText: "Segment one source text.",
+              durationSeconds: 15,
+              shotCount: 4,
+              requiredEvents: ["source event one"],
+              forbiddenFutureEvents: ["future event two"],
+              characters: [],
+              locations: [],
+              props: [],
+              requiredShotBeats: [{ shotNumber: 1, timeRange: "0s-3s", beat: "source event one", visualFocus: "room" }],
+              safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+              contractHash: "sc_test",
+            },
           },
           {
             episodeIndex: 2,
@@ -102,6 +117,14 @@ test("creates, claims, and completes a video prompt render pack job with indepen
             duration: "15 seconds",
             shotCount: 4,
           },
+          {
+            episodeIndex: 5,
+            title: "Segment 5",
+            script: "Segment five source text.",
+            renderInputScript: "Render segment five with full single-segment quality.",
+            duration: "15 seconds",
+            shotCount: 4,
+          },
         ],
       },
       { rootDir },
@@ -109,11 +132,16 @@ test("creates, claims, and completes a video prompt render pack job with indepen
 
     assert.equal(job.status, "pending");
     assert.match(job.id, /^video-prompt-pack-job-/);
-    assert.equal(job.segments.length, 4);
+    assert.equal(job.segments.length, 5);
     assert.match(job.prompt, /Render Pack/);
+    assert.match(job.prompt, /SEGMENT CONTRACT/);
+    assert.match(job.prompt, /source event one/);
+    assert.match(job.prompt, /future event two/);
     assert.match(job.prompt, /episode-001\.json/);
-    assert.match(job.prompt, /episode-004\.json/);
+    assert.match(job.prompt, /episode-005\.json/);
     assert.match(job.prompt, /Do not use 同上/);
+    assert.doesNotMatch(job.prompt, /single-segment AnalysisResult/);
+    assert.doesNotMatch(job.prompt, /chat-log/);
 
     const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
     assert.ok(claimed);
@@ -127,13 +155,13 @@ test("creates, claims, and completes a video prompt render pack job with indepen
 
     const completed = await completeVideoPromptPackCodexJob(job.id, { rootDir });
     assert.equal(completed.status, "completed");
-    assert.equal(completed.result.segments.length, 4);
-    assert.deepEqual(completed.result.segments.map((segment) => segment.episodeIndex), [1, 2, 3, 4]);
+    assert.equal(completed.result.segments.length, 5);
+    assert.deepEqual(completed.result.segments.map((segment) => segment.episodeIndex), [1, 2, 3, 4, 5]);
     assert.equal(completed.result.segments[1].result.title, "Segment 2");
 
     const reloaded = await getVideoPromptPackCodexJob(job.id, { rootDir });
     assert.equal(reloaded.status, "completed");
-    assert.equal(reloaded.result.segments[3].result.workflow.fullVideoPrompt, "Segment 4 full video prompt");
+    assert.equal(reloaded.result.segments[4].result.workflow.fullVideoPrompt, "Segment 5 full video prompt");
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
@@ -236,6 +264,7 @@ test("video prompt render pack jobs default to strict UTF-8 mode", async () => {
     assert.match(job.prompt, /3-shot segments should usually have at least 1100/);
     assert.match(job.prompt, /Do not make thin shots/);
     assert.match(job.prompt, /videoPrompt must describe the full moving image/);
+    assert.match(job.prompt, /natural Chinese labels/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

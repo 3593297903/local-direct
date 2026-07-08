@@ -170,10 +170,132 @@ test("creates, claims, and completes a season planning job from per-episode inpu
     assert.equal(completed.result.episodes[0].episodeIndex, 1);
     assert.match(completed.result.episodes[1].input.renderInputScript, /单段渲染输入/);
     assert.doesNotMatch(completed.result.episodes[1].input.renderInputScript, /单集渲染输入/);
+    assert.ok(completed.result.seasonPlan.segmentContracts);
+    assert.equal(completed.result.episodes[0].input.segmentContract.segmentIndex, 1);
+    assert.match(completed.result.episodes[0].input.renderInputScript, /SEGMENT CONTRACT/);
 
     const reloaded = await getSeasonPackCodexJob(job.id, { rootDir });
     assert.equal(reloaded.status, "completed");
     assert.equal(reloaded.result.episodes[0].input.title, "第1段｜测试");
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("cleans undefined bridge placeholders from season planning input packs before validation", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createSeasonPackCodexJob(
+      {
+        script: "Segment 1: Detectives review evidence. Segment 2: The team follows the next lead.",
+        episodeCount: 2,
+        duration: "auto",
+      },
+      { rootDir },
+    );
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 2, generatedEpisodes: [1, 2] }, null, 2), "utf8");
+    writeLockedSeasonPlan(claimed, 2, {
+      titles: ["第1段｜证据复盘", "第2段｜继续追线"],
+      sourceTexts: ["Detectives review evidence.", "The team follows the next lead."],
+    });
+
+    const poisonedChain = [
+      {
+        segmentIndex: 1,
+        startState: "Evidence has been found.",
+        endState: "The team prepares to continue.",
+        carriedHooks: ["unknown suspect"],
+        resolvedHooks: [],
+        nextBridge: "下一段继续：undefined",
+      },
+      {
+        segmentIndex: 2,
+        startState: "The next lead begins.",
+        endState: "The team moves forward.",
+        carriedHooks: [],
+        resolvedHooks: ["unknown suspect"],
+        nextBridge: "下一段继续：null",
+      },
+    ];
+    const poisonedBlueprint = {
+      objective: "Preserve the case logic.",
+      continuityBridge: "下一段继续：undefined",
+    };
+
+    writeFileSync(
+      path.join(claimed.episodesDir, "episode-001.json"),
+      JSON.stringify(sampleEpisodeInput(1, {
+        episodeChain: poisonedChain,
+        blueprint: poisonedBlueprint,
+        renderInputScript: "",
+      }), null, 2),
+      "utf8",
+    );
+    writeFileSync(
+      path.join(claimed.episodesDir, "episode-002.json"),
+      JSON.stringify(sampleEpisodeInput(2, {
+        episodeChain: poisonedChain,
+        blueprint: poisonedBlueprint,
+        renderInputScript: "",
+      }), null, 2),
+      "utf8",
+    );
+
+    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    assert.equal(completed.status, "completed");
+    const serialized = JSON.stringify(completed.result);
+    assert.doesNotMatch(serialized, /\bundefined\b/i);
+    assert.doesNotMatch(serialized, /\bnull\b/i);
+    assert.match(completed.result.episodes[0].input.renderInputScript, /下一段继续/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("cleans contradictory renderer instructions from segment render scripts", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createSeasonPackCodexJob(
+      {
+        script: "Segment 1: Detectives show a photo to the crowd and confirm a witness.",
+        episodeCount: 1,
+        duration: "auto",
+      },
+      { rootDir },
+    );
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 1, generatedEpisodes: [1] }, null, 2), "utf8");
+    writeLockedSeasonPlan(claimed, 1, {
+      titles: ["第1段｜照片辨认"],
+      sourceTexts: ["侦查人员拿照片给群众辨认，一名群众确认照片上的人住在附近。"],
+      shotCounts: [4],
+    });
+
+    writeFileSync(
+      path.join(claimed.episodesDir, "episode-001.json"),
+      JSON.stringify(sampleEpisodeInput(1, {
+        renderInputScript: [
+          "单段渲染输入：第 1 段。",
+          "不要输出 workflow.fullVideoPrompt；不要输出本规划文件 pack。",
+          "Do not include workflow.fullVideoPrompt in the final output.",
+          "按单段质量生成完整 AnalysisResult。",
+        ].join("\n"),
+      }), null, 2),
+      "utf8",
+    );
+
+    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const renderInputScript = completed.result.episodes[0].input.renderInputScript;
+    assert.doesNotMatch(renderInputScript, /不要输出 workflow\.fullVideoPrompt/);
+    assert.doesNotMatch(renderInputScript, /Do not include workflow\.fullVideoPrompt/i);
+    assert.match(renderInputScript, /Renderer output requirement: final video prompt result JSON must include workflow\.fullVideoPrompt/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
@@ -279,7 +401,9 @@ test("packs season plan beats into locked segments before render input generatio
     assert.match(completed.result.episodes[0].input.renderInputScript, /LOCKED SEGMENT PLAN/);
     assert.match(completed.result.episodes[0].input.renderInputScript, /B001/);
     assert.match(completed.result.episodes[0].input.renderInputScript, /B003/);
-    assert.doesNotMatch(completed.result.episodes[0].input.renderInputScript, /B004/);
+    assert.doesNotMatch(completed.result.seasonPlan.lockedSegments[0].sourceText, /B004/);
+    assert.match(completed.result.episodes[0].input.renderInputScript, /forbiddenFutureEvents/);
+    assert.match(completed.result.episodes[0].input.segmentContract.forbiddenFutureEvents.join("\n"), /B004/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
@@ -334,6 +458,171 @@ test("prefers locked season segments over legacy generic segments", async () => 
     assert.equal(completed.result.episodes[0].input.title, "第1段｜锁定段");
     assert.equal(completed.result.episodes[0].input.duration, "8秒");
     assert.match(completed.result.episodes[0].input.renderInputScript, /B001/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("coerces episode input pack shot count to the locked segment contract when pack metadata disagrees", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createSeasonPackCodexJob(
+      {
+        script: "A source chapter is globally planned into one short segment with three visual beats.",
+        segmentCountMode: "auto",
+        duration: "auto",
+      },
+      { rootDir },
+    );
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(
+      claimed.manifestPath,
+      JSON.stringify({ segmentCountMode: "auto", episodeCount: 1, generatedEpisodes: [1], status: "completed" }, null, 2),
+      "utf8",
+    );
+    writeFileSync(
+      claimed.seasonPlanPath,
+      JSON.stringify(
+        {
+          storyBible: { title: "Shot Count Lock" },
+          lockedSegments: [
+            {
+              segmentIndex: 1,
+              title: "Locked three-shot segment",
+              beatStart: 1,
+              beatEnd: 1,
+              beatIds: ["B001"],
+              estimatedDurationSeconds: 9.8,
+              shotCount: 3,
+              sourceText: "B001: investigators form a new suspect focus",
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const staleInputContract = {
+      segmentIndex: 1,
+      title: "Locked three-shot segment",
+      sourceText: "B001: investigators form a new suspect focus",
+      durationSeconds: 9.8,
+      shotCount: 4,
+      requiredEvents: ["investigators form a new suspect focus"],
+      forbiddenFutureEvents: [],
+      characters: [],
+      locations: [],
+      props: [],
+      requiredShotBeats: [
+        { shotNumber: 1, timeRange: "0s-3s", beat: "review evidence", visualFocus: "evidence" },
+        { shotNumber: 2, timeRange: "3s-7s", beat: "name suspect focus", visualFocus: "suspect" },
+        { shotNumber: 3, timeRange: "7s-10s", beat: "hold on unresolved question", visualFocus: "question" },
+        { shotNumber: 4, timeRange: "10s-12s", beat: "stale extra shot", visualFocus: "extra" },
+      ],
+      safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+    };
+
+    writeFileSync(
+      path.join(claimed.episodesDir, "episode-001.json"),
+      JSON.stringify(sampleEpisodeInput(1, {
+        shotCount: 4,
+        renderInputScript: "",
+        segmentContract: staleInputContract,
+      }), null, 2),
+      "utf8",
+    );
+
+    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const input = completed.result.episodes[0].input;
+    assert.equal(input.shotCount, 3);
+    assert.equal(input.segmentContract.shotCount, 3);
+    assert.match(input.renderInputScript, /Shot count lock: 3/);
+    assert.doesNotMatch(input.renderInputScript, /Shot count lock: 4/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("coerces stale segment contract shot count to the locked segment plan when contract metadata disagrees", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createSeasonPackCodexJob(
+      {
+        script: "A source chapter is globally planned into one locked segment with four visual beats.",
+        segmentCountMode: "auto",
+        duration: "auto",
+      },
+      { rootDir },
+    );
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest" });
+    assert.ok(claimed);
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(
+      claimed.manifestPath,
+      JSON.stringify({ segmentCountMode: "auto", episodeCount: 1, generatedEpisodes: [1], status: "completed" }, null, 2),
+      "utf8",
+    );
+    writeFileSync(
+      claimed.seasonPlanPath,
+      JSON.stringify(
+        {
+          storyBible: { title: "Contract Lock" },
+          lockedSegments: [
+            {
+              segmentIndex: 1,
+              title: "Locked four-shot segment",
+              beatStart: 1,
+              beatEnd: 1,
+              beatIds: ["B001"],
+              estimatedDurationSeconds: 12,
+              shotCount: 4,
+              sourceText: "B001: investigators review evidence and form a new suspect focus",
+            },
+          ],
+          segmentContracts: [
+            {
+              segmentIndex: 1,
+              title: "Locked four-shot segment",
+              sourceText: "B001: investigators review evidence and form a new suspect focus",
+              durationSeconds: 12,
+              shotCount: 3,
+              requiredEvents: ["investigators review evidence", "form a new suspect focus"],
+              forbiddenFutureEvents: [],
+              characters: [],
+              locations: [],
+              props: [],
+              requiredShotBeats: [
+                { shotNumber: 1, timeRange: "0s-3s", beat: "review evidence", visualFocus: "evidence" },
+                { shotNumber: 2, timeRange: "3s-7s", beat: "name suspect focus", visualFocus: "suspect" },
+                { shotNumber: 3, timeRange: "7s-10s", beat: "hold on unresolved question", visualFocus: "question" },
+              ],
+              safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    writeFileSync(
+      path.join(claimed.episodesDir, "episode-001.json"),
+      JSON.stringify(sampleEpisodeInput(1, { shotCount: 4, renderInputScript: "" }), null, 2),
+      "utf8",
+    );
+
+    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const input = completed.result.episodes[0].input;
+    assert.equal(input.shotCount, 4);
+    assert.equal(input.segmentContract.shotCount, 4);
+    assert.equal(input.segmentContract.requiredShotBeats.length, 4);
+    assert.match(input.renderInputScript, /Shot count lock: 4/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
@@ -607,7 +896,7 @@ test("rejects compact one-shot season input packs when no explicit source shot l
 
     await assert.rejects(
       () => completeSeasonPackCodexJob(job.id, { rootDir }),
-      /too few planned shots: 1 \/ 4/,
+      /too few planned shots: 1 \/ 3/,
     );
   } finally {
     rmSync(rootDir, { recursive: true, force: true });

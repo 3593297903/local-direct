@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { createVideoPromptPackCodexJob } from "@/lib/video-prompt-pack-codex-queue";
 import { CODEX_QUOTA_EXHAUSTED_CODE, assertCodexRuntimeAvailable } from "@/lib/codex-runtime-state";
+import type { SegmentContract } from "@/lib/batch-segment-contract";
 
 export const runtime = "nodejs";
 
@@ -12,12 +13,16 @@ const SegmentSchema = z.object({
   renderInputScript: z.string().min(5).max(50_000),
   duration: z.string().min(1),
   shotCount: z.number().int().min(1).max(12).optional(),
+  segmentContract: z.custom<SegmentContract>(
+    (value) => value === undefined || (Boolean(value) && typeof value === "object" && !Array.isArray(value)),
+    "segmentContract must be an object",
+  ).optional(),
 });
 
 const RequestSchema = z.object({
   projectId: z.string().uuid().optional(),
   mode: z.enum(["standard", "strictUtf8"]).optional(),
-  segments: z.array(SegmentSchema).min(1).max(4),
+  segments: z.array(SegmentSchema).min(1).max(5),
 });
 
 export async function POST(request: NextRequest) {

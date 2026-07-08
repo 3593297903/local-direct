@@ -85,7 +85,7 @@ function buildCodexPrompt(task) {
     "You are running Local Director season planning from a local Codex CLI worker.",
     "The task prompt already contains the full source, output paths, and file-pack contract.",
     "This task must create Story Bible, Episode Chain, and Episode Input Packs only.",
-    "Do not create final AnalysisResult JSON here.",
+    "Do not create final video prompt result JSON here.",
     "Follow it exactly. Do not call network providers. Do not open a browser. Do not ask for user input.",
     "After writing and validating the file pack, reply with exactly one line: DONE.",
     "",

@@ -1,6 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  buildSegmentContractHash,
+  normalizeSegmentContract,
+  segmentContractToRenderBlock,
+  validateSegmentContract,
+  type SegmentContract,
+} from "./batch-segment-contract";
+import { findInternalPromptToken, sanitizeInternalPromptTokens } from "./internal-prompt-token-sanitizer";
 
 export type SeasonPackCodexJobStatus = "pending" | "running" | "completed" | "failed";
 export type SeasonPackSegmentCountMode = "fixed" | "auto";
@@ -41,6 +49,7 @@ export type SeasonPackEpisodeInput = {
   };
   targetDurationSeconds?: number;
   lockedSegmentPlan?: LockedSeasonSegment;
+  segmentContract?: SegmentContract;
 };
 
 export type SeasonPackBeat = {
@@ -125,6 +134,7 @@ type OutputJsonContext = {
   style: string;
   sourceContext: SeasonSourceContext;
   lockedSegment?: LockedSeasonSegment;
+  segmentContract?: SegmentContract;
 };
 
 const TASK_ROOT = ".tmp-season-pack-codex";
@@ -181,8 +191,8 @@ export async function createSeasonPackCodexJob(
   const manifestPath = path.join(packDir, "manifest.json");
   const seasonPlanPath = path.join(packDir, "season-plan.json");
   const duration = normalizeRequestedDuration(input.duration);
-  const contentType = input.contentType || "short drama / general";
-  const style = input.style || "auto match script tone";
+  const contentType = input.contentType || "短剧 / 通用";
+  const style = input.style || "自动匹配文案气质";
   const projectMemory = input.projectMemory || "";
   const segmentCountMode: SeasonPackSegmentCountMode = input.segmentCountMode === "auto" ? "auto" : "fixed";
   const requestedEpisodeCount = segmentCountMode === "auto" ? null : input.episodeCount || 1;
@@ -325,8 +335,8 @@ function buildSeasonPackCodexPrompt(
   return [
     "You are running Local Director season planning from a local Codex CLI worker.",
     "Use one long-context pass to understand the complete source script and produce a planning file pack.",
-    "Important: do NOT generate final video prompts here. Do NOT generate AnalysisResult JSON here.",
-    "This task only creates Story Bible, Segment Chain, and per-segment input packs for the normal single-segment renderer.",
+    "Important: do NOT generate final video prompts here. Do NOT generate final video prompt result JSON here.",
+    "This task only creates Story Bible, Segment Chain, and per-segment input packs for the normal Chinese single segment renderer.",
     "Do not call network providers. Do not open a browser. Do not ask the user for follow-up input.",
     "",
     segmentCountInstruction,
@@ -334,7 +344,7 @@ function buildSeasonPackCodexPrompt(
     "Each file must contain one strict Segment Input Pack JSON object, not a final prompt result.",
     "For compatibility this object is also called an Episode Input Pack in older code, but user-facing text must say segment / 段.",
     "Every Segment Input Pack must include: episodeIndex, title, sourceText, duration, contentType, style, storyBible, episodeChain, blueprint, shotCount, and renderInputScript.",
-    "Do not include workflow.fullVideoPrompt. Do not include storyboard. The downstream single-segment renderer will create those.",
+    "Do not include workflow.fullVideoPrompt. Do not include storyboard. The downstream single segment renderer will create those.",
     "",
     "Write these files as UTF-8 with Node.js fs.writeFileSync. Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
     `Pack directory: ${paths.packDir}`,
@@ -344,7 +354,7 @@ function buildSeasonPackCodexPrompt(
     "",
     "Required file pack:",
     "- manifest.json with episodeCount, generatedEpisodes, and status.",
-    "- season-plan.json with storyBible, episodeChain, characters, scenes, props, visualStyle, cameraLanguage, lockedRules, beats, and one plan item per segment.",
+    "- season-plan.json with storyBible, episodeChain, characters, scenes, props, visualStyle, cameraLanguage, lockedRules, beats, lockedSegments, and segmentContracts.",
     requiredEpisodeFilesInstruction,
     "",
     "Planning rules:",
@@ -354,6 +364,8 @@ function buildSeasonPackCodexPrompt(
     "- Do not let the downstream render worker decide whether a shot should move to the next segment. All moving/splitting belongs to this planning stage.",
     "- If one beat is longer than 15 seconds, split it into smaller beat items before writing season-plan.json.",
     "- Include a segments or lockedSegments array when possible: segmentIndex, title, beatStart, beatEnd, beatIds, estimatedDurationSeconds, shotCount, and sourceText.",
+    "- Include segmentContracts: one contract per locked segment with segmentIndex, title, sourceText, durationSeconds, shotCount, requiredEvents, forbiddenFutureEvents, characters, locations, props, requiredShotBeats, and safetyPolicy.",
+    "- SegmentContract is the hard render contract. requiredEvents must be covered; forbiddenFutureEvents must not appear in the final generated segment.",
     "- Every segment must be <=15 seconds. Ideal segment duration is 9-14.8 seconds. Segments under 7 seconds should be merged with a neighbor unless they are a deliberate hook.",
     "- Build one Segment Chain covering every requested segment: startState, endState, carriedHooks, resolvedHooks, nextBridge, timelinePosition.",
     "- Keep all segments consistent with the same Story Bible and ID references.",
@@ -371,8 +383,8 @@ function buildSeasonPackCodexPrompt(
     "- The segment title should be 第N段｜source segment title when a segment title exists.",
     "- The segment duration should match the source segment end time when explicit shot time ranges exist, otherwise follow the requested duration.",
     "- contentType and style must be concrete Chinese text inferred from the full source and project memory; never leave them blank.",
-    "- renderInputScript is the exact script that will be sent to the normal single-segment renderer. It must be compact but complete.",
-    "- renderInputScript must include: Story Bible summary, Segment Chain item, Segment Blueprint, original sourceText, shotCount lock, style lock, continuity rules, and a clear instruction to generate a full Local Director single-segment AnalysisResult.",
+    "- renderInputScript is the exact script that will be sent to the normal single segment renderer. It must be compact but complete.",
+    "- renderInputScript must include: Story Bible summary, Segment Chain item, Segment Blueprint, SegmentContract summary, original sourceText, shotCount lock, style lock, continuity rules, and a clear instruction to generate a full Local Director Chinese single segment video prompt result.",
     "- renderInputScript must say 第 N 段, 本段, and 单段渲染输入. It must not say 第 N 集, 本集, or 单集.",
     "- renderInputScript must not contain final workflow.fullVideoPrompt or final storyboard JSON.",
     "",
@@ -482,11 +494,12 @@ async function readSeasonPackResult(job: SeasonPackCodexJob): Promise<SeasonPack
   const episodes: SeasonPackEpisodeResult[] = [];
   const sourceContext = parseSeasonSourceContext(job.script);
   const manifest = await readOptionalJson(job.manifestPath);
-  const rawSeasonPlan = await readOptionalJson(job.seasonPlanPath);
+  const rawSeasonPlan = sanitizeSeasonPlanningPlaceholders(await readOptionalJson(job.seasonPlanPath)) as Record<string, unknown> | null;
   const lockedSeasonPlan = buildLockedSeasonPlan(rawSeasonPlan);
   const episodeCount = resolveSeasonPackEpisodeCount(job, manifest, lockedSeasonPlan.segments.length);
   validateLockedSeasonPlanCount(lockedSeasonPlan.segments, episodeCount);
   const lockedSegmentsByIndex = new Map(lockedSeasonPlan.segments.map((segment) => [segment.segmentIndex, segment]));
+  const segmentContractsByIndex = new Map(lockedSeasonPlan.segmentContracts.map((contract) => [contract.segmentIndex, contract]));
   for (let episodeIndex = 1; episodeIndex <= episodeCount; episodeIndex += 1) {
     const fileName = episodeFileName(episodeIndex);
     const filePath = path.join(job.episodesDir, fileName);
@@ -499,6 +512,7 @@ async function readSeasonPackResult(job: SeasonPackCodexJob): Promise<SeasonPack
       style: job.style,
       sourceContext,
       lockedSegment: lockedSegmentsByIndex.get(episodeIndex),
+      segmentContract: segmentContractsByIndex.get(episodeIndex),
     });
     episodes.push({ episodeIndex, fileName, input });
   }
@@ -517,8 +531,8 @@ async function readOutputJson(filePath: string, context: OutputJsonContext | str
       episodeIndex: 1,
       episodeCount: 1,
       duration: "auto",
-      contentType: "short drama / general",
-      style: "auto match script tone",
+      contentType: "短剧 / 通用",
+      style: "自动匹配文案气质",
       sourceContext: parseSeasonSourceContext(context),
     }
     : context;
@@ -527,7 +541,9 @@ async function readOutputJson(filePath: string, context: OutputJsonContext | str
     if (!fileStat.isFile() || fileStat.size <= 0) {
       throw new SeasonPackCodexQueueError(`Season pack output file is empty: ${filePath}`);
     }
-    const result = JSON.parse(stripJsonBom(await readFile(filePath, "utf8"))) as Record<string, unknown>;
+    const result = sanitizeSeasonPlanningPlaceholders(
+      JSON.parse(stripJsonBom(await readFile(filePath, "utf8"))),
+    ) as Record<string, unknown>;
     const input = normalizeEpisodeInputPack(result, outputContext);
     validateEpisodeInputPack(input, result, outputContext);
     validateEncodingQuality(input as unknown as Record<string, unknown>, outputContext.sourceText);
@@ -564,7 +580,42 @@ async function isValidSeasonPack(job: SeasonPackCodexJob) {
 function buildLockedSeasonPlan(seasonPlan: Record<string, unknown> | null) {
   const beats = normalizeSeasonPlanBeats(seasonPlan);
   const segments = beats.length ? packBeatsIntoLockedSegments(beats) : normalizeSeasonPlanSegments(seasonPlan);
-  return { beats, segments };
+  const segmentContracts = normalizeSeasonPlanSegmentContracts(seasonPlan, segments);
+  return { beats, segments, segmentContracts };
+}
+
+function normalizeSeasonPlanSegmentContracts(
+  seasonPlan: Record<string, unknown> | null,
+  segments: LockedSeasonSegment[],
+) {
+  const rawContracts = Array.isArray(seasonPlan?.segmentContracts)
+    ? seasonPlan.segmentContracts
+    : Array.isArray(seasonPlan?.contracts)
+      ? seasonPlan.contracts
+      : [];
+  const rawByIndex = new Map<number, unknown>();
+  rawContracts.forEach((raw, index) => {
+    if (!raw || typeof raw !== "object") return;
+    const record = raw as Record<string, unknown>;
+    rawByIndex.set(normalizePositiveInteger(record.segmentIndex) || index + 1, record);
+  });
+
+  return segments.map((segment, index) => {
+    const futureEvents = segments
+      .slice(index + 1)
+      .flatMap((future) => future.sourceText.split(/\n|[;；。]/).map((item) => item.trim()).filter(Boolean))
+      .slice(0, 8);
+    const contract = normalizeSegmentContract(rawByIndex.get(segment.segmentIndex), {
+      segmentIndex: segment.segmentIndex,
+      fallbackTitle: segment.title || `Segment ${segment.segmentIndex}`,
+      fallbackSourceText: segment.sourceText,
+      fallbackDurationSeconds: segment.estimatedDurationSeconds,
+      fallbackShotCount: segment.shotCount,
+      forbiddenFutureEvents: futureEvents,
+    });
+    validateSegmentContract(contract, segment.segmentIndex);
+    return contract;
+  });
 }
 
 function normalizeSeasonPlanBeats(seasonPlan: Record<string, unknown> | null): SeasonPackBeat[] {
@@ -704,13 +755,14 @@ function normalizeSeasonPlanSegments(seasonPlan: Record<string, unknown> | null)
 
 function seasonPlanWithLockedSegments(
   seasonPlan: Record<string, unknown> | null,
-  lockedSeasonPlan: { beats: SeasonPackBeat[]; segments: LockedSeasonSegment[] },
+  lockedSeasonPlan: { beats: SeasonPackBeat[]; segments: LockedSeasonSegment[]; segmentContracts: SegmentContract[] },
 ) {
   if (!lockedSeasonPlan.segments.length) return seasonPlan;
   return {
     ...(seasonPlan || {}),
     beats: lockedSeasonPlan.beats.length ? lockedSeasonPlan.beats : seasonPlan?.beats,
     lockedSegments: lockedSeasonPlan.segments,
+    segmentContracts: lockedSeasonPlan.segmentContracts,
     segmentPlanMode: "beat_locked",
     segmentDurationLimitSeconds: 15,
   };
@@ -817,6 +869,13 @@ function validateEncodingQuality(result: Record<string, unknown>, sourceText: st
 function normalizeEpisodeInputPack(result: Record<string, unknown>, context: OutputJsonContext): SeasonPackEpisodeInput {
   const sourceSegment = context.sourceContext.segments.get(context.episodeIndex);
   const lockedSegment = context.lockedSegment;
+  const normalizedSegmentContract = normalizeSegmentContract(context.segmentContract || result.segmentContract, {
+    segmentIndex: context.episodeIndex,
+    fallbackTitle: lockedSegment?.title || cleanString(result.title) || `Segment ${context.episodeIndex}`,
+    fallbackSourceText: lockedSegment?.sourceText || cleanString(result.sourceText) || context.sourceText,
+    fallbackDurationSeconds: lockedSegment?.estimatedDurationSeconds || parseDurationSeconds(context.duration) || 15,
+    fallbackShotCount: lockedSegment?.shotCount || normalizeShotCount(result.shotCount) || 4,
+  });
   const title = normalizeSegmentTitle(lockedSegment?.title || "", context.episodeIndex)
     || normalizeSegmentTitle(cleanString(result.title), context.episodeIndex)
     || (sourceSegment ? `第${context.episodeIndex}段｜${sourceSegment.title}` : "")
@@ -826,7 +885,7 @@ function normalizeEpisodeInputPack(result: Record<string, unknown>, context: Out
     || sourceSegment?.duration
     || normalizeDurationLabel(context.duration)
     || "15秒";
-  const contentType = cleanString(result.contentType)
+  const contentType = cleanContentTypeLabel(result.contentType)
     || inferContentTypeFromSource(context.sourceText)
     || normalizeLooseLabel(context.contentType)
     || "短剧 / 通用";
@@ -839,11 +898,13 @@ function normalizeEpisodeInputPack(result: Record<string, unknown>, context: Out
     || extractSeasonSourceSegmentText(context.sourceText, context.episodeIndex)
     || context.sourceText);
   const shotCount = lockedSegment?.shotCount
+    || normalizedSegmentContract.shotCount
     || normalizeShotCount(result.shotCount)
     || sourceSegment?.shotCount
     || minimumShotCountForDuration(duration)
     || minimumShotCountForDuration(context.duration)
     || 4;
+  const segmentContract = reconcileSegmentContractShotCount(normalizedSegmentContract, shotCount);
   const storyBible = isMeaningfulValue(result.storyBible) ? result.storyBible : {};
   const episodeChain = isMeaningfulValue(result.episodeChain) ? result.episodeChain : {};
   const blueprint = isMeaningfulValue(result.blueprint) ? result.blueprint : {};
@@ -869,12 +930,52 @@ function normalizeEpisodeInputPack(result: Record<string, unknown>, context: Out
       : undefined,
     targetDurationSeconds: lockedSegment?.estimatedDurationSeconds,
     lockedSegmentPlan: lockedSegment,
+    segmentContract,
   };
-  partial.renderInputScript = appendLockedSegmentPlan(
-    normalizeRenderInputScript(cleanSourceEpisodeLabels(cleanString(result.renderInputScript) || buildEpisodeRenderInputScript(partial))),
-    lockedSegment,
+  partial.renderInputScript = appendSegmentContractPlan(
+    appendLockedSegmentPlan(
+      normalizeRenderInputScript(cleanSourceEpisodeLabels(cleanString(result.renderInputScript) || buildEpisodeRenderInputScript(partial))),
+      lockedSegment,
+    ),
+    segmentContract,
   );
   return partial;
+}
+
+function reconcileSegmentContractShotCount(contract: SegmentContract, shotCount: number): SegmentContract {
+  const targetShotCount = normalizeShotCount(shotCount) || contract.shotCount;
+  if (contract.shotCount === targetShotCount && contract.requiredShotBeats.length <= targetShotCount) {
+    return contract;
+  }
+
+  const requiredShotBeats = contract.requiredShotBeats
+    .slice(0, targetShotCount)
+    .map((beat, index) => ({
+      ...beat,
+      shotNumber: index + 1,
+    }));
+
+  while (requiredShotBeats.length < targetShotCount) {
+    const shotNumber = requiredShotBeats.length + 1;
+    requiredShotBeats.push({
+      shotNumber,
+      timeRange: "",
+      beat: contract.requiredEvents[shotNumber - 1] || contract.requiredEvents[0] || contract.sourceText,
+      visualFocus: contract.title,
+    });
+  }
+
+  const { contractHash: _ignored, ...contractWithoutHash } = contract;
+  const updatedContract = {
+    ...contractWithoutHash,
+    shotCount: targetShotCount,
+    requiredShotBeats,
+  };
+
+  return {
+    ...updatedContract,
+    contractHash: buildSegmentContractHash(updatedContract),
+  };
 }
 
 function validateEpisodeInputPack(
@@ -913,6 +1014,18 @@ function validateEpisodeInputPack(
       `Season pack episode ${context.episodeIndex} shotCount ${input.shotCount} does not match locked SegmentPlan shotCount ${context.lockedSegment.shotCount}`,
     );
   }
+  if (input.segmentContract) {
+    try {
+      validateSegmentContract(input.segmentContract, context.episodeIndex);
+    } catch (error) {
+      throw new SeasonPackCodexQueueError(error instanceof Error ? error.message : "Season pack episode input pack has an invalid SegmentContract");
+    }
+    if (input.segmentContract.shotCount !== input.shotCount) {
+      throw new SeasonPackCodexQueueError(
+        `Season pack episode ${context.episodeIndex} shotCount ${input.shotCount} does not match SegmentContract shotCount ${input.segmentContract.shotCount}`,
+      );
+    }
+  }
   const sourceSegment = context.sourceContext.segments.get(context.episodeIndex);
   const maximumShotCount = maximumShotCountForDuration(input.duration || context.duration);
   if (maximumShotCount > 0 && input.shotCount > maximumShotCount) {
@@ -925,7 +1038,7 @@ function validateEpisodeInputPack(
       `Season pack episode ${context.episodeIndex} shotCount ${input.shotCount} does not match source segment shot count ${sourceSegment.shotCount}`,
     );
   }
-  const minimumShotCount = sourceSegment?.shotCount ? 0 : minimumShotCountForDuration(input.duration || context.duration);
+  const minimumShotCount = sourceSegment?.shotCount ? 0 : minimumInputPackShotCount(input, context);
   if (minimumShotCount > 0 && input.shotCount < minimumShotCount) {
     throw new SeasonPackCodexQueueError(
       `Season pack episode ${context.episodeIndex} has too few planned shots: ${input.shotCount} / ${minimumShotCount}`,
@@ -940,7 +1053,7 @@ function buildEpisodeRenderInputScript(input: SeasonPackEpisodeInput) {
   return [
     `你正在为 Local Director 生成第 ${input.episodeIndex} 段的视频提示词。`,
     "",
-    "单段渲染输入：必须按普通单段生成的质量和结构输出完整 AnalysisResult。",
+    "单段渲染输入：必须按普通单段生成的质量和结构输出完整视频提示词结果 JSON。",
     "不要输出摘要版，不要压缩镜头，不要省略镜头字段。",
     "最终标题、核心主题和完整视频提示词都必须使用“段”，不要写“第N集”或“本集”。",
     "",
@@ -1010,6 +1123,15 @@ function maximumShotCountForDuration(value: unknown) {
   if (seconds <= 20) return 5;
   if (seconds <= 60) return 8;
   return 0;
+}
+
+function minimumInputPackShotCount(input: SeasonPackEpisodeInput, context: OutputJsonContext) {
+  const minimum = minimumShotCountForDuration(input.duration || context.duration);
+  if (!minimum) return 0;
+  if (context.lockedSegment || input.segmentContract) {
+    return Math.min(minimum, 3);
+  }
+  return minimum;
 }
 
 function validateAnalysisResultShape(result: Record<string, unknown>, context?: OutputJsonContext) {
@@ -1129,6 +1251,45 @@ function hasPoisonedGeneratedText(value: unknown) {
   return /\b(?:undefined|null)\b/i.test(value);
 }
 
+function sanitizeSeasonPlanningPlaceholders(value: unknown, pathParts: string[] = []): unknown {
+  if (typeof value === "string") {
+    return sanitizePlanningString(value, pathParts[pathParts.length - 1] || "");
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => sanitizeSeasonPlanningPlaceholders(item, [...pathParts, String(index)]));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        sanitizeSeasonPlanningPlaceholders(item, [...pathParts, key]),
+      ]),
+    );
+  }
+  return value;
+}
+
+function sanitizePlanningString(value: string, key: string) {
+  const isBridgeKey = /(?:nextBridge|continuityBridge)$/i.test(key);
+  const containsBridgeLabel = /(?:nextBridge|continuityBridge)\s*[:=]/i.test(value);
+  const containsChineseBridge = /下一段继续\s*[：:]/.test(value);
+  if (!isBridgeKey && !containsBridgeLabel && !containsChineseBridge) return sanitizeInternalPromptTokens(value);
+
+  const replacement = "待下一段承接";
+  let sanitized = value
+    .replace(/((?:nextBridge|continuityBridge)\s*[:=]\s*["']?[^"'\n;；。]*?)\b(?:undefined|null)\b/gi, `$1${replacement}`)
+    .replace(/(下一段继续\s*[：:]\s*)\b(?:undefined|null)\b/gi, `$1${replacement}`);
+
+  if (isBridgeKey && hasPoisonedGeneratedText(sanitized)) {
+    sanitized = sanitized.replace(/\b(?:undefined|null)\b/gi, replacement);
+  }
+
+  return sanitizeInternalPromptTokens(sanitized
+    .replace(/[ \t]+([。；;,.，])/g, "$1")
+    .replace(/([：:=])\s*([。；;,.，])?\s*$/g, `$1${replacement}`)
+    .trim());
+}
+
 function countOccurrences(value: string, pattern: string) {
   if (!pattern) return 0;
   return value.split(pattern).length - 1;
@@ -1152,7 +1313,7 @@ function normalizeAnalysisResultShape(result: Record<string, unknown>, context?:
     || sourceSegment?.duration
     || normalizeDurationLabel(context?.duration)
     || "15秒";
-  const contentType = cleanString(result.contentType)
+  const contentType = cleanContentTypeLabel(result.contentType)
     || inferContentTypeFromSource(context?.sourceText || "")
     || normalizeLooseLabel(context?.contentType)
     || "短剧 / 通用";
@@ -1209,7 +1370,7 @@ function normalizeAnalysisResultShape(result: Record<string, unknown>, context?:
 function buildFullVideoPromptFromResult(result: Record<string, unknown>, workflow: Record<string, unknown>) {
   const title = cleanString(result.title) || "未命名视频提示词";
   const duration = cleanString(result.duration) || "15秒";
-  const contentType = cleanString(result.contentType) || "短剧 / 通用";
+  const contentType = cleanContentTypeLabel(result.contentType) || "短剧 / 通用";
   const style = cleanString(result.style) || "电影级写实";
   const coreTheme = cleanString(workflow.coreTheme)
     || `${title}：围绕原文案核心事件，保持人物关系、线索顺序和情绪推进，生成一段可直接执行的 AI 视频提示词。`;
@@ -1343,12 +1504,24 @@ function matchSourceShotLine(line: string) {
 function cleanString(value: unknown) {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
-  return trimmed && trimmed !== "undefined" && trimmed !== "null" && !/\bundefined\b/.test(trimmed) ? trimmed : "";
+  return trimmed && trimmed !== "undefined" && trimmed !== "null" && !/\bundefined\b/.test(trimmed)
+    ? sanitizeInternalPromptTokens(trimmed)
+    : "";
+}
+
+function cleanContentTypeLabel(value: unknown) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw || findInternalPromptToken(raw)) return "";
+  const text = cleanString(raw);
+  if (/^(?:单段视频提示词结果|视频提示词结果|视频段)$/.test(text)) return "";
+  return text;
 }
 
 function normalizeLooseLabel(value: unknown) {
+  if (findInternalPromptToken(value)) return "";
   const text = cleanString(value);
   if (!text || /^(auto|auto match script tone|short drama \/ general)$/i.test(text)) return "";
+  if (/^(?:单段视频提示词结果|视频提示词结果|视频段)$/.test(text)) return "";
   return text;
 }
 
@@ -1468,10 +1641,30 @@ function cleanSourceEpisodeLabels(value: string) {
 function normalizeRenderInputScript(value: string) {
   const text = cleanString(value);
   if (!text) return "";
-  const normalized = text.replace(/单集渲染输入/g, "单段渲染输入").replace(/普通单集生成/g, "普通单段生成");
-  return /单段渲染输入/.test(normalized)
+  const normalized = enforceSingleSegmentRendererOutputContract(
+    text.replace(/单集渲染输入/g, "单段渲染输入").replace(/普通单集生成/g, "普通单段生成"),
+  );
+  const prefixed = /单段渲染输入/.test(normalized)
     ? normalized
     : `单段渲染输入：\n${normalized}`;
+  return prefixed.includes("Renderer output requirement:")
+    ? prefixed
+    : `${prefixed}\nRenderer output requirement: final video prompt result JSON must include workflow.fullVideoPrompt, workflow.concisePrompt, and storyboard.`;
+}
+
+function enforceSingleSegmentRendererOutputContract(value: string) {
+  return value
+    .split(/\r?\n/)
+    .filter((line) => !isContradictoryRendererOutputLine(line))
+    .join("\n")
+    .replace(/(?:不要|不得|禁止)[^\n。；;]*workflow\.fullVideoPrompt[^\n。；;]*[。；;]?/gi, "")
+    .replace(/\b(?:do not|don't|must not)\s+(?:include|output|contain)[^\n.]*workflow\.fullVideoPrompt[^\n.]*\.?/gi, "")
+    .trim();
+}
+
+function isContradictoryRendererOutputLine(line: string) {
+  return /workflow\.fullVideoPrompt/i.test(line)
+    && /\b(?:do not|don't|must not|not contain|not include|not output)\b|(?:不要|不得|禁止)/i.test(line);
 }
 
 function appendLockedSegmentPlan(value: string, lockedSegment: LockedSeasonSegment | undefined) {
@@ -1490,6 +1683,12 @@ function appendLockedSegmentPlan(value: string, lockedSegment: LockedSeasonSegme
     "Rendering rule: use only this locked beat range for the current segment. Do not move content into another segment during render. If the segment cannot fit within the locked duration, fail quality validation instead of inventing a new split.",
   ].join("\n");
   return value.includes("LOCKED SEGMENT PLAN") ? value : `${value}\n${lockedPlanText}`;
+}
+
+function appendSegmentContractPlan(value: string, segmentContract: SegmentContract | undefined) {
+  if (!segmentContract) return value;
+  if (value.includes("SEGMENT CONTRACT")) return value;
+  return `${value}\n\n${segmentContractToRenderBlock(segmentContract)}`;
 }
 
 function formatSeconds(value: number) {

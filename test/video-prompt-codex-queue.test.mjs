@@ -90,7 +90,8 @@ test("creates, claims, and completes a local Codex video prompt job", async () =
     assert.equal(job.status, "pending");
     assert.match(job.id, /^video-prompt-job-/);
     assert.match(job.prompt, /strict JSON/);
-    assert.match(job.prompt, /AnalysisResult/);
+    assert.match(job.prompt, /complete video prompt result/);
+    assert.doesNotMatch(job.prompt, /AnalysisResult/);
     assert.match(job.prompt, /optimizedScript/);
     assert.match(job.prompt, /workflow\.fullVideoPrompt/);
     assert.match(job.prompt, /storyboard/);
@@ -122,6 +123,35 @@ test("creates, claims, and completes a local Codex video prompt job", async () =
     const reloaded = await getVideoPromptCodexJob(job.id, { rootDir });
     assert.equal(reloaded.status, "completed");
     assert.equal(reloaded.result.workflow.fullVideoPrompt, "未来厨房里，早餐机自动制作吐司和咖啡。");
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("video prompt Codex jobs sanitize internal engineering tokens before building prompts", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptCodexJob(
+      {
+        script: "Open chat-log inside forensic_room and write a single-segment AnalysisResult.",
+        contentType: "single-segment AnalysisResult",
+        style: "case-room digital-records",
+        projectMemory: "video_prompt_segment should not leak to users.",
+        duration: "auto",
+      },
+      { rootDir },
+    );
+
+    assert.doesNotMatch(job.prompt, /single-segment AnalysisResult/);
+    assert.doesNotMatch(job.prompt, /chat-log/);
+    assert.doesNotMatch(job.prompt, /forensic_room/);
+    assert.doesNotMatch(job.prompt, /case-room/);
+    assert.doesNotMatch(job.prompt, /digital-records/);
+    assert.doesNotMatch(job.prompt, /video_prompt_segment/);
+    assert.match(job.prompt, /聊天记录证据/);
+    assert.match(job.prompt, /法医室/);
+    assert.match(job.prompt, /专案会议室/);
+    assert.match(job.prompt, /数字证据/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

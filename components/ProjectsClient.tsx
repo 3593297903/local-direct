@@ -7,6 +7,7 @@ import {
   summarizeSegmentPromptQuality,
   type SegmentPromptQualityIssue,
 } from "@/lib/segment-prompt-quality";
+import { sanitizeInternalPromptTokens, sanitizeInternalPromptTokensDeep } from "@/lib/internal-prompt-token-sanitizer";
 import {
   BookOpen,
   Boxes,
@@ -328,7 +329,7 @@ function parseJsonOrThrow(value: string) {
 }
 
 function buildPromptText(version: ProjectVersion) {
-  if (version.fullVideoPrompt) return version.fullVideoPrompt;
+  if (version.fullVideoPrompt) return sanitizeInternalPromptTokens(version.fullVideoPrompt);
 
   const shots = version.shots
     .map((shot) =>
@@ -344,7 +345,7 @@ function buildPromptText(version: ProjectVersion) {
     )
     .join("\n\n");
 
-  return [
+  return sanitizeInternalPromptTokens([
     `标题：${version.title}`,
     `时长：${version.duration || "-"}`,
     `风格：${version.style || "-"}`,
@@ -353,12 +354,13 @@ function buildPromptText(version: ProjectVersion) {
     `镜头表：\n${shots}`,
   ]
     .filter(Boolean)
-    .join("\n\n");
+    .join("\n\n"));
 }
 
 function buildAnalysisResultPromptText(result: AnalysisResult) {
-  const workflow = result.workflow;
-  const shotLines = result.storyboard
+  const cleanResult = sanitizeInternalPromptTokensDeep(result);
+  const workflow = cleanResult.workflow;
+  const shotLines = cleanResult.storyboard
     .map((shot) =>
       [
         `${shot.shotNumber}. ${shot.scene || "镜头"} ${shot.timeRange || ""}`.trim(),
@@ -375,12 +377,12 @@ function buildAnalysisResultPromptText(result: AnalysisResult) {
     )
     .join("\n\n");
 
-  return [
-    `核心主题\n\n${workflow?.coreTheme || result.title}`,
-    `完整视频提示词\n\n${workflow?.fullVideoPrompt || result.optimizedScript}`,
+  return sanitizeInternalPromptTokens([
+    `核心主题\n\n${workflow?.coreTheme || cleanResult.title}`,
+    `完整视频提示词\n\n${workflow?.fullVideoPrompt || cleanResult.optimizedScript}`,
     workflow?.fullNegativePrompt ? `完整负向提示词\n\n${workflow.fullNegativePrompt}` : "",
     `镜头表\n\n${shotLines}`,
-  ].filter(Boolean).join("\n\n");
+  ].filter(Boolean).join("\n\n"));
 }
 
 function parseDurationSeconds(value?: string | null) {
@@ -422,9 +424,9 @@ function buildAnalysisResultFromProjectVersion(project: ProjectDetail, version: 
     lastFramePrompt: shot.lastFramePrompt || shot.visual || shot.videoPrompt || "镜头结束画面。",
     negativePrompt: shot.negativePrompt || "no gore, no explicit injury detail, no unreadable text",
   }));
-  const fullVideoPrompt = version.fullVideoPrompt || buildPromptText(version);
+  const fullVideoPrompt = sanitizeInternalPromptTokens(version.fullVideoPrompt || buildPromptText(version));
 
-  return {
+  return sanitizeInternalPromptTokensDeep({
     title: version.title || project.title,
     contentType: version.contentType || project.contentType || "短剧 / 通用",
     duration,
@@ -445,7 +447,7 @@ function buildAnalysisResultFromProjectVersion(project: ProjectDetail, version: 
     recommendedItems: [],
     editingNotes: [],
     qualityCheck: version.qualityCheck || {},
-  };
+  });
 }
 
 function getShotAssets(version: ProjectVersion, shot: ProjectShot, type?: VisualAsset["type"]) {

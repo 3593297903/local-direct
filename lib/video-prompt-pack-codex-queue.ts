@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { segmentContractToRenderBlock, type SegmentContract } from "./batch-segment-contract";
+import { sanitizeInternalPromptTokens } from "./internal-prompt-token-sanitizer";
 import { readVideoPromptOutputJson } from "./video-prompt-codex-queue";
 
 export type VideoPromptPackCodexJobStatus = "pending" | "running" | "completed" | "failed";
@@ -12,6 +14,7 @@ export type VideoPromptPackSegmentInput = {
   renderInputScript: string;
   duration: string;
   shotCount?: number;
+  segmentContract?: SegmentContract;
 };
 
 export type CreateVideoPromptPackCodexJobInput = {
@@ -62,7 +65,7 @@ type ClaimOptions = QueueOptions & {
 const TASK_ROOT = ".tmp-video-prompt-pack-codex";
 const JOB_DIR = "jobs";
 const RESULT_DIR = "results";
-const MAX_PACK_SEGMENTS = 4;
+const MAX_PACK_SEGMENTS = 5;
 
 export class VideoPromptPackCodexQueueError extends Error {
   constructor(message: string) {
@@ -183,12 +186,13 @@ function buildVideoPromptPackCodexPrompt(
   mode: VideoPromptPackCodexMode,
 ) {
   const segmentInstructions = segments.flatMap((segment) => [
-    `Segment ${segment.episodeIndex}: ${segment.title}`,
+    `Segment ${segment.episodeIndex}: ${sanitizeInternalPromptTokens(segment.title)}`,
     `Duration: ${segment.duration}`,
     `Shot count lock: ${segment.shotCount || "use render script lock"}`,
+    segment.segmentContract ? sanitizeInternalPromptTokens(segmentContractToRenderBlock(segment.segmentContract)) : "",
     `Output path: ${segment.outputPath}`,
     "Render script:",
-    segment.renderInputScript,
+    sanitizeInternalPromptTokens(segment.renderInputScript),
     "",
   ]);
   const strictUtf8Instructions =
@@ -206,20 +210,21 @@ function buildVideoPromptPackCodexPrompt(
 
   return [
     "You are handling a Local Director Render Pack task from a local Codex CLI worker.",
-    "A Render Pack reduces CLI startup overhead, but every segment must still be rendered as a complete independent single-segment AnalysisResult JSON.",
+    "A Render Pack only batches local CLI work. Every segment must still be rendered as a complete independent Chinese Local Director single segment video prompt JSON.",
     "Do not open a browser. Do not ask the user to copy or paste. Do not call network providers.",
     "",
     "Hard quality rules:",
     "- Write one separate JSON file per segment to the exact output path shown below.",
-    "- Each JSON must be a complete Local Director AnalysisResult, not a summary and not a combined array.",
+    "- Each JSON must be a complete Local Director video prompt result, not a summary and not a combined array.",
     "- Each JSON must include title, contentType, duration, style, diagnosis, optimizedScript, workflow.fullVideoPrompt, workflow.fullNegativePrompt, workflow.concisePrompt, and storyboard.",
     "- Every storyboard shot must include shotNumber, timeRange, scene, visual, shotType, composition, cameraMovement, lighting, sound, dialogue, emotion, transition, shotPurpose, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt.",
-    "- Keep single-segment quality: a 4-shot segment should usually have workflow.fullVideoPrompt with at least 1400 meaningful Chinese characters; 3-shot segments should usually have at least 1100.",
+    "- Keep full single segment quality: a 4-shot segment should usually have workflow.fullVideoPrompt with at least 1400 meaningful Chinese characters; 3-shot segments should usually have at least 1100.",
     "- Do not make thin shots. visual, composition, lighting, sound, shotPurpose, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt must be concrete, shootable text instead of short labels.",
     "- videoPrompt must describe the full moving image for that shot with action, space, camera behavior, light, sound, emotion, and continuity. Do not output one-sentence summaries.",
     "- Do not use 同上, 如上, 略, 参考上一段, continue as above, or any placeholder that depends on another segment.",
     "- If there is no spoken line, dialogue must be a concrete no-dialogue value such as \"无\" or \"none\".",
     "- Preserve the specific render script, shot count lock, Story Bible continuity, and source events for each segment.",
+    "- User-facing fields must use natural Chinese labels. Do not output hyphenated English internal IDs, schema names, file-format names, or engineering type names in title, contentType, scene, visual, workflow, or storyboard fields.",
     "",
     "File writing requirements:",
     "- Write all JSON files as UTF-8.",

@@ -103,7 +103,7 @@ function buildCodexPrompt(task) {
     "You are running Local Director video prompt Render Pack generation from a local Codex CLI worker.",
     "The task prompt already contains every segment render script and exact output paths.",
     "Do not call network providers. Do not open a browser. Do not ask the user for follow-up input.",
-    "Write each segment as its own complete Local Director AnalysisResult JSON file.",
+    "Write each segment as its own complete Local Director video prompt result JSON file.",
     "Do not use 同上, 如上, 略, or any placeholder that points to another segment.",
     "",
     "Render Pack task prompt:",

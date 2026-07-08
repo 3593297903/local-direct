@@ -21,9 +21,11 @@ export function isCodexQuotaErrorText(value) {
 }
 
 export function buildCodexFailureMessage(baseMessage, capturedOutput = "") {
-  const outputExcerpt = compactOutput(capturedOutput);
+  const rawOutputExcerpt = compactOutput(capturedOutput);
+  const joinedForDetection = [baseMessage, rawOutputExcerpt].filter(Boolean).join("\nCodex output: ");
+  const outputExcerpt = summarizeCodexOutputExcerpt(rawOutputExcerpt);
   const joined = [baseMessage, outputExcerpt].filter(Boolean).join("\nCodex output: ");
-  if (!isCodexQuotaErrorText(joined)) return joined || String(baseMessage || "codex exec failed");
+  if (!isCodexQuotaErrorText(joinedForDetection)) return joined || String(baseMessage || "codex exec failed");
   return [
     `${CODEX_QUOTA_EXHAUSTED_CODE}: ${CODEX_QUOTA_EXHAUSTED_MESSAGE}`,
     outputExcerpt ? `Codex output: ${outputExcerpt}` : "",
@@ -39,4 +41,14 @@ function compactOutput(value) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (text.length <= 1200) return text;
   return `${text.slice(0, 1200)}...`;
+}
+
+function summarizeCodexOutputExcerpt(value) {
+  const text = String(value || "");
+  if (!looksLikeEchoedTaskPrompt(text)) return text;
+  return "Codex returned task prompt or SegmentContract text instead of a valid result. Check the local worker log for the full output.";
+}
+
+function looksLikeEchoedTaskPrompt(text) {
+  return /(SEGMENT CONTRACT|LOCKED SEGMENT PLAN|Segment index|forbiddenFutureEvents|requiredShotBeats|renderInputScript|Video prompt generation instructions)/i.test(text);
 }

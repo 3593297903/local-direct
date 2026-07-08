@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { sanitizeInternalPromptTokens } from "./internal-prompt-token-sanitizer";
 
 export type VideoPromptCodexJobStatus = "pending" | "running" | "completed" | "failed";
 
@@ -190,11 +191,16 @@ export async function failVideoPromptCodexJob(
 function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outputPath: string) {
   const requestedDuration = normalizeRequestedDuration(input.duration);
   const durationMode = requestedDuration.toLowerCase() === "auto" ? "auto" : "fixed";
+  const script = sanitizeInternalPromptTokens(input.script);
+  const contentType = sanitizeInternalPromptTokens(input.contentType || "短剧 / 通用");
+  const style = sanitizeInternalPromptTokens(input.style || "自动匹配文案气质");
+  const projectMemory = sanitizeInternalPromptTokens(input.projectMemory || "(none)");
   return [
     "You are handling a Local Director local video prompt generation task.",
     "",
-    "Generate strict JSON only. The JSON must match the Local Director AnalysisResult contract.",
+    "Generate strict JSON only. The JSON must match the Local Director complete video prompt result contract.",
     "Do not open a browser. Do not ask the user to copy or paste. Do not call network providers.",
+    "User-facing fields must use natural Chinese labels. Do not output internal schema names, file-format names, or engineering type names.",
     "",
     "Required top-level fields:",
     "- title",
@@ -231,13 +237,13 @@ function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outp
     "- Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
     "- After writing, read the file back as UTF-8 and confirm Chinese characters are preserved, not replaced by question marks.",
     "",
-    `Script: ${input.script}`,
-    `Content type: ${input.contentType || "短剧 / 通用"}`,
-    `Style: ${input.style || "自动匹配文案气质"}`,
+    `Script: ${script}`,
+    `Content type: ${contentType}`,
+    `Style: ${style}`,
     `Duration: ${requestedDuration}`,
     "",
     "Project memory / continuity context:",
-    input.projectMemory || "(none)",
+    projectMemory,
     `Output path: ${outputPath}`,
     "",
     "Completion requirements:",

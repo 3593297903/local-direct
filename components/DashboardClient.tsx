@@ -6,6 +6,21 @@ import { CopyButton } from "@/components/CopyButton";
 import { Drawer } from "@/components/Drawer";
 import { PreviewAnimation } from "@/components/PreviewAnimation";
 import { matchShotReferences, ShotReferenceMatches } from "@/lib/reference-matcher";
+import { buildSegmentContractHash, findMissingSegmentContractRequiredEvents, type SegmentContract } from "@/lib/batch-segment-contract";
+import { buildRenderPacks } from "@/lib/batch-render-scheduler";
+import {
+  findInternalPromptToken,
+  sanitizeInternalPromptTokens,
+  sanitizeInternalPromptTokensDeep,
+} from "@/lib/internal-prompt-token-sanitizer";
+import {
+  createSegmentQualityReport,
+  summarizeSegmentQualityReports,
+  updateSegmentQualityReportStatus,
+  type BatchQualityReportSummary,
+  type SegmentQualityReport,
+  type SegmentQualityStatus,
+} from "@/lib/batch-segment-quality-report";
 import { Clock, Download, FileText, Film, ImageIcon, Loader2, Maximize2, ScanLine, Send, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
 
 type StoryboardImageState = {
@@ -92,6 +107,7 @@ type SeasonPackEpisodeInput = {
   blueprint: unknown;
   shotCount: number;
   renderInputScript: string;
+  segmentContract?: SegmentContract;
 };
 
 type SeasonPackCodexJob = {
@@ -159,6 +175,7 @@ type BatchRepairReasonType =
   | "segment-label"
   | "duration"
   | "shot-density"
+  | "contract"
   | "quality"
   | "render-pack";
 
@@ -175,21 +192,25 @@ type BatchGenerationProgress = {
   requestedCount: number | null;
   resolvedSegmentCount: number | null;
   completedCount: number;
+  savedCount: number;
+  cachedCount: number;
   runningCount: number;
   pendingCount: number;
   repairingCount: number;
   savingCount: number;
   currentMessage: string;
   segments: BatchSegmentProgress[];
+  qualityReportSummary?: BatchQualityReportSummary;
 };
 
 const MAX_EPISODE_BATCH_COUNT = 30;
 const BATCH_RENDER_PACK_SIZE = 4;
 const BATCH_RENDER_PACK_CONCURRENCY = 4;
 const BATCH_SINGLE_RENDER_CONCURRENCY = 3;
+const MAX_BATCH_REPAIR_ATTEMPTS_PER_REASON = 1;
 const SLOW_RENDER_PACK_WARNING_MS = 8 * 60_000;
 const STRICT_UTF8_RENDER_PACK_MODE: RenderPackCodexMode = "strictUtf8";
-const MIN_BATCH_FULL_PROMPT_LENGTH = 1400;
+const MIN_BATCH_FULL_PROMPT_LENGTH = 900;
 const BATCH_SEGMENT_CACHE_PREFIX = "localdirector:segment-batch:";
 const segmentTerminologyPattern = /(?:\u7b2c\s*[0-9\u4e00-\u9fa5]+\s*\u96c6|\u672c\u96c6|\u5355\u96c6|\u5267\u96c6)/;
 const GENERIC_SEASON_TEMPLATE_PHRASES = [
@@ -198,6 +219,24 @@ const GENERIC_SEASON_TEMPLATE_PHRASES = [
   "同期环境声、脚步声、纸张声或市场声",
   "保留北方县城真实空间感",
 ];
+
+function formatBatchDurationMs(ms: number) {
+  if (!Number.isFinite(ms) || ms <= 0) return "0s";
+  const totalSeconds = Math.round(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m${seconds}s` : `${seconds}s`;
+}
+
+function formatBatchSafetyRisk(risk: BatchQualityReportSummary["highestSafetyRisk"]) {
+  const labels: Record<BatchQualityReportSummary["highestSafetyRisk"], string> = {
+    none: "无",
+    low: "低",
+    medium: "中",
+    high: "高",
+  };
+  return labels[risk] || risk;
+}
 const REQUIRED_BATCH_SEGMENT_SHOT_FIELDS = [
   "timeRange",
   "scene",
@@ -227,7 +266,7 @@ const MIN_BATCH_FIELD_LENGTHS: Partial<Record<(typeof REQUIRED_BATCH_SEGMENT_SHO
   transition: 2,
   shotPurpose: 20,
   firstFramePrompt: 24,
-  videoPrompt: 60,
+  videoPrompt: 40,
   lastFramePrompt: 24,
   negativePrompt: 16,
 };
@@ -359,7 +398,7 @@ function buildVideoGenerationPromptText(result: AnalysisResult) {
   const title = cleanPromptValue(result.title, "未命名视频提示词");
   const duration = cleanPromptValue(result.duration, "15秒");
   const style = cleanPromptValue(result.style, "电影级写实");
-  const contentType = cleanPromptValue(result.contentType, "短剧 / 通用");
+  const contentType = cleanPromptContentType(result.contentType);
   const coreTheme = cleanPromptValue(workflow?.coreTheme, "") || `${title}：围绕原文案核心事件，保持人物关系、线索顺序和情绪推进，生成一段可直接执行的 AI 视频提示词。`;
   const technicalParams =
     cleanPromptValue(workflow?.videoParameterLock, "") ||
@@ -403,26 +442,103 @@ function cleanPromptValue(value: unknown, fallback = "") {
   return trimmed;
 }
 
+function cleanPromptContentType(value: unknown, fallback = "短剧 / 通用") {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const sanitized = cleanPromptValue(raw ? sanitizeInternalPromptTokens(raw) : "", "");
+  if (!sanitized || findInternalPromptToken(raw)) return fallback;
+  if (/^(?:单段视频提示词结果|视频提示词结果|视频段)$/.test(sanitized)) return fallback;
+  return sanitized;
+}
+
 function sanitizeBatchSegmentText(value: string) {
-  return value
+  const segmentSanitized = value
     .replace(/\u7b2c\s*([0-9\u4e00-\u9fa5]+)\s*\u96c6/g, "\u7b2c$1\u6bb5")
     .replace(/\u672c\u96c6/g, "\u672c\u6bb5")
     .replace(/\u5355\u96c6/g, "\u5355\u6bb5")
-    .replace(/\u5267\u96c6/g, "\u5206\u6bb5");
+    .replace(/\u5267\u96c6/g, "\u5206\u6bb5")
+    .replace(/16\s*:\s*9\s*\u7ad6\u5c4f/g, "16:9\u6a2a\u5c4f")
+    .replace(/\u7ad6\u5c4f\s*16\s*:\s*9/g, "16:9\u6a2a\u5c4f")
+    .replace(/\u6a2a\u5c4f\s*\u7ad6\u5c4f/g, "\u6a2a\u5c4f");
+  return sanitizeInternalPromptTokens(segmentSanitized);
+}
+
+function sanitizeBatchNegativePrompt(value: unknown) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const cleaned = sanitizeBatchSegmentText(raw)
+    .replace(/\bundefined\b/gi, "\u7a7a\u5b57\u6bb5")
+    .replace(/\bnull\b/gi, "\u7a7a\u503c");
+  const baseItems = ["\u7a7a\u5b57\u6bb5\u6216\u5360\u4f4d\u6587\u672c", "\u540c\u4e0a", "\u5982\u4e0a", "\u7565", "16:9\u7ad6\u5c4f"];
+  const parts = cleaned
+    .split(/[,\uff0c\u3001]/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  for (const item of baseItems) {
+    if (!parts.some((part) => part.includes(item))) parts.push(item);
+  }
+  return parts.join("\uff0c");
+}
+
+function normalizeBatchSegmentResultForQuality(result: AnalysisResult): AnalysisResult {
+  const sanitized = sanitizeBatchSegmentOutput(result);
+  const storyboard = Array.isArray(sanitized.storyboard)
+    ? sanitized.storyboard.map((shot) => ({
+      ...shot,
+      dialogue: cleanPromptValue(shot.dialogue, "") || "\u65e0",
+      negativePrompt: sanitizeBatchNegativePrompt(shot.negativePrompt),
+    }))
+    : [];
+  const workflow = sanitized.workflow
+    ? {
+      ...sanitized.workflow,
+      fullNegativePrompt: sanitizeBatchNegativePrompt(sanitized.workflow.fullNegativePrompt),
+    }
+    : sanitized.workflow;
+
+  return {
+    ...sanitized,
+    workflow,
+    storyboard,
+  };
+}
+
+function containsBatchNullishValue(value: unknown, path = "result"): string {
+  if (value === null || value === undefined) return path;
+  if (typeof value === "string") {
+    if (/(?:negativePrompt|fullNegativePrompt)$/i.test(path)) return "";
+    return /\b(?:undefined|null)\b/i.test(value) ? path : "";
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const found = containsBatchNullishValue(value[index], `${path}[${index}]`);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (typeof value === "object") {
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const found = containsBatchNullishValue(item, `${path}.${key}`);
+      if (found) return found;
+    }
+  }
+  return "";
 }
 
 function sanitizeBatchSegmentOutput<T>(value: T): T {
-  if (typeof value === "string") return sanitizeBatchSegmentText(value) as T;
-  if (Array.isArray(value)) return value.map((item) => sanitizeBatchSegmentOutput(item)) as T;
-  if (!value || typeof value !== "object") return value;
-
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, sanitizeBatchSegmentOutput(item)]),
+  return sanitizeInternalPromptTokensDeep(
+    (function sanitizeSegmentLabels(item: unknown): unknown {
+      if (typeof item === "string") return sanitizeBatchSegmentText(item);
+      if (Array.isArray(item)) return item.map((entry) => sanitizeSegmentLabels(entry));
+      if (!item || typeof item !== "object") return item;
+      return Object.fromEntries(
+        Object.entries(item as Record<string, unknown>).map(([key, entry]) => [key, sanitizeSegmentLabels(entry)]),
+      );
+    })(value),
   ) as T;
 }
 
 function classifyBatchRepairReason(reason: string): BatchRepairReasonType {
   if (/encoding|question marks|replacement characters|UTF-?8|parse|JSON/i.test(reason)) return "encoding";
+  if (/contract|SegmentContract|requiredEvents|forbidden future event/i.test(reason)) return "contract";
   if (/missing|required|optimizedScript|workflow\.fullVideoPrompt|storyboard\[\d+\]|field|schema/i.test(reason)) return "schema";
   if (segmentTerminologyPattern.test(reason) || /episode terminology|segment label/i.test(reason)) return "segment-label";
   if (/duration|seconds|15\s*s|15\s*\u79d2|\u65f6\u957f/i.test(reason)) return "duration";
@@ -438,10 +554,15 @@ function batchRepairReasonLabel(reasonType: BatchRepairReasonType) {
     "segment-label": "\u6bb5\u843d\u7f16\u53f7\u4fee\u590d",
     duration: "\u65f6\u957f\u4fee\u590d",
     "shot-density": "\u955c\u5934\u5bc6\u5ea6\u4fee\u590d",
+    contract: "\u4e8b\u4ef6\u8986\u76d6\u4fee\u590d",
     quality: "\u8d28\u91cf\u4fee\u590d",
     "render-pack": "Render Pack \u4fee\u590d",
   };
   return labels[reasonType];
+}
+
+function buildBatchRepairAttemptKey(episodeIndex: number, reasonType: BatchRepairReasonType) {
+  return `${episodeIndex}:${reasonType}`;
 }
 
 function normalizeBatchEpisodeResult(
@@ -461,9 +582,10 @@ function normalizeBatchEpisodeResult(
     || sourceInfo.duration
     || normalizePromptDuration(requestedDuration)
     || "15秒";
-  const contentType = cleanPromptValue(result.contentType, "")
-    || inferPromptContentType(baseScript)
-    || "短剧 / 通用";
+  const contentType = cleanPromptContentType(
+    result.contentType,
+    inferPromptContentType(baseScript) || "短剧 / 通用",
+  );
   const style = cleanPromptValue(result.style, "")
     || inferPromptStyle(baseScript)
     || "电影级写实";
@@ -496,7 +618,7 @@ function normalizeBatchEpisodeResult(
     storyboard: Array.isArray(result.storyboard) ? result.storyboard : [],
   } as AnalysisResult;
 
-  return sanitizeBatchSegmentOutput(normalized);
+  return normalizeBatchSegmentResultForQuality(normalized);
 }
 
 function inferBatchEpisodeSourceInfo(baseScript: string, episodeIndex: number) {
@@ -660,12 +782,48 @@ function assertBatchShotFieldLength(episodeIndex: number, shotIndex: number, fie
   }
 }
 
+function normalizeContractCheckText(value: unknown) {
+  return cleanPromptValue(value, "")
+    .replace(/\s+/g, "")
+    .replace(/[，。；：、""''《》【】（）()|\-—–]/g, "")
+    .toLowerCase();
+}
+
+function assertBatchSegmentContractQuality(
+  episodeIndex: number,
+  result: AnalysisResult,
+  contract: SegmentContract | undefined,
+) {
+  if (!contract) return;
+  const storyboard = Array.isArray(result.storyboard) ? result.storyboard : [];
+  if (storyboard.length !== contract.shotCount) {
+    throw new Error(`Segment ${episodeIndex} failed contract check: storyboard count ${storyboard.length} does not match SegmentContract shotCount ${contract.shotCount}.`);
+  }
+  const resultDurationSeconds = parsePromptDurationSeconds(result.duration);
+  if (resultDurationSeconds > 0 && resultDurationSeconds > contract.durationSeconds + 0.2) {
+    throw new Error(`Segment ${episodeIndex} failed contract check: duration ${resultDurationSeconds}s exceeds SegmentContract ${contract.durationSeconds}s.`);
+  }
+  const fullPromptText = normalizeContractCheckText(buildVideoGenerationPromptText(result));
+  for (const forbidden of contract.forbiddenFutureEvents || []) {
+    const normalizedForbidden = normalizeContractCheckText(forbidden);
+    if (normalizedForbidden.length >= 4 && fullPromptText.includes(normalizedForbidden)) {
+      throw new Error(`Segment ${episodeIndex} failed contract check: prompt reveals forbidden future event "${forbidden}".`);
+    }
+  }
+  const missingRequiredEvents = findMissingSegmentContractRequiredEvents(buildVideoGenerationPromptText(result), contract);
+  if (missingRequiredEvents.length) {
+    throw new Error(`Segment ${episodeIndex} failed contract check: prompt does not cover SegmentContract requiredEvents: ${missingRequiredEvents.join(" / ")}`);
+  }
+}
+
 function assertBatchSegmentQuality(
   baseScript: string,
   episodeIndex: number,
   result: AnalysisResult,
   requestedDuration: string,
+  contract?: SegmentContract,
 ) {
+  assertBatchSegmentContractQuality(episodeIndex, result, contract);
   const sourceInfo = inferBatchEpisodeSourceInfo(baseScript, episodeIndex);
   const storyboard = Array.isArray(result.storyboard) ? result.storyboard : [];
   const maximumShotCount = maximumBatchStoryboardShotCount(result, requestedDuration);
@@ -682,15 +840,22 @@ function assertBatchSegmentQuality(
 
   const fullPrompt = buildVideoGenerationPromptText(result);
   const serializedResult = JSON.stringify(result);
-  const qualityText = `${fullPrompt}\n${serializedResult}`;
-  if (/\b(?:undefined|null)\b/i.test(serializedResult)) {
-    throw new Error(`Segment ${episodeIndex} failed quality check: serialized result contains undefined/null.`);
+  const internalTokenHit = findInternalPromptToken(serializedResult) || findInternalPromptToken(fullPrompt);
+  if (internalTokenHit) {
+    throw new Error(
+      `Segment ${episodeIndex} failed quality check: user-facing prompt contains internal token "${internalTokenHit.token}".`,
+    );
+  }
+  const nullishPath = containsBatchNullishValue(result);
+  if (nullishPath) {
+    throw new Error(`Segment ${episodeIndex} failed quality check: ${nullishPath} contains undefined/null.`);
   }
   if (segmentTerminologyPattern.test(serializedResult)) {
     throw new Error(`Segment ${episodeIndex} failed quality check: serialized result still contains episode terminology.`);
   }
-  if (/\b(?:undefined|null)\b/i.test(qualityText)) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：提示词中包含 undefined/null 字段。`);
+  const fullPromptNullishPath = containsBatchNullishValue(fullPrompt, "workflow.fullVideoPrompt");
+  if (fullPromptNullishPath) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：提示词中包含空字段或占位文本。`);
   }
   if (/16\s*:\s*9\s*竖屏|竖屏\s*16\s*:\s*9|横屏\s*竖屏/.test(fullPrompt)) {
     throw new Error(`第 ${episodeIndex} 段生成失败：提示词包含 16:9 竖屏这类自相矛盾描述。`);
@@ -763,15 +928,6 @@ function clampEpisodeCount(value: number) {
   return Math.min(MAX_EPISODE_BATCH_COUNT, Math.max(1, Math.round(value)));
 }
 
-function chunkEpisodesForRenderPacks<T>(items: T[], size = BATCH_RENDER_PACK_SIZE) {
-  const chunks: T[][] = [];
-  const chunkSize = Math.max(1, size);
-  for (let index = 0; index < items.length; index += chunkSize) {
-    chunks.push(items.slice(index, index + chunkSize));
-  }
-  return chunks;
-}
-
 function buildBatchEpisodeScript(baseScript: string, episodeIndex: number, episodeCount: number) {
   const source = baseScript.trim();
   return [
@@ -801,7 +957,7 @@ function buildBatchEpisodeRenderScript(episodeInput: SeasonPackEpisodeInput, epi
     "最终标题、核心主题和完整视频提示词必须使用“第 N 段”，不要写“第 N 集”。",
     "15 秒默认 4-5 镜头；除非用户明确选择密集镜头版，否则 10-20 秒最多 5 个镜头。",
     `最终 storyboard 必须严格等于 ${episodeInput.shotCount} 个镜头。`,
-    "最终输出必须是 Local Director AnalysisResult JSON，由本地视频提示词 Codex worker 写入文件。",
+    "最终输出必须是 Local Director 完整视频提示词结果 JSON，由本地视频提示词 Codex worker 写入文件。",
   ].join("\n");
 }
 
@@ -820,16 +976,16 @@ function buildBatchSegmentRepairScript(renderScript: string, episodeIndex: numbe
     "4. 没有台词时 dialogue 必须写“无”。",
     "5. 最终标题和提示词必须使用“第 N 段”，不要写“第 N 集”。",
     "6. 15 秒默认 4-5 镜头；除非用户明确要求密集镜头版，否则 10-20 秒最多 5 个镜头。",
-    "7. 不要出现 undefined、null、如上、同上、略、其他：无、16:9竖屏。",
+    "7. 不要输出空字段、占位文本、如上、同上、略、其他：无、16:9竖屏。",
     "",
     "未通过校验的上次结果摘要：",
-    JSON.stringify({
+    sanitizeInternalPromptTokens(JSON.stringify({
       title: failedResult.title,
       duration: failedResult.duration,
       style: failedResult.style,
       storyboardCount: Array.isArray(failedResult.storyboard) ? failedResult.storyboard.length : 0,
       optimizedScript: failedResult.optimizedScript,
-    }, null, 2),
+    }, null, 2)),
   ].join("\n");
 }
 
@@ -994,6 +1150,7 @@ export function DashboardClient() {
       renderInputScript: string;
       duration: string;
       shotCount: number;
+      segmentContract?: SegmentContract;
     }>,
     projectId: string | undefined,
     mode: RenderPackCodexMode = STRICT_UTF8_RENDER_PACK_MODE,
@@ -1329,10 +1486,17 @@ export function DashboardClient() {
     const requestedCount = mode === "auto" ? null : episodeCount;
     let resolvedSegmentCount = requestedCount || null;
     let segmentProgressItems: BatchSegmentProgress[] = [];
+    const qualityReports = new Map<number, SegmentQualityReport>();
     setBatchGenerating(true);
 
+    function qualityReportSummary() {
+      return summarizeSegmentQualityReports(Array.from(qualityReports.values()));
+    }
+
     function publishBatchProgress(phase: BatchGenerationPhase, currentMessage: string) {
-      const completedCount = segmentProgressItems.filter((item) => ["cached", "completed", "saving", "saved"].includes(item.status)).length;
+      const savedCount = segmentProgressItems.filter((item) => item.status === "saved" || item.status === "completed").length;
+      const cachedCount = segmentProgressItems.filter((item) => item.status === "cached").length;
+      const completedCount = savedCount;
       const runningCount = segmentProgressItems.filter((item) => item.status === "running").length;
       const repairingCount = segmentProgressItems.filter((item) => item.status === "repairing").length;
       const savingCount = segmentProgressItems.filter((item) => item.status === "saving").length;
@@ -1343,12 +1507,15 @@ export function DashboardClient() {
         requestedCount,
         resolvedSegmentCount,
         completedCount,
+        savedCount,
+        cachedCount,
         runningCount,
         pendingCount,
         repairingCount,
         savingCount,
         currentMessage,
         segments: segmentProgressItems,
+        qualityReportSummary: qualityReportSummary(),
       });
       setGenerationProgress(currentMessage);
     }
@@ -1384,9 +1551,42 @@ export function DashboardClient() {
     }
 
     const seasonPackJob = await runSeasonPackPlanningWithLockedRetry();
-    const batchCacheKey = `${BATCH_SEGMENT_CACHE_PREFIX}${seasonPackJob.id}`;
     const episodes = [...(seasonPackJob.result?.episodes || [])].sort((left, right) => left.episodeIndex - right.episodeIndex);
     resolvedSegmentCount = episodes.length;
+    const batchContractHash = buildSegmentContractHash({
+      segmentIndex: 1,
+      title: `batch:${seasonPackJob.id}`,
+      sourceText: episodes.map((episode) => episode.input.segmentContract?.contractHash || episode.input.sourceText).join("\n"),
+      durationSeconds: 15,
+      shotCount: Math.max(1, episodes.length),
+      requiredEvents: episodes.map((episode) => episode.input.segmentContract?.contractHash || episode.input.title),
+      forbiddenFutureEvents: [],
+      characters: [],
+      locations: [],
+      props: [],
+      requiredShotBeats: episodes.map((episode) => ({
+        shotNumber: episode.episodeIndex,
+        timeRange: "",
+        beat: episode.input.title,
+        visualFocus: episode.input.title,
+      })),
+      safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+    });
+    const batchSourceHash = buildSegmentContractHash({
+      segmentIndex: 1,
+      title: `source:${mode}:${episodeCount}`,
+      sourceText: script,
+      durationSeconds: 15,
+      shotCount: Math.max(1, episodes.length),
+      requiredEvents: [mode, String(episodeCount), selectedDurationValue()],
+      forbiddenFutureEvents: [],
+      characters: [],
+      locations: [],
+      props: [],
+      requiredShotBeats: [{ shotNumber: 1, timeRange: "", beat: "source", visualFocus: "source" }],
+      safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+    });
+    const batchCacheKey = `${BATCH_SEGMENT_CACHE_PREFIX}${activeProjectId || "new"}:${mode}:${resolvedSegmentCount}:${batchSourceHash}:${batchContractHash}`;
     if (mode === "fixed" && episodes.length !== episodeCount) {
       throw new Error(`整段规划任务完成但段数不完整：${episodes.length} / ${episodeCount}`);
     }
@@ -1413,9 +1613,29 @@ export function DashboardClient() {
     const repairQueue: Array<{ episode: SeasonPackEpisodeResult; reason: string; reasonType: BatchRepairReasonType }> = [];
     const queuedRepairIndexes = new Set<number>();
     const queuedSaveIndexes = new Set<number>();
+    const repairAttemptCounts = new Map<string, number>();
+    const segmentRepairReasons = new Map<number, string[]>();
     let nextSegmentToSave = 1;
     let saveChain = Promise.resolve();
     let saveError: Error | null = null;
+    let activeRenderScheduleProfile = "UNSCHEDULED";
+
+    function registerSegmentRepairReason(episodeIndex: number, reason: string) {
+      const current = segmentRepairReasons.get(episodeIndex) || [];
+      if (!current.includes(reason)) {
+        segmentRepairReasons.set(episodeIndex, [...current, reason]);
+      }
+    }
+
+    function markSegmentQualityStatus(
+      episodeIndex: number,
+      status: SegmentQualityStatus,
+      patch: Partial<Pick<SegmentQualityReport, "durationMs" | "repairCount" | "repairReasons" | "qualityScore" | "qualityFindings" | "safetyRisk" | "safetyFindings">> = {},
+    ) {
+      const existing = qualityReports.get(episodeIndex);
+      if (!existing) return;
+      qualityReports.set(episodeIndex, updateSegmentQualityReportStatus(existing, status, patch));
+    }
 
     function writeBatchSegmentCache() {
       if (typeof window === "undefined") return;
@@ -1436,8 +1656,11 @@ export function DashboardClient() {
           JSON.stringify({
             batchId: seasonPackJob.id,
             projectId: activeProjectId || null,
+            sourceHash: batchSourceHash,
+            contractHash: batchContractHash,
             resolvedSegmentCount,
             cachedCount: cachedSegments.length,
+            qualityReports: Array.from(qualityReports.values()),
             updatedAt: new Date().toISOString(),
             segments: cachedSegments,
           }),
@@ -1452,6 +1675,7 @@ export function DashboardClient() {
       renderDuration: string,
       episodeIndex: number,
       episodeCount: number,
+      segmentContract?: SegmentContract,
     ) {
       const rawResult = await requestAnalysisWithContext(
         renderScript,
@@ -1461,12 +1685,13 @@ export function DashboardClient() {
       );
       const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, episodeCount, rawResult, renderDuration);
       try {
-        assertBatchSegmentQuality(script, episodeIndex, episodeResult, renderDuration);
+        assertBatchSegmentQuality(script, episodeIndex, episodeResult, renderDuration, segmentContract);
         return episodeResult;
       } catch (error) {
         const reason = error instanceof Error ? error.message : "当前段未通过质量校验";
         const reasonType = classifyBatchRepairReason(reason);
         const repairLabel = batchRepairReasonLabel(reasonType);
+        registerSegmentRepairReason(episodeIndex, reason);
         updateSegmentProgress(episodeIndex, "repairing", `${repairLabel}: ${reason}`);
         publishBatchProgress("repairing", `第 ${episodeIndex} / ${episodeCount} 段正在自动修复：${reason}`);
         const repairScript = buildBatchSegmentRepairScript(renderScript, episodeIndex, episodeCount, reason, episodeResult);
@@ -1477,7 +1702,7 @@ export function DashboardClient() {
           undefined,
         );
         const repairedResult = normalizeBatchEpisodeResult(script, episodeIndex, episodeCount, repairedRawResult, renderDuration);
-        assertBatchSegmentQuality(script, episodeIndex, repairedResult, renderDuration);
+        assertBatchSegmentQuality(script, episodeIndex, repairedResult, renderDuration, segmentContract);
         return repairedResult;
       }
     }
@@ -1497,10 +1722,15 @@ export function DashboardClient() {
           const episodeScript = rendered.sourceText;
           const fullVideoPrompt = rendered.promptText;
 
+          segmentRepairReasons.delete(episodeIndex);
+          queuedRepairIndexes.delete(episodeIndex);
           updateSegmentProgress(episodeIndex, "saving", "正在保存到项目");
+          markSegmentQualityStatus(episodeIndex, "cached");
           publishBatchProgress("saving", `正在保存第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
           const save = await saveAnalysisProject(episodeScript, episodeResult, fullVideoPrompt, activeProjectId || undefined, undefined);
           if (!save.saved || !save.projectId || !save.versionId) {
+            markSegmentQualityStatus(episodeIndex, "failed", { repairReasons: [...(segmentRepairReasons.get(episodeIndex) || []), save.reason || "项目保存失败"] });
+            writeBatchSegmentCache();
             throw new Error(`第 ${episodeIndex} 段已生成，但项目保存失败：${save.reason || "未返回保存结果"}`);
           }
 
@@ -1518,6 +1748,8 @@ export function DashboardClient() {
           setBatchResults([...completed]);
           setResult(episodeResult);
           updateSegmentProgress(episodeIndex, "saved", "已保存");
+          markSegmentQualityStatus(episodeIndex, "saved");
+          writeBatchSegmentCache();
           publishBatchProgress("saving", `已保存第 ${episodeIndex} / ${resolvedSegmentCount} 段。`);
         }).catch((error) => {
           saveError = error instanceof Error ? error : new Error(String(error));
@@ -1526,9 +1758,107 @@ export function DashboardClient() {
       }
     }
 
+    function restoreCachedRenderedSegments() {
+      if (typeof window === "undefined") return 0;
+      try {
+        const rawCache = window.localStorage.getItem(batchCacheKey);
+        if (!rawCache) return 0;
+        const cache = JSON.parse(rawCache) as {
+          projectId?: string | null;
+          sourceHash?: string;
+          contractHash?: string;
+          resolvedSegmentCount?: number;
+          qualityReports?: SegmentQualityReport[];
+          segments?: Array<{
+            episodeIndex?: number;
+            title?: string;
+            sourceText?: string;
+            promptText?: string;
+            result?: AnalysisResult;
+          }>;
+        };
+        if (
+          cache.projectId !== (activeProjectId || null)
+          || cache.sourceHash !== batchSourceHash
+          || cache.contractHash !== batchContractHash
+          || cache.resolvedSegmentCount !== resolvedSegmentCount
+          || !Array.isArray(cache.segments)
+        ) {
+          return 0;
+        }
+
+        let restoredCount = 0;
+        if (Array.isArray(cache.qualityReports)) {
+          for (const report of cache.qualityReports) {
+            if (report && Number.isInteger(report.segmentIndex)) {
+              qualityReports.set(report.segmentIndex, report);
+            }
+          }
+        }
+        for (const cached of cache.segments) {
+          const episodeIndex = Number(cached.episodeIndex);
+          if (!Number.isInteger(episodeIndex) || episodeIndex < 1 || episodeIndex > renderedEpisodes.length) continue;
+          if (renderedEpisodes[episodeIndex - 1]) continue;
+          const episodeInput = episodes.find((episode) => episode.episodeIndex === episodeIndex)?.input;
+          if (!episodeInput || !cached.result || !cached.promptText || !cached.sourceText) continue;
+          const renderDuration = episodeInput.duration || selectedDurationValue();
+          const normalizedCachedResult = normalizeBatchEpisodeResult(
+            script,
+            episodeIndex,
+            resolvedSegmentCount || episodes.length,
+            cached.result,
+            renderDuration,
+          );
+          try {
+            assertBatchSegmentQuality(script, episodeIndex, normalizedCachedResult, renderDuration, episodeInput.segmentContract);
+          } catch {
+            continue;
+          }
+          renderedEpisodes[episodeIndex - 1] = {
+            episodeIndex,
+            episodeInput,
+            result: normalizedCachedResult,
+            promptText: buildVideoGenerationPromptText(normalizedCachedResult),
+            sourceText: cached.sourceText,
+          };
+          segmentRepairReasons.delete(episodeIndex);
+          queuedRepairIndexes.delete(episodeIndex);
+          updateSegmentProgress(episodeIndex, "cached", "已恢复缓存分段，继续按顺序保存");
+          restoredCount += 1;
+        }
+
+        if (restoredCount > 0) {
+          setBatchResults(
+            renderedEpisodes
+              .filter((item): item is RenderedEpisode => Boolean(item))
+              .sort((left, right) => left.episodeIndex - right.episodeIndex)
+              .map((item) => ({
+                segment: { index: item.episodeIndex, text: item.sourceText },
+                result: item.result,
+                promptText: item.promptText,
+              })),
+          );
+          publishBatchProgress("saving", `已恢复缓存分段，继续按顺序保存：${restoredCount} 段`);
+          queueReadySegmentSaves();
+        }
+        return restoredCount;
+      } catch (cacheError) {
+        console.warn("Failed to restore rendered batch segments from cache", cacheError);
+        return 0;
+      }
+    }
+
     function storeRenderedEpisode(
       episode: SeasonPackEpisodeResult,
       episodeResult: AnalysisResult,
+      reportMeta: {
+        status?: SegmentQualityStatus;
+        renderStartedAt?: number;
+        renderCompletedAt?: number;
+        durationMs?: number;
+        packIndex?: number;
+        packSize?: number;
+      } = {},
     ) {
       const episodeIndex = episode.episodeIndex;
       const episodeInput = episode.input;
@@ -1537,6 +1867,28 @@ export function DashboardClient() {
       }
       const fullVideoPrompt = buildVideoGenerationPromptText(episodeResult);
       const episodeScript = episodeSourceText(script, episodeIndex, resolvedSegmentCount || episodes.length, episodeInput, episodeResult);
+      const repairReasons = segmentRepairReasons.get(episodeIndex) || [];
+      qualityReports.set(
+        episodeIndex,
+        createSegmentQualityReport({
+          batchId: seasonPackJob.id,
+          projectId: activeProjectId || undefined,
+          segmentIndex: episodeIndex,
+          title: episodeResult.title || episodeInput.title,
+          result: episodeResult,
+          sourceText: episodeScript,
+          status: reportMeta.status || (repairReasons.length ? "repaired" : "cached"),
+          scheduleProfile: activeRenderScheduleProfile,
+          packIndex: reportMeta.packIndex,
+          packSize: reportMeta.packSize,
+          repairCount: repairReasons.length,
+          repairReasons,
+          renderStartedAt: reportMeta.renderStartedAt,
+          renderCompletedAt: reportMeta.renderCompletedAt,
+          durationMs: reportMeta.durationMs,
+          contractHash: episodeInput.segmentContract?.contractHash,
+        }),
+      );
       renderedEpisodes[episodeIndex - 1] = {
         episodeIndex,
         episodeInput,
@@ -1544,6 +1896,8 @@ export function DashboardClient() {
         promptText: fullVideoPrompt,
         sourceText: episodeScript,
       };
+      segmentRepairReasons.delete(episodeIndex);
+      queuedRepairIndexes.delete(episodeIndex);
       setBatchResults(
         renderedEpisodes
           .filter((item): item is RenderedEpisode => Boolean(item))
@@ -1569,14 +1923,60 @@ export function DashboardClient() {
 
       updateSegmentProgress(episodeIndex, "repairing", "正在按单段质量生成修复");
       publishBatchProgress("repairing", `正在按单段质量生成第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
-      const episodeResult = await renderBatchSegmentWithQualityRepair(renderScript, renderDuration, episodeIndex, resolvedSegmentCount || episodes.length);
-      storeRenderedEpisode(episode, episodeResult);
+      const renderStartedAt = Date.now();
+      const episodeResult = await renderBatchSegmentWithQualityRepair(
+        renderScript,
+        renderDuration,
+        episodeIndex,
+        resolvedSegmentCount || episodes.length,
+        episodeInput.segmentContract,
+      );
+      storeRenderedEpisode(episode, episodeResult, {
+        status: "repaired",
+        renderStartedAt,
+        renderCompletedAt: Date.now(),
+        packIndex: episodeIndex,
+        packSize: 1,
+      });
     }
 
     function queueSegmentRepair(episode: SeasonPackEpisodeResult, reason: string) {
-      if (renderedEpisodes[episode.episodeIndex - 1] || queuedRepairIndexes.has(episode.episodeIndex)) return;
-      queuedRepairIndexes.add(episode.episodeIndex);
+      const cachedRendered = renderedEpisodes[episode.episodeIndex - 1];
+      if (cachedRendered) {
+        try {
+          assertBatchSegmentQuality(
+            script,
+            episode.episodeIndex,
+            cachedRendered.result,
+            cachedRendered.episodeInput.duration || selectedDurationValue(),
+            cachedRendered.episodeInput.segmentContract,
+          );
+        } catch {
+          renderedEpisodes[episode.episodeIndex - 1] = undefined;
+        }
+      }
+      if (renderedEpisodes[episode.episodeIndex - 1]) {
+        segmentRepairReasons.delete(episode.episodeIndex);
+        queuedRepairIndexes.delete(episode.episodeIndex);
+        updateSegmentProgress(episode.episodeIndex, "cached", "已有合格缓存，继续按顺序保存");
+        markSegmentQualityStatus(episode.episodeIndex, "cached", { repairReasons: [] });
+        writeBatchSegmentCache();
+        queueReadySegmentSaves();
+        return;
+      }
+      if (queuedRepairIndexes.has(episode.episodeIndex)) return;
       const reasonType = classifyBatchRepairReason(reason);
+      registerSegmentRepairReason(episode.episodeIndex, reason);
+      const attemptKey = buildBatchRepairAttemptKey(episode.episodeIndex, reasonType);
+      const attemptCount = (repairAttemptCounts.get(attemptKey) || 0) + 1;
+      repairAttemptCounts.set(attemptKey, attemptCount);
+      if (attemptCount > MAX_BATCH_REPAIR_ATTEMPTS_PER_REASON) {
+        updateSegmentProgress(episode.episodeIndex, "failed", `同类问题已自动修复 ${MAX_BATCH_REPAIR_ATTEMPTS_PER_REASON} 次，停止重复修复：${reason}`);
+        markSegmentQualityStatus(episode.episodeIndex, "failed", { repairReasons: segmentRepairReasons.get(episode.episodeIndex) || [reason] });
+        publishBatchProgress("failed", `第 ${episode.episodeIndex} 段同类问题重复出现，已停止自动重修。`);
+        return;
+      }
+      queuedRepairIndexes.add(episode.episodeIndex);
       const repairLabel = batchRepairReasonLabel(reasonType);
       repairQueue.push({ episode, reason, reasonType });
       updateSegmentProgress(episode.episodeIndex, "repairing", `${repairLabel}: ${reason}`);
@@ -1594,7 +1994,7 @@ export function DashboardClient() {
           const repairIndex = nextRepairIndex;
           nextRepairIndex += 1;
           const { episode, reasonType } = repairQueue[repairIndex];
-          updateSegmentProgress(episode.episodeIndex, "repairing", `${batchRepairReasonLabel(reasonType)}: retrying single-segment render`);
+          updateSegmentProgress(episode.episodeIndex, "repairing", `${batchRepairReasonLabel(reasonType)}: 正在重跑单段渲染`);
           await renderSingleEpisodeWithQualityRepair(episode);
         }
       }
@@ -1602,7 +2002,9 @@ export function DashboardClient() {
       await Promise.all(Array.from({ length: repairConcurrency }, () => repairNextSegment()));
     }
 
-    async function renderPackedSegmentsWithQualityRepair(packEpisodes: SeasonPackEpisodeResult[], allowSplitFallback = true) {
+    async function renderPackedSegmentsWithQualityRepair(packEpisodes: SeasonPackEpisodeResult[], allowSplitFallback = true, packIndex?: number) {
+      packEpisodes = packEpisodes.filter((episode) => !renderedEpisodes[episode.episodeIndex - 1]);
+      if (!packEpisodes.length) return;
       const packLabel = packEpisodes.map((episode) => episode.episodeIndex).join(", ");
       const packSegments = packEpisodes.map((episode) => {
         const episodeInput = episode.input;
@@ -1613,6 +2015,7 @@ export function DashboardClient() {
           renderInputScript: buildBatchEpisodeRenderScript(episodeInput, resolvedSegmentCount || episodes.length),
           duration: episodeInput.duration || selectedDurationValue(),
           shotCount: episodeInput.shotCount,
+          segmentContract: episodeInput.segmentContract,
         };
       });
 
@@ -1620,6 +2023,7 @@ export function DashboardClient() {
         updateSegmentProgress(episode.episodeIndex, "running", `Render Pack 生成中：${packLabel}`);
       }
       publishBatchProgress("rendering", `正在本地并发生成 Render Pack：第 ${packLabel} 段...`);
+      const packStartedAt = Date.now();
 
       try {
         async function runRenderPack(mode: RenderPackCodexMode) {
@@ -1631,20 +2035,20 @@ export function DashboardClient() {
         try {
           renderPackJob = await runRenderPack(STRICT_UTF8_RENDER_PACK_MODE);
         } catch (strictError) {
-          if (allowSplitFallback && packEpisodes.length > 2 && isRecoverableRenderPackError(strictError)) {
-            const splitAt = Math.ceil(packEpisodes.length / 2);
-            const splitRenderPacks = [packEpisodes.slice(0, splitAt), packEpisodes.slice(splitAt)].filter((pack) => pack.length);
+          if (allowSplitFallback && packEpisodes.length > 1 && isRecoverableRenderPackError(strictError)) {
+            const splitRenderPacks = buildRenderPacks(packEpisodes, { forceProfile: "SINGLE" }).packs;
             const reason = strictError instanceof Error ? strictError.message : "Render Pack strict UTF-8 generation failed";
             publishBatchProgress(
               "repairing",
-              `Render Pack 第 ${packLabel} 段 strict UTF-8 失败，正在拆成 ${splitRenderPacks.length} 个小包继续生成：${reason}`,
+              `Render Pack 第 ${packLabel} 段 strict UTF-8 失败，正在拆成 ${splitRenderPacks.length} 个单段包继续生成：${reason}`,
             );
-            await Promise.all(splitRenderPacks.map((splitPack) => renderPackedSegmentsWithQualityRepair(splitPack, false)));
+            await Promise.all(splitRenderPacks.map((splitPack, splitIndex) => renderPackedSegmentsWithQualityRepair(splitPack, false, splitIndex + 1)));
             return;
           }
           throw strictError;
         }
         const packDurationMs = renderPackDurationMs(renderPackJob);
+        const packCompletedAt = Date.now();
         if (packDurationMs >= SLOW_RENDER_PACK_WARNING_MS) {
           const minutes = Math.round(packDurationMs / 60_000);
           publishBatchProgress("rendering", `Render Pack ${packLabel} took ${minutes} minutes, marked as slow pack for diagnostics.`);
@@ -1665,8 +2069,15 @@ export function DashboardClient() {
           }
           const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, resolvedSegmentCount || episodes.length, rawResult, renderDuration);
           try {
-            assertBatchSegmentQuality(script, episodeIndex, episodeResult, renderDuration);
-            storeRenderedEpisode(episode, episodeResult);
+            assertBatchSegmentQuality(script, episodeIndex, episodeResult, renderDuration, episodeInput.segmentContract);
+            storeRenderedEpisode(episode, episodeResult, {
+              status: "cached",
+              renderStartedAt: packStartedAt,
+              renderCompletedAt: packCompletedAt,
+              durationMs: packDurationMs || Math.max(0, packCompletedAt - packStartedAt),
+              packIndex,
+              packSize: packEpisodes.length,
+            });
           } catch (error) {
             const reason = error instanceof Error ? error.message : "Render Pack 结果未通过单段质量校验";
             publishBatchProgress("repairing", `第 ${episodeIndex} / ${resolvedSegmentCount} 段 Render Pack 未过质量闸，正在单段重修：${reason}`);
@@ -1682,15 +2093,24 @@ export function DashboardClient() {
       }
     }
 
-    const renderPacks = chunkEpisodesForRenderPacks(episodes, BATCH_RENDER_PACK_SIZE);
+    restoreCachedRenderedSegments();
+
+    const renderSchedule = buildRenderPacks(episodes);
+    activeRenderScheduleProfile = renderSchedule.profile;
+    const renderPacks = renderSchedule.packs;
     let nextPackToRender = 0;
-    const renderPackConcurrency = Math.min(BATCH_RENDER_PACK_CONCURRENCY, renderPacks.length);
+    const renderPackConcurrency = Math.min(renderSchedule.concurrency, renderPacks.length);
+    const renderPackShape = renderPacks.map((pack) => pack.length).join("/");
+    publishBatchProgress(
+      "rendering",
+      `调度策略：${renderSchedule.profile}，${renderPackConcurrency} 包并发，分包 ${renderPackShape}。`,
+    );
 
     async function renderNextPack() {
       while (nextPackToRender < renderPacks.length) {
         const packIndex = nextPackToRender;
         nextPackToRender += 1;
-        await renderPackedSegmentsWithQualityRepair(renderPacks[packIndex]);
+        await renderPackedSegmentsWithQualityRepair(renderPacks[packIndex], true, packIndex + 1);
       }
     }
 
@@ -2226,13 +2646,30 @@ export function DashboardClient() {
                 {batchProgress.resolvedSegmentCount ? ` · 已识别 ${batchProgress.resolvedSegmentCount} 段` : ""}
               </div>
             </div>
-            <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-5">
-              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">完成 {batchProgress.completedCount}</span>
+            <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-6">
+              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">已保存 {batchProgress.savedCount}</span>
+              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">已缓存 {batchProgress.cachedCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">生成中 {batchProgress.runningCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">修复 {batchProgress.repairingCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">保存 {batchProgress.savingCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">等待 {batchProgress.pendingCount}</span>
             </div>
+            {batchProgress.qualityReportSummary && batchProgress.qualityReportSummary.totalReports > 0 && (
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-4">
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  质量均分 {batchProgress.qualityReportSummary.averageQualityScore}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  建议检查 {batchProgress.qualityReportSummary.suggestedReviewCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  最高风险 {formatBatchSafetyRisk(batchProgress.qualityReportSummary.highestSafetyRisk)}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  最慢段 {batchProgress.qualityReportSummary.slowestSegmentIndex ? `第 ${batchProgress.qualityReportSummary.slowestSegmentIndex} 段 ${formatBatchDurationMs(batchProgress.qualityReportSummary.slowestDurationMs)}` : "暂无"}
+                </span>
+              </div>
+            )}
             {batchProgress.segments.length > 0 && (
               <div className="mt-3 flex max-h-32 flex-wrap gap-2 overflow-y-auto pr-1">
                 {batchProgress.segments.map((segment) => (

@@ -102,7 +102,7 @@ async function postJson(pathname, body) {
 function buildCodexPrompt(task) {
   return [
     "You are running Local Director video prompt generation from a local Codex CLI worker.",
-    "Return strict JSON by writing a Local Director AnalysisResult object to the output path.",
+    "Return strict JSON by writing a Local Director complete video prompt result object to the output path.",
     "Do not call network providers. Do not open a browser. Do not ask the user for follow-up input.",
     "Write the JSON file as UTF-8. Prefer Node.js fs.writeFileSync(outputPath, JSON.stringify(result, null, 2), \"utf8\").",
     "Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
@@ -112,7 +112,7 @@ function buildCodexPrompt(task) {
     `Task ID: ${task.id}`,
     `Output path: ${task.outputPath}`,
     "",
-    "AnalysisResult generation instructions:",
+    "Video prompt generation instructions:",
     task.prompt,
     "",
     "After writing and validating the JSON file, reply with exactly one line: DONE.",

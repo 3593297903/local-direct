@@ -76,6 +76,13 @@ test("Codex workers capture CLI output and normalize quota failures", async () =
   assert.match(message, /CODEX_QUOTA_EXHAUSTED/);
   assert.match(message, /Codex 额度/);
 
+  const contractEchoMessage = helper.buildCodexFailureMessage(
+    "codex exec exited with code 1",
+    'SEGMENT CONTRACT: { "sourceText": "secret", "forbiddenFutureEvents": ["future"], "requiredShotBeats": [] }',
+  );
+  assert.match(contractEchoMessage, /Codex returned task prompt or SegmentContract text/);
+  assert.doesNotMatch(contractEchoMessage, /forbiddenFutureEvents/);
+
   for (const worker of codexWorkers) {
     const source = readFileSync(worker, "utf8");
     assert.match(source, /codex-runtime-utils\.mjs/, `${worker} should import quota normalization helpers`);
