@@ -21,6 +21,14 @@ import {
   type SegmentQualityReport,
   type SegmentQualityStatus,
 } from "@/lib/batch-segment-quality-report";
+import {
+  applyDeterministicQualityPatch,
+  buildTargetedRepairReason,
+  evaluateBatchSegmentQuality,
+  shouldRepairWithCodex,
+  summarizeQualityFindings,
+  type BatchSegmentQualityFinding,
+} from "@/lib/batch-segment-quality-gate";
 import { Clock, Download, FileText, Film, ImageIcon, Loader2, Maximize2, ScanLine, Send, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
 
 type StoryboardImageState = {
@@ -916,6 +924,69 @@ function assertBatchSegmentQuality(
   });
 }
 
+const SOFT_BATCH_FIELD_LENGTH_NAMES = Object.keys(MIN_BATCH_FIELD_LENGTHS);
+
+function isLegacySoftFieldLengthError(reason: string) {
+  if (!reason) return false;
+  const mentionsKnownField = SOFT_BATCH_FIELD_LENGTH_NAMES.some((field) => reason.includes(field));
+  if (!mentionsKnownField) return false;
+  return /too short|field length|minimum|有效字符|字段过短|瀛楁杩囩煭|杩囩煭/i.test(reason) || /\d+/.test(reason);
+}
+
+function normalizePatchAndValidateBatchSegment(
+  baseScript: string,
+  episodeIndex: number,
+  result: AnalysisResult,
+  requestedDuration: string,
+  contract?: SegmentContract,
+) {
+  const normalizedResult = normalizeBatchSegmentResultForQuality(result);
+  const firstGate = evaluateBatchSegmentQuality(normalizedResult, {
+    expectedShotCount: contract?.shotCount,
+    fullPromptText: buildVideoGenerationPromptText(normalizedResult),
+    minFullPromptLength: minimumBatchFullPromptLength(normalizedResult.storyboard || []),
+  });
+  const patchedResult = canonicalizeBatchSegmentResult(
+    applyDeterministicQualityPatch(normalizedResult, firstGate.findings),
+  );
+  const finalGate = evaluateBatchSegmentQuality(patchedResult, {
+    expectedShotCount: contract?.shotCount,
+    fullPromptText: buildVideoGenerationPromptText(patchedResult),
+    minFullPromptLength: minimumBatchFullPromptLength(patchedResult.storyboard || []),
+  });
+
+  if (shouldRepairWithCodex(finalGate)) {
+    throw new Error(buildTargetedRepairReason(finalGate));
+  }
+
+  try {
+    assertBatchSegmentQuality(baseScript, episodeIndex, patchedResult, requestedDuration, contract);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (isLegacySoftFieldLengthError(reason) && !shouldRepairWithCodex(finalGate)) {
+      const warning: BatchSegmentQualityFinding = {
+        severity: "warning",
+        code: "field_below_target",
+        message: reason,
+      };
+      finalGate.findings.push(warning);
+      finalGate.warningFindings.push(warning);
+      return {
+        result: patchedResult,
+        gate: finalGate,
+        localPatchSummary: summarizeQualityFindings([...firstGate.findings, ...finalGate.findings]),
+      };
+    }
+    throw error;
+  }
+
+  return {
+    result: patchedResult,
+    gate: finalGate,
+    localPatchSummary: summarizeQualityFindings([...firstGate.findings, ...finalGate.findings]),
+  };
+}
+
 function inferPromptContentType(sourceText: string) {
   if (/刑侦|公安|警局|投案|案/.test(sourceText)) return "短剧 / 刑侦惊悚";
   if (/惊悚|恐怖|旅馆|悬疑/.test(sourceText)) return "短剧 / 悬疑惊悚";
@@ -1009,6 +1080,9 @@ function buildBatchSegmentRepairScript(renderScript: string, episodeIndex: numbe
       storyboardCount: Array.isArray(failedResult.storyboard) ? failedResult.storyboard.length : 0,
       optimizedScript: failedResult.optimizedScript,
     }, null, 2)),
+    "",
+    "上一版完整结果 JSON（只修失败字段，其余字段尽量原样保留）：",
+    sanitizeInternalPromptTokens(JSON.stringify(failedResult, null, 2)),
   ].join("\n");
 }
 
@@ -1634,6 +1708,7 @@ export function DashboardClient() {
 
     const renderedEpisodes: Array<RenderedEpisode | undefined> = new Array(resolvedSegmentCount);
     const repairQueue: Array<{ episode: SeasonPackEpisodeResult; reason: string; reasonType: BatchRepairReasonType }> = [];
+    let repairPoolPromise: Promise<void> | null = null;
     const queuedRepairIndexes = new Set<number>();
     const queuedSaveIndexes = new Set<number>();
     const repairAttemptCounts = new Map<string, number>();
@@ -1708,8 +1783,8 @@ export function DashboardClient() {
       );
       const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, episodeCount, rawResult, renderDuration);
       try {
-        assertBatchSegmentQuality(script, episodeIndex, episodeResult, renderDuration, segmentContract);
-        return episodeResult;
+        const validated = normalizePatchAndValidateBatchSegment(script, episodeIndex, episodeResult, renderDuration, segmentContract);
+        return validated.result;
       } catch (error) {
         const reason = error instanceof Error ? error.message : "当前段未通过质量校验";
         const reasonType = classifyBatchRepairReason(reason);
@@ -1725,8 +1800,8 @@ export function DashboardClient() {
           undefined,
         );
         const repairedResult = normalizeBatchEpisodeResult(script, episodeIndex, episodeCount, repairedRawResult, renderDuration);
-        assertBatchSegmentQuality(script, episodeIndex, repairedResult, renderDuration, segmentContract);
-        return repairedResult;
+        const validatedRepair = normalizePatchAndValidateBatchSegment(script, episodeIndex, repairedResult, renderDuration, segmentContract);
+        return validatedRepair.result;
       }
     }
 
@@ -1832,16 +1907,23 @@ export function DashboardClient() {
             cached.result,
             renderDuration,
           );
+          let validatedCachedResult: AnalysisResult;
           try {
-            assertBatchSegmentQuality(script, episodeIndex, normalizedCachedResult, renderDuration, episodeInput.segmentContract);
+            validatedCachedResult = normalizePatchAndValidateBatchSegment(
+              script,
+              episodeIndex,
+              normalizedCachedResult,
+              renderDuration,
+              episodeInput.segmentContract,
+            ).result;
           } catch {
             continue;
           }
           renderedEpisodes[episodeIndex - 1] = {
             episodeIndex,
             episodeInput,
-            result: normalizedCachedResult,
-            promptText: buildVideoGenerationPromptText(normalizedCachedResult),
+            result: validatedCachedResult,
+            promptText: buildVideoGenerationPromptText(validatedCachedResult),
             sourceText: cached.sourceText,
           };
           segmentRepairReasons.delete(episodeIndex);
@@ -1967,13 +2049,18 @@ export function DashboardClient() {
       const cachedRendered = renderedEpisodes[episode.episodeIndex - 1];
       if (cachedRendered) {
         try {
-          assertBatchSegmentQuality(
+          const validatedCached = normalizePatchAndValidateBatchSegment(
             script,
             episode.episodeIndex,
             cachedRendered.result,
             cachedRendered.episodeInput.duration || selectedDurationValue(),
             cachedRendered.episodeInput.segmentContract,
           );
+          renderedEpisodes[episode.episodeIndex - 1] = {
+            ...cachedRendered,
+            result: validatedCached.result,
+            promptText: buildVideoGenerationPromptText(validatedCached.result),
+          };
         } catch {
           renderedEpisodes[episode.episodeIndex - 1] = undefined;
         }
@@ -2006,6 +2093,8 @@ export function DashboardClient() {
     }
 
     async function runSegmentRepairPool() {
+      if (repairPoolPromise) return repairPoolPromise;
+      repairPoolPromise = (async () => {
       if (!repairQueue.length) return;
       publishBatchProgress("repairing", `正在并发重修 ${repairQueue.length} 段，最多同时 ${BATCH_SINGLE_RENDER_CONCURRENCY} 段...`);
 
@@ -2023,6 +2112,14 @@ export function DashboardClient() {
       }
 
       await Promise.all(Array.from({ length: repairConcurrency }, () => repairNextSegment()));
+      repairQueue.splice(0, nextRepairIndex);
+      })();
+
+      try {
+        await repairPoolPromise;
+      } finally {
+        repairPoolPromise = null;
+      }
     }
 
     async function renderPackedSegmentsWithQualityRepair(packEpisodes: SeasonPackEpisodeResult[], allowSplitFallback = true, packIndex?: number) {
@@ -2092,8 +2189,8 @@ export function DashboardClient() {
           }
           const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, resolvedSegmentCount || episodes.length, rawResult, renderDuration);
           try {
-            assertBatchSegmentQuality(script, episodeIndex, episodeResult, renderDuration, episodeInput.segmentContract);
-            storeRenderedEpisode(episode, episodeResult, {
+            const validated = normalizePatchAndValidateBatchSegment(script, episodeIndex, episodeResult, renderDuration, episodeInput.segmentContract);
+            storeRenderedEpisode(episode, validated.result, {
               status: "cached",
               renderStartedAt: packStartedAt,
               renderCompletedAt: packCompletedAt,
@@ -2114,6 +2211,7 @@ export function DashboardClient() {
           queueSegmentRepair(episode, reason);
         }
       }
+      await runSegmentRepairPool();
     }
 
     restoreCachedRenderedSegments();

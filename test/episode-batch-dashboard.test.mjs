@@ -121,6 +121,10 @@ test("dashboard batch normalizes deterministic segment issues before expensive r
   const dashboardSource = await readFile(join(process.cwd(), "components", "DashboardClient.tsx"), "utf8");
 
   assert.match(dashboardSource, /normalizeBatchSegmentResultForQuality/);
+  assert.match(dashboardSource, /evaluateBatchSegmentQuality/);
+  assert.match(dashboardSource, /applyDeterministicQualityPatch/);
+  assert.match(dashboardSource, /shouldRepairWithCodex/);
+  assert.match(dashboardSource, /normalizePatchAndValidateBatchSegment/);
   assert.match(dashboardSource, /containsBatchNullishValue/);
   assert.match(dashboardSource, /sanitizeBatchNegativePrompt/);
   assert.doesNotMatch(dashboardSource, /\\b\(\?:undefined\|null\)\\b\/i\.test\(serializedResult\)/);
@@ -160,7 +164,8 @@ test("dashboard limits duplicate segment repair attempts and can restore cached 
   assert.match(dashboardSource, /restoreCachedRenderedSegments/);
   assert.match(dashboardSource, /localStorage\.getItem\(batchCacheKey\)/);
   assert.match(dashboardSource, /normalizedCachedResult/);
-  assert.match(dashboardSource, /assertBatchSegmentQuality\(script, episodeIndex, normalizedCachedResult/);
+  assert.match(dashboardSource, /normalizePatchAndValidateBatchSegment\(/);
+  assert.match(dashboardSource, /validatedCachedResult/);
   assert.match(dashboardSource, /已恢复缓存分段，继续按顺序保存/);
   assert.match(dashboardSource, /segmentRepairReasons\.delete\(episodeIndex\)/);
   assert.match(dashboardSource, /已有合格缓存，继续按顺序保存/);
