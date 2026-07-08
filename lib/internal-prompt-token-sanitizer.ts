@@ -36,6 +36,16 @@ const INTERNAL_PROMPT_TOKEN_RULES: InternalPromptTokenRule[] = [
     replacement: "聊天记录证据",
   },
   {
+    label: "qq_records",
+    pattern: /\bqq[-_\s]*(?:chat[-_\s]*)?records\b/gi,
+    replacement: "QQ聊天记录",
+  },
+  {
+    label: "chat_records",
+    pattern: /\bchat[-_\s]*records\b/gi,
+    replacement: "聊天记录证据",
+  },
+  {
     label: "digital-records",
     pattern: /\bdigital[-_\s]*records\b/gi,
     replacement: "数字证据",

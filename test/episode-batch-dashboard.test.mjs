@@ -68,16 +68,21 @@ test("dashboard can generate multiple project segments through a season pack job
     dashboardSource,
     /const episodeResult = normalizeBatchEpisodeResult/,
   );
-  assert.match(dashboardSource, /normalizeBatchSegmentResultForQuality\(normalized\)/);
+  assert.match(dashboardSource, /canonicalizeBatchSegmentResult\(normalized\)/);
   assert.match(dashboardSource, /JSON\.stringify\(result\)/);
   assert.match(dashboardSource, /segmentTerminologyPattern/);
   assert.match(dashboardSource, /assertBatchSegmentQuality/);
   assert.match(dashboardSource, /user-facing prompt contains internal token/);
+  assert.match(dashboardSource, /canonicalizeBatchSegmentResult/);
+  assert.match(dashboardSource, /fullVideoPrompt: canonicalFullVideoPrompt/);
+  assert.match(dashboardSource, /filmScript: canonicalFullVideoPrompt/);
   assert.match(dashboardSource, /segmentContract/);
   assert.match(dashboardSource, /contractHash/);
   assert.match(dashboardSource, /assertBatchSegmentContractQuality/);
   assert.match(dashboardSource, /renderBatchSegmentWithQualityRepair/);
   assert.match(dashboardSource, /buildBatchSegmentRepairScript/);
+  assert.match(dashboardSource, /字段级补强/);
+  assert.match(dashboardSource, /qq_records 要写成/);
   assert.match(dashboardSource, /15 秒默认 4-5 镜头/);
   assert.match(
     dashboardSource,

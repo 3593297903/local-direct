@@ -133,7 +133,7 @@ test("video prompt Codex jobs sanitize internal engineering tokens before buildi
   try {
     const job = await createVideoPromptCodexJob(
       {
-        script: "Open chat-log inside forensic_room and write a single-segment AnalysisResult.",
+        script: "Open chat-log and qq_records inside forensic_room and write a single-segment AnalysisResult.",
         contentType: "single-segment AnalysisResult",
         style: "case-room digital-records",
         projectMemory: "video_prompt_segment should not leak to users.",
@@ -144,6 +144,7 @@ test("video prompt Codex jobs sanitize internal engineering tokens before buildi
 
     assert.doesNotMatch(job.prompt, /single-segment AnalysisResult/);
     assert.doesNotMatch(job.prompt, /chat-log/);
+    assert.doesNotMatch(job.prompt, /qq_records/);
     assert.doesNotMatch(job.prompt, /forensic_room/);
     assert.doesNotMatch(job.prompt, /case-room/);
     assert.doesNotMatch(job.prompt, /digital-records/);

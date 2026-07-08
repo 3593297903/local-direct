@@ -428,11 +428,13 @@ ${shot.lighting ? `光影：${shot.lighting}` : ""}
     )
     .join("\n\n");
 
-  return [
+  const promptText = [
     `核心主题\n\n${coreTheme}`,
     `技术参数\n\n${technicalParams}`,
     `镜头画面 + 时间轴 + 声音 / 台词\n${shotLines}`,
   ].filter(Boolean).join("\n\n");
+
+  return sanitizeInternalPromptTokens(promptText);
 }
 
 function cleanPromptValue(value: unknown, fallback = "") {
@@ -498,6 +500,23 @@ function normalizeBatchSegmentResultForQuality(result: AnalysisResult): Analysis
     ...sanitized,
     workflow,
     storyboard,
+  };
+}
+
+function canonicalizeBatchSegmentResult(result: AnalysisResult): AnalysisResult {
+  const normalized = normalizeBatchSegmentResultForQuality(result);
+  const canonicalFullVideoPrompt = buildVideoGenerationPromptText(normalized);
+  const workflow = normalized.workflow
+    ? {
+      ...normalized.workflow,
+      fullVideoPrompt: canonicalFullVideoPrompt,
+      filmScript: canonicalFullVideoPrompt,
+    }
+    : normalized.workflow;
+
+  return {
+    ...normalized,
+    workflow,
   };
 }
 
@@ -618,7 +637,7 @@ function normalizeBatchEpisodeResult(
     storyboard: Array.isArray(result.storyboard) ? result.storyboard : [],
   } as AnalysisResult;
 
-  return normalizeBatchSegmentResultForQuality(normalized);
+  return canonicalizeBatchSegmentResult(normalized);
 }
 
 function inferBatchEpisodeSourceInfo(baseScript: string, episodeIndex: number) {
@@ -977,6 +996,10 @@ function buildBatchSegmentRepairScript(renderScript: string, episodeIndex: numbe
     "5. 最终标题和提示词必须使用“第 N 段”，不要写“第 N 集”。",
     "6. 15 秒默认 4-5 镜头；除非用户明确要求密集镜头版，否则 10-20 秒最多 5 个镜头。",
     "7. 不要输出空字段、占位文本、如上、同上、略、其他：无、16:9竖屏。",
+    "8. 这是字段级补强，不是整段重写；上一版已经合格的镜头、字段、人物、地点、事件顺序和情绪推进必须尽量原样保留。",
+    "9. 如果失败原因是某个 visual、composition、lighting、sound、shotPurpose、firstFramePrompt、videoPrompt 或 lastFramePrompt 过短，只扩写对应字段到更具体可拍的镜头描述，不要压缩其它镜头。",
+    "10. 修复后的 workflow.fullVideoPrompt、workflow.filmScript 和 storyboard 必须互相一致，不能比上一版更短、更概括或更模板化。",
+    "11. 不要把内部英文 ID、schema 名称、文件格式名或工程字段名写进 title、contentType、scene、visual、workflow 或 storyboard 字段；例如 qq_records 要写成“QQ聊天记录”。",
     "",
     "未通过校验的上次结果摘要：",
     sanitizeInternalPromptTokens(JSON.stringify({

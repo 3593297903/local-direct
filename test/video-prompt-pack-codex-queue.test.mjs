@@ -87,7 +87,7 @@ test("creates, claims, and completes a video prompt render pack job with indepen
               forbiddenFutureEvents: ["future event two"],
               characters: [],
               locations: [],
-              props: [],
+              props: [{ name: "qq_records" }],
               requiredShotBeats: [{ shotNumber: 1, timeRange: "0s-3s", beat: "source event one", visualFocus: "room" }],
               safetyPolicy: { avoidTerms: [], rewriteHints: {} },
               contractHash: "sc_test",
@@ -142,6 +142,7 @@ test("creates, claims, and completes a video prompt render pack job with indepen
     assert.match(job.prompt, /Do not use 同上/);
     assert.doesNotMatch(job.prompt, /single-segment AnalysisResult/);
     assert.doesNotMatch(job.prompt, /chat-log/);
+    assert.doesNotMatch(job.prompt, /qq_records/);
 
     const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
     assert.ok(claimed);
