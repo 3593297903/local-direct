@@ -199,6 +199,10 @@ type BatchGenerationProgress = {
   phase: BatchGenerationPhase;
   requestedCount: number | null;
   resolvedSegmentCount: number | null;
+  startedAtMs: number;
+  updatedAtMs: number;
+  finishedAtMs?: number;
+  elapsedMs: number;
   completedCount: number;
   savedCount: number;
   cachedCount: number;
@@ -234,6 +238,17 @@ function formatBatchDurationMs(ms: number) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return minutes > 0 ? `${minutes}m${seconds}s` : `${seconds}s`;
+}
+
+function formatBatchElapsedMs(ms: number) {
+  if (!Number.isFinite(ms) || ms <= 0) return "0秒";
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}小时${minutes}分${seconds}秒`;
+  if (minutes > 0) return `${minutes}分${seconds}秒`;
+  return `${seconds}秒`;
 }
 
 function formatBatchSafetyRisk(risk: BatchQualityReportSummary["highestSafetyRisk"]) {
@@ -1125,6 +1140,7 @@ export function DashboardClient() {
   const [episodeCount, setEpisodeCount] = useState(1);
   const [segmentCountMode, setSegmentCountMode] = useState<SegmentCountMode>("fixed");
   const [batchProgress, setBatchProgress] = useState<BatchGenerationProgress | null>(null);
+  const [batchProgressTick, setBatchProgressTick] = useState(0);
   const [episodeCountPickerOpen, setEpisodeCountPickerOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState("");
   const [generationProgress, setGenerationProgress] = useState("");
@@ -1134,6 +1150,13 @@ export function DashboardClient() {
   const [promptSafetyMessage, setPromptSafetyMessage] = useState("");
   const [promptSafetyError, setPromptSafetyError] = useState("");
   const [libraryError, setLibraryError] = useState("");
+
+  useEffect(() => {
+    if (!batchProgress || batchProgress.phase === "completed" || batchProgress.phase === "failed") return;
+    setBatchProgressTick(Date.now());
+    const timer = window.setInterval(() => setBatchProgressTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [batchProgress?.startedAtMs, batchProgress?.phase]);
 
   useEffect(() => {
     let active = true;
@@ -1584,6 +1607,8 @@ export function DashboardClient() {
     let resolvedSegmentCount = requestedCount || null;
     let segmentProgressItems: BatchSegmentProgress[] = [];
     const qualityReports = new Map<number, SegmentQualityReport>();
+    const batchStartedAtMs = Date.now();
+    let batchFinishedAtMs: number | undefined;
     setBatchGenerating(true);
 
     function qualityReportSummary() {
@@ -1591,6 +1616,11 @@ export function DashboardClient() {
     }
 
     function publishBatchProgress(phase: BatchGenerationPhase, currentMessage: string) {
+      const nowMs = Date.now();
+      if ((phase === "completed" || phase === "failed") && !batchFinishedAtMs) {
+        batchFinishedAtMs = nowMs;
+      }
+      const elapsedReferenceMs = batchFinishedAtMs || nowMs;
       const savedCount = segmentProgressItems.filter((item) => item.status === "saved" || item.status === "completed").length;
       const cachedCount = segmentProgressItems.filter((item) => item.status === "cached").length;
       const completedCount = savedCount;
@@ -1603,6 +1633,10 @@ export function DashboardClient() {
         phase,
         requestedCount,
         resolvedSegmentCount,
+        startedAtMs: batchStartedAtMs,
+        updatedAtMs: nowMs,
+        finishedAtMs: batchFinishedAtMs,
+        elapsedMs: Math.max(0, elapsedReferenceMs - batchStartedAtMs),
         completedCount,
         savedCount,
         cachedCount,
@@ -2336,6 +2370,18 @@ export function DashboardClient() {
         ? "本地服务暂时无响应，请确认开发服务器正在运行，或重启后再试。"
         : formatUserFacingError(err, "分析失败");
       setError(message);
+      setBatchProgress((current) => {
+        if (!current || current.phase === "completed" || current.phase === "failed") return current;
+        const failedAtMs = Date.now();
+        return {
+          ...current,
+          phase: "failed",
+          currentMessage: message,
+          updatedAtMs: failedAtMs,
+          finishedAtMs: failedAtMs,
+          elapsedMs: Math.max(0, failedAtMs - current.startedAtMs),
+        };
+      });
     } finally {
       setLoading(false);
       setBatchGenerating(false);
@@ -2552,6 +2598,17 @@ export function DashboardClient() {
     ? matchShotReferences(referenceShot, libraryItems)
     : { shot: [], camera: [], transition: [] };
   const referenceTotal = referenceMatches.shot.length + referenceMatches.camera.length + referenceMatches.transition.length;
+  const visibleBatchElapsedMs = batchProgress
+    ? Math.max(
+        0,
+        (batchProgress.finishedAtMs || batchProgressTick || batchProgress.updatedAtMs) - batchProgress.startedAtMs,
+      )
+    : 0;
+  const batchElapsedLabel = batchProgress
+    ? batchProgress.phase === "completed" || batchProgress.phase === "failed"
+      ? `总耗时 ${formatBatchElapsedMs(batchProgress.elapsedMs || visibleBatchElapsedMs)}`
+      : `已用时 ${formatBatchElapsedMs(visibleBatchElapsedMs)}`
+    : "";
 
   return (
     <div className="space-y-6">
@@ -2775,6 +2832,11 @@ export function DashboardClient() {
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">保存 {batchProgress.savingCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">等待 {batchProgress.pendingCount}</span>
             </div>
+            {batchElapsedLabel && (
+              <div className="mt-2 inline-flex rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1 text-xs font-semibold text-cyan-50">
+                {batchElapsedLabel}
+              </div>
+            )}
             {batchProgress.qualityReportSummary && batchProgress.qualityReportSummary.totalReports > 0 && (
               <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-4">
                 <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">

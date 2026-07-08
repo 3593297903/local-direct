@@ -10,6 +10,11 @@ test("dashboard can generate multiple project segments through a season pack job
   assert.match(dashboardSource, /type SegmentCountMode = "fixed" \| "auto"/);
   assert.match(dashboardSource, /const \[segmentCountMode, setSegmentCountMode\]/);
   assert.match(dashboardSource, /const \[batchProgress, setBatchProgress\]/);
+  assert.match(dashboardSource, /const \[batchProgressTick, setBatchProgressTick\]/);
+  assert.match(dashboardSource, /startedAtMs: number/);
+  assert.match(dashboardSource, /elapsedMs: number/);
+  assert.match(dashboardSource, /formatBatchElapsedMs/);
+  assert.match(dashboardSource, /batchElapsedLabel/);
   assert.match(dashboardSource, /const \[episodeCountPickerOpen, setEpisodeCountPickerOpen\] = useState\(false\)/);
   assert.match(dashboardSource, /aria-label="生成段数"/);
   assert.match(dashboardSource, /min="1"/);
