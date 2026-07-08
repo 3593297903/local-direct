@@ -25,6 +25,6 @@ test("project versions persist the exact rendered full video prompt", () => {
   assert.doesNotMatch(dashboard, /save:\s*true/);
 
   assert.match(projects, /fullVideoPrompt\?: string \| null/);
-  assert.match(projects, /if \(version\.fullVideoPrompt\) return version\.fullVideoPrompt/);
+  assert.match(projects, /if \(version\.fullVideoPrompt\) return sanitizeInternalPromptTokens\(version\.fullVideoPrompt\)/);
   assert.match(projects, /视频生成提示词/);
 });

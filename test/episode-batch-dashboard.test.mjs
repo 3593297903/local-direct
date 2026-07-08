@@ -82,7 +82,8 @@ test("dashboard can generate multiple project segments through a season pack job
   assert.match(dashboardSource, /renderBatchSegmentWithQualityRepair/);
   assert.match(dashboardSource, /buildBatchSegmentRepairScript/);
   assert.match(dashboardSource, /字段级补强/);
-  assert.match(dashboardSource, /qq_records 要写成/);
+  assert.match(dashboardSource, /所有道具、证据、场景和人物都必须使用中文自然称呼/);
+  assert.doesNotMatch(dashboardSource, /qq_records 要写成/);
   assert.match(dashboardSource, /15 秒默认 4-5 镜头/);
   assert.match(
     dashboardSource,

@@ -290,7 +290,7 @@ function buildPromptSafetyCodexPrompt(
     "Source rendered prompt:",
     input.promptText,
     "",
-    "Source AnalysisResult JSON:",
+    "Source structured prompt JSON:",
     JSON.stringify(input.sourceResult, null, 2),
     "",
     "Completion requirements:",

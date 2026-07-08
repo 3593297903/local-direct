@@ -134,13 +134,15 @@ test("creates, claims, and completes a video prompt render pack job with indepen
     assert.match(job.id, /^video-prompt-pack-job-/);
     assert.equal(job.segments.length, 5);
     assert.match(job.prompt, /Render Pack/);
-    assert.match(job.prompt, /SEGMENT CONTRACT/);
+    assert.match(job.prompt, /段落契约/);
     assert.match(job.prompt, /source event one/);
     assert.match(job.prompt, /future event two/);
     assert.match(job.prompt, /episode-001\.json/);
     assert.match(job.prompt, /episode-005\.json/);
     assert.match(job.prompt, /Do not use 同上/);
     assert.doesNotMatch(job.prompt, /single-segment AnalysisResult/);
+    assert.doesNotMatch(job.prompt, /single-segment/i);
+    assert.doesNotMatch(job.prompt, /SegmentContract/);
     assert.doesNotMatch(job.prompt, /chat-log/);
     assert.doesNotMatch(job.prompt, /qq_records/);
 

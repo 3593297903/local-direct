@@ -172,7 +172,8 @@ test("creates, claims, and completes a season planning job from per-episode inpu
     assert.doesNotMatch(completed.result.episodes[1].input.renderInputScript, /单集渲染输入/);
     assert.ok(completed.result.seasonPlan.segmentContracts);
     assert.equal(completed.result.episodes[0].input.segmentContract.segmentIndex, 1);
-    assert.match(completed.result.episodes[0].input.renderInputScript, /SEGMENT CONTRACT/);
+    assert.match(completed.result.episodes[0].input.renderInputScript, /段落契约/);
+    assert.doesNotMatch(completed.result.episodes[0].input.renderInputScript, /SEGMENT CONTRACT|SegmentContract/);
 
     const reloaded = await getSeasonPackCodexJob(job.id, { rootDir });
     assert.equal(reloaded.status, "completed");
@@ -295,7 +296,8 @@ test("cleans contradictory renderer instructions from segment render scripts", a
     const renderInputScript = completed.result.episodes[0].input.renderInputScript;
     assert.doesNotMatch(renderInputScript, /不要输出 workflow\.fullVideoPrompt/);
     assert.doesNotMatch(renderInputScript, /Do not include workflow\.fullVideoPrompt/i);
-    assert.match(renderInputScript, /Renderer output requirement: final video prompt result JSON must include workflow\.fullVideoPrompt/);
+    assert.match(renderInputScript, /渲染输出要求：最终视频提示词 JSON 必须包含完整视频提示词/);
+    assert.doesNotMatch(renderInputScript, /Renderer output requirement/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
@@ -398,11 +400,12 @@ test("packs season plan beats into locked segments before render input generatio
     assert.deepEqual(completed.result.seasonPlan.lockedSegments[0].beatIds, ["B001", "B002", "B003"]);
     assert.equal(completed.result.episodes[0].input.duration, "14秒");
     assert.equal(completed.result.episodes[1].input.duration, "9秒");
-    assert.match(completed.result.episodes[0].input.renderInputScript, /LOCKED SEGMENT PLAN/);
+    assert.match(completed.result.episodes[0].input.renderInputScript, /全局节拍排程锁/);
     assert.match(completed.result.episodes[0].input.renderInputScript, /B001/);
     assert.match(completed.result.episodes[0].input.renderInputScript, /B003/);
     assert.doesNotMatch(completed.result.seasonPlan.lockedSegments[0].sourceText, /B004/);
-    assert.match(completed.result.episodes[0].input.renderInputScript, /forbiddenFutureEvents/);
+    assert.match(completed.result.episodes[0].input.renderInputScript, /禁止提前透露的后续信息/);
+    assert.doesNotMatch(completed.result.episodes[0].input.renderInputScript, /LOCKED SEGMENT PLAN|forbiddenFutureEvents/);
     assert.match(completed.result.episodes[0].input.segmentContract.forbiddenFutureEvents.join("\n"), /B004/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
@@ -541,8 +544,8 @@ test("coerces episode input pack shot count to the locked segment contract when 
     const input = completed.result.episodes[0].input;
     assert.equal(input.shotCount, 3);
     assert.equal(input.segmentContract.shotCount, 3);
-    assert.match(input.renderInputScript, /Shot count lock: 3/);
-    assert.doesNotMatch(input.renderInputScript, /Shot count lock: 4/);
+    assert.match(input.renderInputScript, /镜头数量锁：3/);
+    assert.doesNotMatch(input.renderInputScript, /Shot count lock|镜头数量锁：4/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
@@ -622,7 +625,8 @@ test("coerces stale segment contract shot count to the locked segment plan when 
     assert.equal(input.shotCount, 4);
     assert.equal(input.segmentContract.shotCount, 4);
     assert.equal(input.segmentContract.requiredShotBeats.length, 4);
-    assert.match(input.renderInputScript, /Shot count lock: 4/);
+    assert.match(input.renderInputScript, /镜头数量锁：4/);
+    assert.doesNotMatch(input.renderInputScript, /Shot count lock/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

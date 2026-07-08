@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { sanitizeInternalPromptTokens } from "./internal-prompt-token-sanitizer";
+import {
+  assertCleanCodexPromptInput,
+  buildChinesePromptLexiconBlock,
+  compileCodexPromptText,
+} from "./codex-prompt-input-compiler";
 
 export type VideoPromptCodexJobStatus = "pending" | "running" | "completed" | "failed";
 
@@ -89,6 +93,8 @@ export async function createVideoPromptCodexJob(
   const requestedDuration = normalizeRequestedDuration(input.duration);
   const projectMemory = input.projectMemory || "";
   const normalizedInput = { ...input, duration: requestedDuration, projectMemory };
+  const prompt = buildVideoPromptCodexPrompt(normalizedInput, outputPath);
+  assertCleanCodexPromptInput(prompt, "Video prompt Codex prompt");
   const job: VideoPromptCodexJob = {
     id: jobId,
     projectId: input.projectId || null,
@@ -98,7 +104,7 @@ export async function createVideoPromptCodexJob(
     style: input.style || "自动匹配文案气质",
     duration: requestedDuration,
     projectMemory,
-    prompt: buildVideoPromptCodexPrompt(normalizedInput, outputPath),
+    prompt,
     status: "pending",
     outputFileName,
     outputPath,
@@ -191,10 +197,16 @@ export async function failVideoPromptCodexJob(
 function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outputPath: string) {
   const requestedDuration = normalizeRequestedDuration(input.duration);
   const durationMode = requestedDuration.toLowerCase() === "auto" ? "auto" : "fixed";
-  const script = sanitizeInternalPromptTokens(input.script);
-  const contentType = sanitizeInternalPromptTokens(input.contentType || "短剧 / 通用");
-  const style = sanitizeInternalPromptTokens(input.style || "自动匹配文案气质");
-  const projectMemory = sanitizeInternalPromptTokens(input.projectMemory || "(none)");
+  const script = compileCodexPromptText(input.script);
+  const contentType = compileCodexPromptText(input.contentType || "短剧 / 通用");
+  const style = compileCodexPromptText(input.style || "自动匹配文案气质");
+  const projectMemory = compileCodexPromptText(input.projectMemory || "(none)");
+  const lexiconBlock = buildChinesePromptLexiconBlock([
+    input.script,
+    input.contentType,
+    input.style,
+    input.projectMemory,
+  ]);
   return [
     "You are handling a Local Director local video prompt generation task.",
     "",
@@ -237,6 +249,8 @@ function buildVideoPromptCodexPrompt(input: CreateVideoPromptCodexJobInput, outp
     "- Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
     "- After writing, read the file back as UTF-8 and confirm Chinese characters are preserved, not replaced by question marks.",
     "",
+    lexiconBlock,
+    lexiconBlock ? "" : "",
     `Script: ${script}`,
     `Content type: ${contentType}`,
     `Style: ${style}`,

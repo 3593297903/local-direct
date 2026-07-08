@@ -999,7 +999,7 @@ function buildBatchSegmentRepairScript(renderScript: string, episodeIndex: numbe
     "8. 这是字段级补强，不是整段重写；上一版已经合格的镜头、字段、人物、地点、事件顺序和情绪推进必须尽量原样保留。",
     "9. 如果失败原因是某个 visual、composition、lighting、sound、shotPurpose、firstFramePrompt、videoPrompt 或 lastFramePrompt 过短，只扩写对应字段到更具体可拍的镜头描述，不要压缩其它镜头。",
     "10. 修复后的 workflow.fullVideoPrompt、workflow.filmScript 和 storyboard 必须互相一致，不能比上一版更短、更概括或更模板化。",
-    "11. 不要把内部英文 ID、schema 名称、文件格式名或工程字段名写进 title、contentType、scene、visual、workflow 或 storyboard 字段；例如 qq_records 要写成“QQ聊天记录”。",
+    "11. 不要把内部英文 ID、schema 名称、文件格式名或工程字段名写进 title、contentType、scene、visual、workflow 或 storyboard 字段；所有道具、证据、场景和人物都必须使用中文自然称呼。",
     "",
     "未通过校验的上次结果摘要：",
     sanitizeInternalPromptTokens(JSON.stringify({

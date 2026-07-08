@@ -4,10 +4,15 @@ import path from "node:path";
 import {
   buildSegmentContractHash,
   normalizeSegmentContract,
-  segmentContractToRenderBlock,
   validateSegmentContract,
   type SegmentContract,
 } from "./batch-segment-contract";
+import {
+  assertCleanCodexPromptInput,
+  buildChinesePromptLexiconBlock,
+  compileCodexPromptText,
+  segmentContractToChineseRenderBlock,
+} from "./codex-prompt-input-compiler";
 import { findInternalPromptToken, sanitizeInternalPromptTokens } from "./internal-prompt-token-sanitizer";
 
 export type SeasonPackCodexJobStatus = "pending" | "running" | "completed" | "failed";
@@ -197,6 +202,16 @@ export async function createSeasonPackCodexJob(
   const segmentCountMode: SeasonPackSegmentCountMode = input.segmentCountMode === "auto" ? "auto" : "fixed";
   const requestedEpisodeCount = segmentCountMode === "auto" ? null : input.episodeCount || 1;
   const episodeCount = requestedEpisodeCount || 0;
+  const prompt = buildSeasonPackCodexPrompt({
+    ...input,
+    duration,
+    contentType,
+    style,
+    projectMemory,
+    segmentCountMode,
+    episodeCount,
+  }, { packDir, episodesDir, manifestPath, seasonPlanPath });
+  assertCleanCodexPromptInput(prompt, "Season pack planning prompt");
   const job: SeasonPackCodexJob = {
     id: jobId,
     projectId: input.projectId || null,
@@ -209,15 +224,7 @@ export async function createSeasonPackCodexJob(
     contentType,
     style,
     projectMemory,
-    prompt: buildSeasonPackCodexPrompt({
-      ...input,
-      duration,
-      contentType,
-      style,
-      projectMemory,
-      segmentCountMode,
-      episodeCount,
-    }, { packDir, episodesDir, manifestPath, seasonPlanPath }),
+    prompt,
     status: "pending",
     packDir,
     episodesDir,
@@ -323,6 +330,16 @@ function buildSeasonPackCodexPrompt(
 ) {
   const isAuto = input.segmentCountMode === "auto";
   const exampleLast = episodeFileName(isAuto ? MAX_EPISODE_COUNT : input.episodeCount);
+  const script = compileCodexPromptText(input.script);
+  const contentType = compileCodexPromptText(input.contentType);
+  const style = compileCodexPromptText(input.style);
+  const projectMemory = compileCodexPromptText(input.projectMemory || "(none)");
+  const lexiconBlock = buildChinesePromptLexiconBlock([
+    input.script,
+    input.contentType,
+    input.style,
+    input.projectMemory,
+  ]);
   const segmentCountInstruction = isAuto
     ? "You must decide the best segment count between 1 and 30 from the source structure. Every resolved segment must be 15 seconds or less unless the source explicitly asks for a shorter duration."
     : `You must write exactly ${input.episodeCount} segment JSON files.`;
@@ -330,21 +347,21 @@ function buildSeasonPackCodexPrompt(
     ? `Segment files keep the compatibility filename pattern episode-001.json through the resolved final file, never beyond ${exampleLast}.`
     : `Segment files keep the compatibility filename pattern episode-001.json through ${exampleLast}.`;
   const requiredEpisodeFilesInstruction = isAuto
-    ? "- one segment file per resolved segment in the episodes directory. The resolved count must be 1-30 and must match manifest.generatedEpisodes."
-    : `- ${input.episodeCount} segment files in the episodes directory.`;
+    ? "- 在分段目录中为每一个识别出的段落写一个段落输入文件。识别段数必须是 1-30，并且必须和 manifest.generatedEpisodes 一致。"
+    : `- 在分段目录中写 ${input.episodeCount} 个段落输入文件。`;
   return [
-    "You are running Local Director season planning from a local Codex CLI worker.",
-    "Use one long-context pass to understand the complete source script and produce a planning file pack.",
-    "Important: do NOT generate final video prompts here. Do NOT generate final video prompt result JSON here.",
-    "This task only creates Story Bible, Segment Chain, and per-segment input packs for the normal Chinese single segment renderer.",
-    "Do not call network providers. Do not open a browser. Do not ask the user for follow-up input.",
+    "你正在通过本地 Codex CLI worker 执行 Local Director 多段规划任务。",
+    "请用一次长上下文阅读完整原文，并生成规划文件包。",
+    "重要：这里不要生成最终视频提示词，也不要生成最终视频提示词结果 JSON。",
+    "本任务只创建项目固定记忆、段落承接关系，以及给后续中文单段渲染器使用的段落输入包。",
+    "不要调用网络模型，不要打开浏览器，不要向用户追问。",
     "",
     segmentCountInstruction,
     filePatternInstruction,
-    "Each file must contain one strict Segment Input Pack JSON object, not a final prompt result.",
-    "For compatibility this object is also called an Episode Input Pack in older code, but user-facing text must say segment / 段.",
-    "Every Segment Input Pack must include: episodeIndex, title, sourceText, duration, contentType, style, storyBible, episodeChain, blueprint, shotCount, and renderInputScript.",
-    "Do not include workflow.fullVideoPrompt. Do not include storyboard. The downstream single segment renderer will create those.",
+    "每个文件必须包含一个严格的段落输入包 JSON 对象，不是最终提示词结果。",
+    "旧代码中这个对象可能仍叫 Episode Input Pack，但所有用户可见文本必须使用“段”。",
+    "每个段落输入包必须包含这些机器字段：episodeIndex, title, sourceText, duration, contentType, style, storyBible, episodeChain, blueprint, shotCount, renderInputScript。",
+    "不要包含 workflow.fullVideoPrompt，不要包含 storyboard；后续单段渲染器会生成这些内容。",
     "",
     "Write these files as UTF-8 with Node.js fs.writeFileSync. Do not use PowerShell Set-Content, Out-File, shell redirection, or here-strings for Chinese text.",
     `Pack directory: ${paths.packDir}`,
@@ -352,54 +369,56 @@ function buildSeasonPackCodexPrompt(
     `Season plan path: ${paths.seasonPlanPath}`,
     `Episodes directory: ${paths.episodesDir}`,
     "",
-    "Required file pack:",
+    "必须写出的文件包：",
     "- manifest.json with episodeCount, generatedEpisodes, and status.",
     "- season-plan.json with storyBible, episodeChain, characters, scenes, props, visualStyle, cameraLanguage, lockedRules, beats, lockedSegments, and segmentContracts.",
     requiredEpisodeFilesInstruction,
     "",
-    "Planning rules:",
-    "- Build one stable Story Bible from the full source and Project memory.",
-    "- First extract a global ordered beats array. Each beat must include id, summary, sourceText, estimatedDurationSeconds, and shotCount.",
-    "- Treat beats as the source of truth for segmentation. The program will repack beats into locked segments with a hard 15 second limit before render.",
-    "- Do not let the downstream render worker decide whether a shot should move to the next segment. All moving/splitting belongs to this planning stage.",
-    "- If one beat is longer than 15 seconds, split it into smaller beat items before writing season-plan.json.",
-    "- Include a segments or lockedSegments array when possible: segmentIndex, title, beatStart, beatEnd, beatIds, estimatedDurationSeconds, shotCount, and sourceText.",
-    "- Include segmentContracts: one contract per locked segment with segmentIndex, title, sourceText, durationSeconds, shotCount, requiredEvents, forbiddenFutureEvents, characters, locations, props, requiredShotBeats, and safetyPolicy.",
-    "- SegmentContract is the hard render contract. requiredEvents must be covered; forbiddenFutureEvents must not appear in the final generated segment.",
-    "- Every segment must be <=15 seconds. Ideal segment duration is 9-14.8 seconds. Segments under 7 seconds should be merged with a neighbor unless they are a deliberate hook.",
-    "- Build one Segment Chain covering every requested segment: startState, endState, carriedHooks, resolvedHooks, nextBridge, timelinePosition.",
-    "- Keep all segments consistent with the same Story Bible and ID references.",
-    "- If Project memory is provided, continue from it and do not reset existing characters, settings, or tone.",
-    "- If Project memory is empty, infer a new project bible from the full source script.",
+    "规划规则：",
+    "- 从完整原文和项目记忆中建立一份稳定的项目固定记忆。",
+    "- 先提取全局有序剧情节拍数组。每个节拍必须包含机器字段 id, summary, sourceText, estimatedDurationSeconds, shotCount。",
+    "- 以节拍作为分段事实来源。程序会在渲染前把节拍重新装入不超过 15 秒的锁定段落。",
+    "- 不要让后续渲染 worker 决定某个镜头是否挪到下一段；所有移动和拆分都必须在规划阶段完成。",
+    "- 如果某个节拍本身超过 15 秒，先把它拆成更小的节拍，再写入 season-plan.json。",
+    "- 尽量包含 segments 或 lockedSegments 数组，字段包括 segmentIndex, title, beatStart, beatEnd, beatIds, estimatedDurationSeconds, shotCount, sourceText。",
+    "- 包含 segmentContracts：每个锁定段落对应一份段落契约，机器字段包括 segmentIndex, title, sourceText, durationSeconds, shotCount, requiredEvents, forbiddenFutureEvents, characters, locations, props, requiredShotBeats, safetyPolicy。",
+    "- 段落契约是渲染硬约束：必须覆盖 requiredEvents，最终生成段落不得出现 forbiddenFutureEvents。",
+    "- 每段必须 <=15 秒。理想段长是 9-14.8 秒。低于 7 秒的段落除非是刻意钩子，否则应优先和相邻段合并。",
+    "- 为所有请求段落建立段落承接关系，字段包括 startState, endState, carriedHooks, resolvedHooks, nextBridge, timelinePosition。",
+    "- 所有段落必须和同一份项目固定记忆、角色称呼、地点称呼和道具称呼保持一致。",
+    "- 如果提供了项目记忆，要从现有记忆继续，不要重置已有角色、设定或语气。",
+    "- 如果项目记忆为空，要从完整原文中推断新的项目固定记忆。",
     isAuto
-      ? "- Auto mode: split the source into the best number of Local Director video segments by meaning and order. Choose enough segments to preserve concrete events, but keep every segment focused and <=15 seconds."
-      : "- Split the source into the requested number of video segments by meaning and order. These are Local Director segments, not story episodes.",
+      ? "- 自动模式：按剧情含义和顺序把原文拆成最合适数量的 Local Director 视频段。段数要足够保留具体事件，但每段必须聚焦且 <=15 秒。"
+      : "- 按用户请求数量和剧情顺序拆成视频段。这些是 Local Director 段落，不是故事剧集。",
     "- If the source script already contains explicit segment headings such as 第1段 / 第2段, preserve that segment count and order.",
     "- If the source contains labels such as 原剧本第二集 / 第三集, keep them only as internal source metadata and never write them into final title, sourceText, or renderInputScript.",
     "- If a source segment contains explicit 镜头 lines or time-range shot lines such as 0s-4s｜镜头1 or 00:00-00:04｜镜头1, use that count only when it fits the duration density rules below.",
-    "- Shot density is locked: 15 秒默认 4-5 镜头; for 10-20 seconds, shotCount must be 4 or 5 unless the user explicitly says 密集镜头版. Do not pack 7-8 shots into a 14-15 second segment.",
-    "- If the source does not contain explicit shot lines, infer shotCount by duration: <=8 seconds needs 2 shots, 10-20 seconds needs 4-5 shots, 20-60 seconds needs 5-8 shots, and longer segments need more concrete beats.",
-    "- Preserve concrete source locations, actions, objects, dialogue, and character beats in sourceText and blueprint.",
-    "- The segment title should be 第N段｜source segment title when a segment title exists.",
-    "- The segment duration should match the source segment end time when explicit shot time ranges exist, otherwise follow the requested duration.",
-    "- contentType and style must be concrete Chinese text inferred from the full source and project memory; never leave them blank.",
-    "- renderInputScript is the exact script that will be sent to the normal single segment renderer. It must be compact but complete.",
-    "- renderInputScript must include: Story Bible summary, Segment Chain item, Segment Blueprint, SegmentContract summary, original sourceText, shotCount lock, style lock, continuity rules, and a clear instruction to generate a full Local Director Chinese single segment video prompt result.",
-    "- renderInputScript must say 第 N 段, 本段, and 单段渲染输入. It must not say 第 N 集, 本集, or 单集.",
-    "- renderInputScript must not contain final workflow.fullVideoPrompt or final storyboard JSON.",
+    "- 镜头密度锁定：15 秒默认 4-5 镜头；10-20 秒的 shotCount 必须是 4 或 5，除非用户明确写了密集镜头版。不要把 7-8 个镜头塞进 14-15 秒段落。",
+    "- 如果原文没有明确镜头行，按时长推断 shotCount：<=8 秒需要 2 个镜头，10-20 秒需要 4-5 个镜头，20-60 秒需要 5-8 个镜头，更长内容必须拆成更多具体节拍。",
+    "- 在 sourceText 和 blueprint 中保留原文的具体地点、动作、物件、台词和人物节拍。",
+    "- 如果原文有段落标题，段落标题应写成“第N段｜原文段落标题”。",
+    "- 如果原文有明确镜头时间范围，段落时长应匹配原文段落结束时间；否则按用户请求时长执行。",
+    "- contentType 和 style 必须是从完整原文和项目记忆推断出的具体中文文本，不能留空。",
+    "- renderInputScript 是要发给后续中文单段渲染器的准确输入，必须短而完整。",
+    "- renderInputScript 必须包含：项目固定记忆摘要、段落承接关系、本段结构规划、中文段落契约摘要、原文范围、镜头数量锁、风格锁定、连续性规则，以及生成完整 Local Director 中文段落视频提示词结果的明确要求。",
+    "- renderInputScript 必须写“第 N 段”“本段”“单段渲染输入”，不得写“第 N 集”“本集”或“单集”。",
+    "- renderInputScript 不得包含最终 workflow.fullVideoPrompt 或最终 storyboard JSON。",
     "",
     `Project ID: ${input.projectId || "new project"}`,
     `Segment count mode: ${input.segmentCountMode}`,
     `Segment count: ${isAuto ? "auto" : input.episodeCount}`,
     `Duration: ${input.duration}`,
-    `Content type: ${input.contentType}`,
-    `Style: ${input.style}`,
+    `Content type: ${contentType}`,
+    `Style: ${style}`,
     "",
+    lexiconBlock,
+    lexiconBlock ? "" : "",
     "Project memory:",
-    input.projectMemory || "(none)",
+    projectMemory,
     "",
     "Full source script:",
-    input.script,
+    script,
     "",
     "Completion requirements:",
     "1. Create all directories if they do not exist.",
@@ -1063,13 +1082,13 @@ function buildEpisodeRenderInputScript(input: SeasonPackEpisodeInput) {
     `风格：${input.style}`,
     `镜头数量锁：${input.shotCount} 个镜头。最终 storyboard 必须严格等于这个数量。`,
     "",
-    "Story Bible / 项目固定记忆：",
+    "项目固定记忆：",
     stringifyPlanningValue(input.storyBible),
     "",
-    "Segment Chain / 本段前后承接：",
+    "本段前后承接：",
     stringifyPlanningValue(input.episodeChain),
     "",
-    "Segment Blueprint / 本段结构规划：",
+    "本段结构规划：",
     stringifyPlanningValue(input.blueprint),
     "",
     "本段原文案：",
@@ -1085,12 +1104,65 @@ function buildEpisodeRenderInputScript(input: SeasonPackEpisodeInput) {
 }
 
 function stringifyPlanningValue(value: unknown) {
-  if (typeof value === "string") return value.trim() || "{}";
-  try {
-    return JSON.stringify(value ?? {}, null, 2);
-  } catch {
-    return "{}";
+  return formatPlanningValue(value) || "无";
+}
+
+function formatPlanningValue(value: unknown, depth = 0): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return compileCodexPromptText(value.trim());
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  const indent = "  ".repeat(depth);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => formatPlanningValue(item, depth + 1))
+      .filter(Boolean)
+      .map((item) => `${indent}- ${item.replace(/\n/g, `\n${indent}  `)}`)
+      .join("\n");
   }
+  if (typeof value === "object") {
+    const lines = Object.entries(value as Record<string, unknown>).flatMap(([key, item]) => {
+      if (isTechnicalPlanningKey(key)) return [];
+      const label = planningKeyToChinese(key);
+      const formatted = formatPlanningValue(item, depth + 1);
+      if (!formatted) return [];
+      return [`${indent}${label}：${formatted.replace(/\n/g, `\n${indent}  `)}`];
+    });
+    return lines.join("\n");
+  }
+  return "";
+}
+
+function isTechnicalPlanningKey(key: string) {
+  return /^(id|uuid|contractHash|hash|createdAt|updatedAt)$/i.test(key);
+}
+
+function planningKeyToChinese(key: string) {
+  const labels: Record<string, string> = {
+    projectTitle: "项目标题",
+    title: "标题",
+    name: "名称",
+    characters: "角色",
+    scenes: "场景",
+    props: "道具",
+    visualStyle: "视觉风格",
+    cameraLanguage: "镜头语言",
+    lockedRules: "锁定规则",
+    startState: "开始状态",
+    endState: "结束状态",
+    carriedHooks: "承接悬念",
+    resolvedHooks: "解决悬念",
+    nextBridge: "下一段承接",
+    timelinePosition: "时间线位置",
+    purpose: "本段目的",
+    keyEvents: "关键事件",
+    emotionalCurve: "情绪曲线",
+    turningPoint: "转折点",
+    visualFocus: "视觉重点",
+    hooks: "伏笔",
+    sourceText: "原文范围",
+    summary: "摘要",
+  };
+  return labels[key] || "信息";
 }
 
 function normalizeShotCount(value: unknown) {
@@ -1647,9 +1719,9 @@ function normalizeRenderInputScript(value: string) {
   const prefixed = /单段渲染输入/.test(normalized)
     ? normalized
     : `单段渲染输入：\n${normalized}`;
-  return prefixed.includes("Renderer output requirement:")
+  return /渲染输出要求：/.test(prefixed)
     ? prefixed
-    : `${prefixed}\nRenderer output requirement: final video prompt result JSON must include workflow.fullVideoPrompt, workflow.concisePrompt, and storyboard.`;
+    : `${prefixed}\n渲染输出要求：最终视频提示词 JSON 必须包含完整视频提示词、精简提示词和逐镜头分镜。`;
 }
 
 function enforceSingleSegmentRendererOutputContract(value: string) {
@@ -1671,24 +1743,24 @@ function appendLockedSegmentPlan(value: string, lockedSegment: LockedSeasonSegme
   if (!lockedSegment) return value;
   const lockedPlanText = [
     "",
-    "LOCKED SEGMENT PLAN / 全局 Beat 排程锁：",
-    `Segment index: ${lockedSegment.segmentIndex}`,
-    `Beat range: ${lockedSegment.beatStart}-${lockedSegment.beatEnd}`,
-    `Beat ids: ${lockedSegment.beatIds.join(", ")}`,
-    `Target duration: ${durationLabelFromSeconds(lockedSegment.estimatedDurationSeconds)} (must not exceed 15 seconds)`,
-    `Shot count lock: ${lockedSegment.shotCount}`,
-    "Locked source beats:",
+    "全局节拍排程锁：",
+    `段号：第 ${lockedSegment.segmentIndex} 段`,
+    `节拍范围：${lockedSegment.beatStart}-${lockedSegment.beatEnd}`,
+    `节拍编号：${lockedSegment.beatIds.join("、")}`,
+    `目标时长：${durationLabelFromSeconds(lockedSegment.estimatedDurationSeconds)}，不得超过 15 秒`,
+    `镜头数量锁：${lockedSegment.shotCount}`,
+    "锁定原文节拍：",
     cleanSourceEpisodeLabels(lockedSegment.sourceText),
     "",
-    "Rendering rule: use only this locked beat range for the current segment. Do not move content into another segment during render. If the segment cannot fit within the locked duration, fail quality validation instead of inventing a new split.",
+    "渲染规则：当前段只能使用上述锁定节拍范围，不得在渲染阶段把内容移动到其他段。如果无法放入锁定时长，应让质量校验失败，不能自行重新拆段。",
   ].join("\n");
-  return value.includes("LOCKED SEGMENT PLAN") ? value : `${value}\n${lockedPlanText}`;
+  return value.includes("全局节拍排程锁") ? value : `${compileCodexPromptText(value)}\n${lockedPlanText}`;
 }
 
 function appendSegmentContractPlan(value: string, segmentContract: SegmentContract | undefined) {
   if (!segmentContract) return value;
-  if (value.includes("SEGMENT CONTRACT")) return value;
-  return `${value}\n\n${segmentContractToRenderBlock(segmentContract)}`;
+  if (value.includes("段落契约")) return value;
+  return `${compileCodexPromptText(value)}\n\n${segmentContractToChineseRenderBlock(segmentContract)}`;
 }
 
 function formatSeconds(value: number) {

@@ -1,8 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { segmentContractToRenderBlock, type SegmentContract } from "./batch-segment-contract";
-import { sanitizeInternalPromptTokens } from "./internal-prompt-token-sanitizer";
+import type { SegmentContract } from "./batch-segment-contract";
+import {
+  assertCleanCodexPromptInput,
+  buildChinesePromptLexiconBlock,
+  compileCodexPromptText,
+  segmentContractToChineseRenderBlock,
+} from "./codex-prompt-input-compiler";
 import { readVideoPromptOutputJson } from "./video-prompt-codex-queue";
 
 export type VideoPromptPackCodexJobStatus = "pending" | "running" | "completed" | "failed";
@@ -92,12 +97,14 @@ export async function createVideoPromptPackCodexJob(
     };
   });
   const mode = input.mode === "standard" ? "standard" : "strictUtf8";
+  const prompt = buildVideoPromptPackCodexPrompt(jobId, segments, mode);
+  assertCleanCodexPromptInput(prompt, "Video prompt render pack prompt");
   const job: VideoPromptPackCodexJob = {
     id: jobId,
     projectId: input.projectId || null,
     mode,
     segments,
-    prompt: buildVideoPromptPackCodexPrompt(jobId, segments, mode),
+    prompt,
     status: "pending",
     result: null,
     error: null,
@@ -186,15 +193,23 @@ function buildVideoPromptPackCodexPrompt(
   mode: VideoPromptPackCodexMode,
 ) {
   const segmentInstructions = segments.flatMap((segment) => [
-    `Segment ${segment.episodeIndex}: ${sanitizeInternalPromptTokens(segment.title)}`,
-    `Duration: ${segment.duration}`,
-    `Shot count lock: ${segment.shotCount || "use render script lock"}`,
-    segment.segmentContract ? sanitizeInternalPromptTokens(segmentContractToRenderBlock(segment.segmentContract)) : "",
+    `段落 ${segment.episodeIndex}：${compileCodexPromptText(segment.title)}`,
+    `时长：${segment.duration}`,
+    `镜头数量锁：${segment.shotCount || "按渲染稿锁定"}`,
+    segment.segmentContract ? segmentContractToChineseRenderBlock(segment.segmentContract) : "",
     `Output path: ${segment.outputPath}`,
-    "Render script:",
-    sanitizeInternalPromptTokens(segment.renderInputScript),
+    "渲染输入：",
+    compileCodexPromptText(segment.renderInputScript),
     "",
   ]);
+  const lexiconBlock = buildChinesePromptLexiconBlock(
+    segments.flatMap((segment) => [
+      segment.title,
+      segment.script,
+      segment.renderInputScript,
+      segment.segmentContract,
+    ]),
+  );
   const strictUtf8Instructions =
     mode === "strictUtf8"
       ? [
@@ -210,7 +225,7 @@ function buildVideoPromptPackCodexPrompt(
 
   return [
     "You are handling a Local Director Render Pack task from a local Codex CLI worker.",
-    "A Render Pack only batches local CLI work. Every segment must still be rendered as a complete independent Chinese Local Director single segment video prompt JSON.",
+    "A Render Pack only batches local CLI work. Every segment must still be rendered as a complete independent Chinese Local Director segment video prompt JSON.",
     "Do not open a browser. Do not ask the user to copy or paste. Do not call network providers.",
     "",
     "Hard quality rules:",
@@ -218,14 +233,16 @@ function buildVideoPromptPackCodexPrompt(
     "- Each JSON must be a complete Local Director video prompt result, not a summary and not a combined array.",
     "- Each JSON must include title, contentType, duration, style, diagnosis, optimizedScript, workflow.fullVideoPrompt, workflow.fullNegativePrompt, workflow.concisePrompt, and storyboard.",
     "- Every storyboard shot must include shotNumber, timeRange, scene, visual, shotType, composition, cameraMovement, lighting, sound, dialogue, emotion, transition, shotPurpose, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt.",
-    "- Keep full single segment quality: a 4-shot segment should usually have workflow.fullVideoPrompt with at least 1400 meaningful Chinese characters; 3-shot segments should usually have at least 1100.",
+    "- Keep full standalone segment quality: a 4-shot segment should usually have workflow.fullVideoPrompt with at least 1400 meaningful Chinese characters; 3-shot segments should usually have at least 1100.",
     "- Do not make thin shots. visual, composition, lighting, sound, shotPurpose, firstFramePrompt, videoPrompt, lastFramePrompt, and negativePrompt must be concrete, shootable text instead of short labels.",
     "- videoPrompt must describe the full moving image for that shot with action, space, camera behavior, light, sound, emotion, and continuity. Do not output one-sentence summaries.",
     "- Do not use 同上, 如上, 略, 参考上一段, continue as above, or any placeholder that depends on another segment.",
     "- If there is no spoken line, dialogue must be a concrete no-dialogue value such as \"无\" or \"none\".",
-    "- Preserve the specific render script, shot count lock, Story Bible continuity, and source events for each segment.",
+    "- 保留每段的具体渲染输入、镜头数量锁、项目记忆连续性和源文案事件。",
     "- User-facing fields must use natural Chinese labels. Do not output hyphenated English internal IDs, schema names, file-format names, or engineering type names in title, contentType, scene, visual, workflow, or storyboard fields.",
     "",
+    lexiconBlock,
+    lexiconBlock ? "" : "",
     "File writing requirements:",
     "- Write all JSON files as UTF-8.",
     "- Prefer Node.js fs.writeFileSync(outputPath, JSON.stringify(result, null, 2), \"utf8\").",
@@ -235,7 +252,7 @@ function buildVideoPromptPackCodexPrompt(
     `Render Pack ID: ${jobId}`,
     `Pack size: ${segments.length}`,
     "",
-    "Segments:",
+    "段落输入：",
     ...segmentInstructions,
     "Completion requirements:",
     "1. Create every output directory if it does not exist.",

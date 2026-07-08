@@ -1233,7 +1233,7 @@ export function ProjectsClient() {
       "3. 不重写成新故事，不输出解释、报告、Markdown 或修改清单。",
       "4. 如果没有台词，dialogue 必须写“无”。",
       "5. 用户侧统一使用“段”，不要写“集 / 本集 / 单集 / 剧集”。",
-      "6. 修复后仍然输出完整 AnalysisResult JSON。",
+      "6. 修复后仍然输出完整视频提示词 JSON。",
       "",
       "检测到的问题：",
       issueText,

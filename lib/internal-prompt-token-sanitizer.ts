@@ -11,6 +11,11 @@ type InternalPromptTokenRule = {
 
 const INTERNAL_PROMPT_TOKEN_RULES: InternalPromptTokenRule[] = [
   {
+    label: "SegmentContract",
+    pattern: /\bSegmentContract\b/g,
+    replacement: "段落契约",
+  },
+  {
     label: "single-segment AnalysisResult",
     pattern: /\bsingle[-_\s]*segment\s+AnalysisResult\b/gi,
     replacement: "单段视频提示词结果",
@@ -90,6 +95,18 @@ export function findInternalPromptToken(value: unknown): InternalPromptTokenHit 
 
 export function containsInternalPromptToken(value: unknown) {
   return Boolean(findInternalPromptToken(value));
+}
+
+export function collectInternalPromptTokenHits(value: unknown): InternalPromptTokenHit[] {
+  if (typeof value === "string") {
+    return INTERNAL_PROMPT_TOKEN_RULES.flatMap((rule) => {
+      rule.pattern.lastIndex = 0;
+      return rule.pattern.test(value) ? [{ token: rule.label, replacement: rule.replacement }] : [];
+    });
+  }
+  if (Array.isArray(value)) return value.flatMap((item) => collectInternalPromptTokenHits(item));
+  if (!value || typeof value !== "object") return [];
+  return Object.values(value as Record<string, unknown>).flatMap((item) => collectInternalPromptTokenHits(item));
 }
 
 export function sanitizeInternalPromptTokensDeep<T>(value: T): T {
