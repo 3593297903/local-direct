@@ -99,3 +99,52 @@ test("removes internal English identifiers deterministically before final cache"
 
   assert.doesNotMatch(serialized, /single-segment|AnalysisResult|chat-log|qq_records|forensic_room/i);
 });
+
+test("rewrites negative prompt placeholder warnings without requiring Codex repair", () => {
+  const raw = baseResult({
+    workflow: {
+      ...baseResult().workflow,
+      fullVideoPrompt: "调查室冷光中，屏幕展示聊天记录。负面提示词：避免同上、如上、略等占位表达。",
+      fullNegativePrompt: "避免同上、如上、略等占位表达，避免低清画面。",
+    },
+    storyboard: [
+      {
+        ...baseResult().storyboard[0],
+        negativePrompt: "避免同上如上略等占位表达，避免低清画面。",
+      },
+    ],
+  });
+
+  const firstGate = evaluateBatchSegmentQuality(raw, {
+    fullPromptText: raw.workflow.fullVideoPrompt,
+    minFullPromptLength: 20,
+  });
+  assert.equal(firstGate.findings.some((finding) => finding.code === "placeholder_text"), true);
+
+  const patched = applyDeterministicQualityPatch(raw, firstGate.findings);
+  const finalGate = evaluateBatchSegmentQuality(patched, {
+    fullPromptText: patched.workflow.fullVideoPrompt,
+    minFullPromptLength: 20,
+  });
+
+  assert.equal(shouldRepairWithCodex(finalGate), false);
+  assert.doesNotMatch(patched.workflow.fullNegativePrompt, /同上|如上|见上文|(?:^|[，。；、\s])略(?:[，。；、\s]|$)/);
+  assert.doesNotMatch(patched.storyboard[0].negativePrompt, /同上|如上|见上文|(?:^|[，。；、\s])略(?:[，。；、\s]|$)/);
+  assert.doesNotMatch(patched.workflow.fullVideoPrompt, /同上|如上|见上文|(?:^|[，。；、\s])略(?:[，。；、\s]|$)/);
+});
+
+test("keeps executable placeholder text as blocking", () => {
+  const raw = baseResult({
+    storyboard: [
+      {
+        ...baseResult().storyboard[0],
+        videoPrompt: "同上，继续上一镜头。",
+      },
+    ],
+  });
+
+  const gate = evaluateBatchSegmentQuality(raw, { minFullPromptLength: 20 });
+
+  assert.equal(shouldRepairWithCodex(gate), true);
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "placeholder_text"), true);
+});

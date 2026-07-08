@@ -73,6 +73,8 @@ const REQUIRED_SHOT_FIELDS = Object.keys(BATCH_SEGMENT_FIELD_QUALITY_RULES) as A
 
 const BASIC_NEGATIVE_PROMPT = "不要字幕水印，不要文字错误，不要畸形手指，不要低清画面，不要多余肢体";
 
+const PLACEHOLDER_TEXT_PATTERN = /同上|如上|见上文|其他\s*[:：]\s*无|其它\s*[:：]\s*无|(?:^|[，。；、\s])略(?:[，。；、\s]|$)/m;
+
 const SENSITIVE_REWRITE_RULES: Array<[RegExp, string]> = [
   [/公安局/g, "办案建筑"],
   [/警徽/g, "机构标识"],
@@ -132,7 +134,25 @@ function pushFieldFinding(
 }
 
 function containsPlaceholderText(value: string) {
-  return /同上|如上|见上文|略|其他\s*[:：]\s*无|^\s*略\s*$/m.test(value);
+  PLACEHOLDER_TEXT_PATTERN.lastIndex = 0;
+  return PLACEHOLDER_TEXT_PATTERN.test(value);
+}
+
+function isNegativePromptPath(path: string) {
+  return /(^|\.)(fullNegativePrompt|negativePrompt)$/.test(path);
+}
+
+function rewritePlaceholderWarningLanguage(value: string) {
+  return value
+    .replace(/同上[、，/和\s]*如上[、，/和\s]*略等?(?:不可执行)?占位(?:内容|表达|文本)?/g, "不可执行占位表达、空泛描述、跨段引用")
+    .replace(/同上[、，/和\s]*如上[、，/和\s]*略/g, "跨段引用、省略描述")
+    .replace(/(?:同上|如上|见上文)等?(?:不可执行)?占位(?:内容|表达|文本)?/g, "跨段引用类占位表达");
+}
+
+function rewriteNegativePromptPlaceholderLanguage(value: string) {
+  return rewritePlaceholderWarningLanguage(value)
+    .replace(/同上|如上|见上文/g, "跨段引用")
+    .replace(/(^|[，。；、\s])略(?=([，。；、\s]|$))/g, "$1省略描述");
 }
 
 function containsNullishText(value: string) {
@@ -148,7 +168,7 @@ function containsVerticalConflict(value: string) {
 }
 
 function applyStringRules(value: string) {
-  let next = value;
+  let next = rewritePlaceholderWarningLanguage(value);
   for (const [pattern, replacement] of SENSITIVE_REWRITE_RULES) {
     next = next.replace(pattern, replacement);
   }
@@ -190,7 +210,7 @@ function ensureTargetLength(value: unknown, target: number, fallback: string) {
 }
 
 function normalizeNegativePrompt(value: unknown) {
-  const text = cleanText(value);
+  const text = rewriteNegativePromptPlaceholderLanguage(cleanText(value));
   if (!text) return BASIC_NEGATIVE_PROMPT;
   const additions = BASIC_NEGATIVE_PROMPT
     .split("，")
@@ -238,6 +258,33 @@ function visualFingerprint(value: unknown) {
   return cleanText(value).replace(/\s+/g, "").replace(/[，。；：、“”‘’（）【】\-—]/g, "").toLowerCase();
 }
 
+function collectPlaceholderFindings(
+  value: unknown,
+  path: string,
+  findings: BatchSegmentQualityFinding[],
+) {
+  if (typeof value === "string") {
+    if (!containsPlaceholderText(value)) return;
+    findings.push({
+      severity: isNegativePromptPath(path) ? "patchable" : "blocking",
+      code: "placeholder_text",
+      message: isNegativePromptPath(path)
+        ? "负向提示词包含占位词禁止说明，允许本地改写"
+        : "包含同上/如上/略等不可执行占位",
+      path,
+    });
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => collectPlaceholderFindings(item, `${path}[${index}]`, findings));
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  Object.entries(value as Record<string, unknown>).forEach(([key, item]) => {
+    collectPlaceholderFindings(item, path ? `${path}.${key}` : key, findings);
+  });
+}
+
 export function evaluateBatchSegmentQuality(
   result: AnalysisResult,
   options: BatchSegmentQualityOptions = {},
@@ -264,7 +311,6 @@ export function evaluateBatchSegmentQuality(
     if (containsNullishText(value)) findings.push({ severity: "patchable", code: "nullish_text", message: "包含 undefined/null 字面占位", path });
     if (containsEpisodeTerminology(value)) findings.push({ severity: "patchable", code: "episode_terminology", message: "包含集/本集/单集术语", path });
     if (containsVerticalConflict(value)) findings.push({ severity: "patchable", code: "vertical_conflict", message: "包含 16:9 竖屏冲突", path });
-    if (containsPlaceholderText(value)) findings.push({ severity: "blocking", code: "placeholder_text", message: "包含同上/如上/略等不可执行占位", path });
     for (const [pattern] of SENSITIVE_REWRITE_RULES) {
       pattern.lastIndex = 0;
       if (pattern.test(value)) {
@@ -273,6 +319,8 @@ export function evaluateBatchSegmentQuality(
       }
     }
   }
+
+  collectPlaceholderFindings(result, "result", findings);
 
   if (options.expectedShotCount && storyboard.length && storyboard.length !== options.expectedShotCount) {
     findings.push({

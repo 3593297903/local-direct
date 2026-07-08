@@ -858,6 +858,44 @@ function assertBatchSegmentContractQuality(
   }
 }
 
+const BATCH_EXECUTABLE_PLACEHOLDER_PATTERN = /同上|如上|见上文|其他\s*[：:]\s*无|其它\s*[：:]\s*无|(?:^|[，。；、\s])略(?:[，。；、\s]|$)/m;
+
+function containsBatchExecutablePlaceholderText(result: AnalysisResult) {
+  const workflow = (result.workflow || {}) as Partial<NonNullable<AnalysisResult["workflow"]>>;
+  const values = [
+    result.optimizedScript,
+    workflow.sourceAnalysis,
+    workflow.screenplay,
+    workflow.filmScript,
+    workflow.concisePrompt,
+    workflow.fullVideoPrompt,
+    ...(Array.isArray(result.storyboard)
+      ? result.storyboard.flatMap((shot) => [
+          shot.scene,
+          shot.visual,
+          shot.shotType,
+          shot.composition,
+          shot.cameraMovement,
+          shot.lighting,
+          shot.sound,
+          shot.dialogue,
+          shot.emotion,
+          shot.transition,
+          shot.shotPurpose,
+          shot.firstFramePrompt,
+          shot.videoPrompt,
+          shot.lastFramePrompt,
+        ])
+      : []),
+  ];
+
+  return values.some((value) => {
+    if (typeof value !== "string") return false;
+    BATCH_EXECUTABLE_PLACEHOLDER_PATTERN.lastIndex = 0;
+    return BATCH_EXECUTABLE_PLACEHOLDER_PATTERN.test(value);
+  });
+}
+
 function assertBatchSegmentQuality(
   baseScript: string,
   episodeIndex: number,
@@ -902,7 +940,7 @@ function assertBatchSegmentQuality(
   if (/16\s*:\s*9\s*竖屏|竖屏\s*16\s*:\s*9|横屏\s*竖屏/.test(fullPrompt)) {
     throw new Error(`第 ${episodeIndex} 段生成失败：提示词包含 16:9 竖屏这类自相矛盾描述。`);
   }
-  if (/如上|同上|见上文|其他\s*[：:]\s*无|其它\s*[：:]\s*无|^\s*略\s*$/m.test(fullPrompt)) {
+  if (containsBatchExecutablePlaceholderText(result)) {
     throw new Error(`第 ${episodeIndex} 段生成失败：提示词包含如上/同上/略等不可执行占位。`);
   }
   if (/第\s*[0-9一二三四五六七八九十百]+\s*集/.test(fullPrompt)) {

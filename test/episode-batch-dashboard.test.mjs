@@ -130,10 +130,12 @@ test("dashboard batch normalizes deterministic segment issues before expensive r
   assert.match(dashboardSource, /applyDeterministicQualityPatch/);
   assert.match(dashboardSource, /shouldRepairWithCodex/);
   assert.match(dashboardSource, /normalizePatchAndValidateBatchSegment/);
+  assert.match(dashboardSource, /containsBatchExecutablePlaceholderText/);
   assert.match(dashboardSource, /containsBatchNullishValue/);
   assert.match(dashboardSource, /sanitizeBatchNegativePrompt/);
   assert.doesNotMatch(dashboardSource, /\\b\(\?:undefined\|null\)\\b\/i\.test\(serializedResult\)/);
   assert.doesNotMatch(dashboardSource, /\\b\(\?:undefined\|null\)\\b\/i\.test\(qualityText\)/);
+  assert.doesNotMatch(dashboardSource, /如上\|同上\|见上文\|其他\\s\*\[：:\]\\s\*无\|其它\\s\*\[：:\]\\s\*无\|\^\\s\*略\\s\*\$\/m\.test\(fullPrompt\)/);
   assert.doesNotMatch(dashboardSource, /不要出现 undefined/);
 });
 
