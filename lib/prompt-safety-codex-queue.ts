@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { PROMPT_SAFETY_LEXICAL_REPLACEMENTS as SHARED_PROMPT_SAFETY_LEXICAL_REPLACEMENTS } from "./prompt-safety-policy";
 
 export type PromptSafetyCodexJobStatus = "pending" | "running" | "completed" | "failed";
 
@@ -677,7 +678,7 @@ function applyPromptSafetyLexicalReplacements(value: unknown): unknown {
 }
 
 function applyPromptSafetyLexicalReplacementText(value: string) {
-  const replaced = PROMPT_SAFETY_LEXICAL_REPLACEMENTS.reduce(
+  const replaced = SHARED_PROMPT_SAFETY_LEXICAL_REPLACEMENTS.reduce(
     (text, [from, to]) => text.split(from).join(to),
     value,
   );

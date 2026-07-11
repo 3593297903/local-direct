@@ -16,7 +16,7 @@ test("dashboard season pack integration renders each segment with the single-seg
   assert.match(dashboardSource, /requestAnalysisWithContext\(\s*renderScript,\s*renderDuration,/s);
   assert.match(dashboardSource, /normalizeBatchEpisodeResult/);
   assert.match(dashboardSource, /const episodeResult = normalizeBatchEpisodeResult/);
-  assert.match(dashboardSource, /saveAnalysisProject\(episodeScript, episodeResult, fullVideoPrompt/);
+  assert.match(dashboardSource, /saveAnalysisProject\(\s*episodeScript,\s*episodeResult,\s*fullVideoPrompt/s);
   assert.match(dashboardSource, /episode\.input/);
   assert.doesNotMatch(dashboardSource, /originalScript:\s*script,\s*result:\s*episodeResult/s);
 });

@@ -272,3 +272,120 @@ test("video prompt render pack jobs default to strict UTF-8 mode", async () => {
     rmSync(rootDir, { recursive: true, force: true });
   }
 });
+
+test("coverage sidecars stay separate and never make a valid main result fail", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const contract = {
+      contractSchemaVersion: 2,
+      coveragePolicyVersion: "test",
+      sourceHash: "src_test",
+      segmentIndex: 1,
+      title: "第1段",
+      sourceText: "大妈认出照片中的邻居。",
+      durationSeconds: 12,
+      shotCount: 1,
+      requiredEvents: ["大妈认出邻居"],
+      requiredEventSlots: [{
+        id: "recognition",
+        label: "大妈认出邻居",
+        importance: "blocking",
+        anchorGroups: [["大妈"]],
+        conceptGroups: [["认出"]],
+        contradictionGroups: [],
+        evidenceSelectors: [{ source: "storyboard", shotNumber: "any", fields: ["dialogue"], requireExecutableShot: true }],
+        repairTargets: [{ shotNumber: 1, field: "dialogue" }],
+      }],
+      forbiddenFutureEvents: [],
+      characterLocks: [],
+      characters: [],
+      locations: [],
+      props: [],
+      requiredShotBeats: [{ shotNumber: 1, timeRange: "0s-12s", beat: "辨认", visualFocus: "照片" }],
+      safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+      contractHash: "sc_sidecar",
+    };
+    const job = await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "第1段",
+        script: contract.sourceText,
+        renderInputScript: "生成完整提示词",
+        duration: "12秒",
+        shotCount: 1,
+        segmentContract: contract,
+      }],
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    const result = sampleAnalysisResult("第1段");
+    result.storyboard[0].dialogue = "大妈：这是隔壁老周。";
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(claimed.segments[0].outputPath, JSON.stringify(result, null, 2), "utf8");
+    writeFileSync(claimed.segments[0].coverageOutputPath, JSON.stringify({
+      schemaVersion: 1,
+      segmentIndex: 1,
+      contractHash: contract.contractHash,
+      receipts: [{ slotId: "recognition", evidence: [{ path: "storyboard[0].dialogue", quote: "这是隔壁老周" }] }],
+    }), "utf8");
+
+    assert.match(claimed.prompt, /Do not write resultHash in the model sidecar/);
+    assert.doesNotMatch(claimed.prompt, /__LOCAL_DIRECTOR_RESULT_HASH__/);
+    assert.match(claimed.prompt, /slotId=recognition/);
+    assert.match(claimed.prompt, /storyboard\[\*\]\.dialogue/);
+
+    const completed = await completeVideoPromptPackCodexJob(job.id, { rootDir });
+    assert.equal(completed.result.segments[0].result.coverage, undefined);
+    assert.equal(completed.result.segments[0].coverageSidecar.receipts[0].slotId, "recognition");
+    assert.match(completed.result.segments[0].coverageSidecar.resultHash, /^sr_[a-z0-9]+$/);
+
+    const invalidJob = await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 2,
+        title: "第2段",
+        script: "这是用于验证无效 sidecar 不影响主结果的中文测试原文。",
+        renderInputScript: "生成完整提示词",
+        duration: "12秒",
+        shotCount: 1,
+        segmentContract: { ...contract, segmentIndex: 2, contractHash: "sc_invalid" },
+      }],
+    }, { rootDir });
+    const invalidClaimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    mkdirSync(path.dirname(invalidClaimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(invalidClaimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("第2段")), "utf8");
+    writeFileSync(invalidClaimed.segments[0].coverageOutputPath, "{not-json", "utf8");
+    const invalidCompleted = await completeVideoPromptPackCodexJob(invalidJob.id, { rootDir });
+    assert.equal(invalidCompleted.result.segments[0].coverageSidecar, null);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("a batch snapshot can disable coverage sidecars without changing the main result", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptPackCodexJob({
+      coverageSidecarEnabled: false,
+      segments: [{
+        episodeIndex: 1,
+        title: "第1段",
+        script: "人物走入办公室并放下资料。",
+        renderInputScript: "生成完整中文视频提示词。",
+        duration: "12秒",
+        shotCount: 1,
+      }],
+    }, { rootDir });
+    assert.equal(job.coverageSidecarEnabled, false);
+    assert.doesNotMatch(job.prompt, /Optional internal coverage sidecar path/);
+    assert.doesNotMatch(job.prompt, /you may write the optional coverage sidecar/);
+
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("第1段"), null, 2), "utf8");
+    writeFileSync(claimed.segments[0].coverageOutputPath, "{ invalid sidecar", "utf8");
+    const completed = await completeVideoPromptPackCodexJob(job.id, { rootDir });
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result.segments[0].coverageSidecar, null);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});

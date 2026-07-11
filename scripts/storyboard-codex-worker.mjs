@@ -3,6 +3,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
+import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.STORYBOARD_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -15,6 +16,7 @@ const messageDir = path.join(rootDir, ".tmp-storyboard-codex", "codex-messages")
 const logDir = path.join(rootDir, ".tmp-storyboard-codex", "codex-logs");
 const sourceManifestDir = path.join(rootDir, ".tmp-storyboard-codex", "source-manifests");
 const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const runtimeHealth = await startCodexWorkerRuntimeHealth("storyboard", { rootDir });
 
 console.log("Local Director storyboard Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -27,6 +29,7 @@ const activeTasks = new Set();
 
 while (true) {
   try {
+    runtimeHealth.assertHealthy();
     while (activeTasks.size < concurrency) {
       const task = await claimTask();
       if (!task) break;

@@ -3,6 +3,8 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
+import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
+import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.SEASON_PACK_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -11,6 +13,7 @@ const idleLogMs = positiveInteger(process.env.SEASON_PACK_CODEX_IDLE_LOG_MS, 30_
 const taskTimeoutMs = positiveInteger(process.env.SEASON_PACK_CODEX_TASK_TIMEOUT_MS, 60 * 60_000);
 const workerToken = process.env.SEASON_PACK_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-season-pack-codex", "codex-messages");
+const runtimeHealth = await startCodexWorkerRuntimeHealth("season-pack", { rootDir });
 
 console.log("Local Director season pack Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -21,6 +24,7 @@ let lastIdleLogAt = 0;
 
 while (true) {
   try {
+    runtimeHealth.assertHealthy();
     const task = await claimTask();
     if (!task) {
       logIdle();
@@ -38,7 +42,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed season pack job ${task.id} (${task.episodeCount} episodes).`);
   try {
-    await runCodex(task);
+    await withCodexCliSlot("primary", task.id, () => runCodex(task));
     await assertSeasonPackOutput(task);
     await completeTask(task);
     console.log(`Completed season pack job ${task.id}: ${task.packDir}`);

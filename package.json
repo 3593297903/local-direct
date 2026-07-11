@@ -20,6 +20,10 @@
     "local:start": "powershell -ExecutionPolicy Bypass -File scripts/start-localdirector.ps1",
     "storyboard:codex-worker": "node scripts/storyboard-codex-worker.mjs",
     "video-prompt:codex-worker": "node scripts/video-prompt-codex-worker.mjs",
+    "batch-segment-repair:codex-worker": "node scripts/batch-segment-repair-codex-worker.mjs",
+    "event-coverage:codex-worker": "node scripts/event-coverage-codex-worker.mjs",
+    "codex:workers": "node scripts/codex-workers.mjs",
+    "codex:runtime-check": "node scripts/codex-runtime-check.mjs",
     "video-prompt-pack:codex-worker": "node scripts/video-prompt-pack-codex-worker.mjs",
     "visual-asset:codex-worker": "node scripts/visual-asset-codex-worker.mjs",
     "season-pack:codex-worker": "node scripts/season-pack-codex-worker.mjs",
@@ -54,6 +58,7 @@
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
     "sonner": "^1.7.4",
+    "yaml": "^2.9.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {

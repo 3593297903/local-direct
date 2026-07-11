@@ -5,6 +5,7 @@ import { NEST_AUTH_TOKEN_COOKIE } from "@/lib/nest-auth-proxy";
 import type { AnalysisResult, StoryboardShot } from "@/types";
 
 type ProjectCreatePayload = Record<string, unknown> & {
+  idempotencyKey: string | undefined;
   projectId: string | undefined;
   versionId: string | undefined;
   title: string | undefined;
@@ -417,6 +418,7 @@ export function mapAnalysisResultToNestProjectBody(input: Record<string, unknown
   const memory = deriveProjectMemoryFromAnalysis(payload.originalScript, payload.result);
 
   return {
+    idempotencyKey: payload.idempotencyKey,
     projectId: payload.projectId,
     versionId: payload.versionId,
     title: deriveProjectSaveTitle(payload),

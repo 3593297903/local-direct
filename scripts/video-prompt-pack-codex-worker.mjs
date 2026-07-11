@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
+import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
+import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.VIDEO_PROMPT_PACK_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -11,6 +13,7 @@ const taskTimeoutMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_TASK_T
 const concurrency = Math.max(1, Math.min(4, positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_CONCURRENCY, 4)));
 const workerToken = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-video-prompt-pack-codex", "codex-messages");
+const runtimeHealth = await startCodexWorkerRuntimeHealth("video-prompt-pack", { rootDir });
 
 console.log("Local Director video prompt Render Pack Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -23,6 +26,7 @@ const activeTasks = new Set();
 
 while (true) {
   try {
+    runtimeHealth.assertHealthy();
     while (activeTasks.size < concurrency) {
       const task = await claimTask();
       if (!task) break;
@@ -56,7 +60,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed video prompt Render Pack job ${task.id} (${task.segments?.length || 0} segments).`);
   try {
-    await runCodex(task);
+    await withCodexCliSlot("primary", task.id, () => runCodex(task));
     await assertOutputJsonFiles(task);
     await completeTask(task);
     console.log(`Completed video prompt Render Pack job ${task.id}.`);

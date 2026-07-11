@@ -1,4 +1,8 @@
-export type SegmentQualityStatus = "rendered" | "repaired" | "cached" | "saved" | "failed";
+import type { BatchSegmentQualityGate, QualityPatchDiff } from "./batch-segment-quality-gate";
+import type { CoverageDecision } from "./batch-event-coverage";
+import { detectPromptSafetyRisk } from "./prompt-safety-policy";
+
+export type SegmentQualityStatus = "rendered" | "repaired" | "cached" | "saved" | "needs_review" | "failed";
 
 export type SegmentSafetyRisk = "none" | "low" | "medium" | "high";
 
@@ -18,20 +22,54 @@ export type SegmentQualityReport = {
   repairReasons: string[];
   qualityScore: number;
   qualityFindings: string[];
+  blockingCount: number;
+  patchableCount: number;
+  warningCount: number;
+  riskCount: number;
+  localPatchCount: number;
+  codexPatchCount: number;
+  patchDiffs: QualityPatchDiff[];
+  codexRepairAttempted: boolean;
+  codexRepairSegmentCount: number;
   safetyRisk: SegmentSafetyRisk;
   safetyFindings: string[];
   contractHash?: string;
   renderHash: string;
   sourceHash: string;
+  coverageReceiptCount: number;
+  verifiedCoverageCount: number;
+  localCoveredSlotCount: number;
+  ambiguousSlotCount: number;
+  definiteMissingSlotCount: number;
+  contradictionSlotCount: number;
+  judgeInvoked: boolean;
+  judgeWaveId?: string;
+  judgeDecisionCount: number;
+  judgeDurationMs: number;
+  coverageDurationMs: number;
+  eventPatchCount: number;
+  eventPatchPaths: string[];
+  needsReviewReason?: string;
 };
 
 export type BatchQualityReportSummary = {
   totalReports: number;
   averageQualityScore: number;
   suggestedReviewCount: number;
+  blockingCount: number;
+  patchableCount: number;
+  warningCount: number;
+  riskCount: number;
+  localPatchCount: number;
+  codexPatchCount: number;
+  codexRepairCount: number;
+  codexRepairSegmentCount: number;
   highestSafetyRisk: SegmentSafetyRisk;
   slowestSegmentIndex?: number;
   slowestDurationMs: number;
+  judgeInvocationCount: number;
+  eventPatchCount: number;
+  needsReviewCount: number;
 };
 
 type ReportAnalysisResult = {
@@ -60,49 +98,22 @@ type CreateSegmentQualityReportInput = {
   packSize?: number;
   repairCount?: number;
   repairReasons?: string[];
+  qualityGate?: BatchSegmentQualityGate;
+  patchDiffs?: QualityPatchDiff[];
+  codexRepairAttempted?: boolean;
   renderStartedAt?: number;
   renderCompletedAt?: number;
   durationMs?: number;
   contractHash?: string;
+  coverageDecisions?: CoverageDecision[];
+  coverageReceiptCount?: number;
+  judgeInvoked?: boolean;
+  judgeWaveId?: string;
+  judgeDecisionCount?: number;
+  judgeDurationMs?: number;
+  coverageDurationMs?: number;
+  needsReviewReason?: string;
 };
-
-const HIGH_RISK_PATTERNS = [
-  "自杀",
-  "割腕",
-  "上吊",
-  "性侵",
-  "强奸",
-  "真实公众人物",
-  "国徽",
-  "警徽",
-  "血泊",
-  "尸体",
-];
-
-const MEDIUM_RISK_PATTERNS = [
-  "公安",
-  "警察",
-  "警方",
-  "政府",
-  "政治",
-  "未成年",
-  "伤口",
-  "血迹",
-  "血腥",
-  "凶手",
-  "杀",
-  "犯罪",
-  "暴力",
-];
-
-const LOW_RISK_PATTERNS = [
-  "冲突",
-  "惊悚",
-  "恐惧",
-  "威胁",
-  "紧张",
-  "悬疑",
-];
 
 const RISK_RANK: Record<SegmentSafetyRisk, number> = {
   none: 0,
@@ -113,11 +124,34 @@ const RISK_RANK: Record<SegmentSafetyRisk, number> = {
 
 export function createSegmentQualityReport(input: CreateSegmentQualityReportInput): SegmentQualityReport {
   const promptText = collectPromptText(input.result);
-  const quality = computeSegmentQualityScore(input.result, {
-    repairCount: input.repairCount || 0,
-    repairReasons: input.repairReasons || [],
-  });
+  const quality = input.qualityGate
+    ? {
+        score: input.qualityGate.score,
+        findings: input.qualityGate.findings.map(formatGateFindingForReport),
+        blockingCount: input.qualityGate.blockingFindings.length,
+        patchableCount: input.qualityGate.patchableFindings.length,
+        warningCount: input.qualityGate.warningFindings.length,
+        riskCount: input.qualityGate.riskFindings.length,
+      }
+    : {
+        ...computeSegmentQualityScore(input.result, {
+          repairCount: input.repairCount || 0,
+          repairReasons: input.repairReasons || [],
+        }),
+        blockingCount: 0,
+        patchableCount: 0,
+        warningCount: 0,
+        riskCount: 0,
+      };
   const safety = detectSegmentSafetyRisk([collectSafetyText(input.result), input.sourceText].join("\n"));
+  const patchDiffs = input.patchDiffs || [];
+  const localPatchCount = patchDiffs.filter((patch) => patch.patchSource === "local").length;
+  const codexPatchCount = patchDiffs.filter((patch) => patch.patchSource === "codex").length;
+  const codexRepairSegmentCount = input.codexRepairAttempted ? 1 : 0;
+  const coverageDecisions = input.coverageDecisions || [];
+  const eventPatchPaths = patchDiffs
+    .filter((patch) => ["missing_required_event_slot", "continuity_contradiction", "ambiguous_required_event_slot"].includes(patch.code))
+    .map((patch) => patch.path);
   const durationMs = input.durationMs
     ?? (
       typeof input.renderStartedAt === "number" && typeof input.renderCompletedAt === "number"
@@ -141,11 +175,34 @@ export function createSegmentQualityReport(input: CreateSegmentQualityReportInpu
     repairReasons: input.repairReasons || [],
     qualityScore: quality.score,
     qualityFindings: quality.findings,
+    blockingCount: quality.blockingCount,
+    patchableCount: quality.patchableCount,
+    warningCount: quality.warningCount,
+    riskCount: quality.riskCount,
+    localPatchCount,
+    codexPatchCount,
+    patchDiffs,
+    codexRepairAttempted: Boolean(input.codexRepairAttempted),
+    codexRepairSegmentCount,
     safetyRisk: safety.risk,
     safetyFindings: safety.findings,
     contractHash: input.contractHash,
     renderHash: stableReportHash(promptText),
     sourceHash: stableReportHash(input.sourceText),
+    coverageReceiptCount: input.coverageReceiptCount || 0,
+    verifiedCoverageCount: coverageDecisions.filter((decision) => decision.status === "covered").length,
+    localCoveredSlotCount: coverageDecisions.filter((decision) => decision.status === "covered" && decision.reasonCode === "verified_local_bundle").length,
+    ambiguousSlotCount: coverageDecisions.filter((decision) => decision.status === "ambiguous").length,
+    definiteMissingSlotCount: coverageDecisions.filter((decision) => decision.status === "definite_missing").length,
+    contradictionSlotCount: coverageDecisions.filter((decision) => decision.status === "contradiction").length,
+    judgeInvoked: Boolean(input.judgeInvoked),
+    judgeWaveId: input.judgeWaveId,
+    judgeDecisionCount: input.judgeDecisionCount || 0,
+    judgeDurationMs: input.judgeDurationMs || 0,
+    coverageDurationMs: input.coverageDurationMs || 0,
+    eventPatchCount: eventPatchPaths.length,
+    eventPatchPaths,
+    needsReviewReason: input.needsReviewReason,
   };
 }
 
@@ -159,6 +216,14 @@ export function updateSegmentQualityReportStatus(
     status,
     ...patch,
   };
+}
+
+function formatGateFindingForReport(finding: BatchSegmentQualityGate["findings"][number]) {
+  const location = finding.path ? `${finding.path}: ` : "";
+  const length = finding.currentLength !== undefined && finding.minimumLength !== undefined
+    ? ` (${finding.currentLength}/${finding.minimumLength})`
+    : "";
+  return `${finding.severity}:${finding.code}: ${location}${finding.message}${length}`;
 }
 
 export function computeSegmentQualityScore(
@@ -220,22 +285,13 @@ export function computeSegmentQualityScore(
 }
 
 export function detectSegmentSafetyRisk(text: string): { risk: SegmentSafetyRisk; findings: string[] } {
-  const high = collectRiskMatches(text, HIGH_RISK_PATTERNS);
-  if (high.length) {
-    return { risk: "high", findings: high };
-  }
-
-  const medium = collectRiskMatches(text, MEDIUM_RISK_PATTERNS);
-  if (medium.length) {
-    return { risk: "medium", findings: medium };
-  }
-
-  const low = collectRiskMatches(text, LOW_RISK_PATTERNS);
-  if (low.length) {
-    return { risk: "low", findings: low };
-  }
-
-  return { risk: "none", findings: [] };
+  const policyRisk = detectPromptSafetyRisk(text);
+  return {
+    risk: policyRisk.risk,
+    findings: policyRisk.findings.map((finding) => (
+      `${finding.match}: ${finding.reason}`
+    )),
+  };
 }
 
 export function summarizeSegmentQualityReports(reports: SegmentQualityReport[]): BatchQualityReportSummary {
@@ -244,12 +300,34 @@ export function summarizeSegmentQualityReports(reports: SegmentQualityReport[]):
       totalReports: 0,
       averageQualityScore: 0,
       suggestedReviewCount: 0,
+      blockingCount: 0,
+      patchableCount: 0,
+      warningCount: 0,
+      riskCount: 0,
+      localPatchCount: 0,
+      codexPatchCount: 0,
+      codexRepairCount: 0,
+      codexRepairSegmentCount: 0,
       highestSafetyRisk: "none",
       slowestDurationMs: 0,
+      judgeInvocationCount: 0,
+      eventPatchCount: 0,
+      needsReviewCount: 0,
     };
   }
 
   const totalScore = reports.reduce((sum, report) => sum + report.qualityScore, 0);
+  const blockingCount = reports.reduce((sum, report) => sum + report.blockingCount, 0);
+  const patchableCount = reports.reduce((sum, report) => sum + report.patchableCount, 0);
+  const warningCount = reports.reduce((sum, report) => sum + report.warningCount, 0);
+  const riskCount = reports.reduce((sum, report) => sum + report.riskCount, 0);
+  const localPatchCount = reports.reduce((sum, report) => sum + report.localPatchCount, 0);
+  const codexPatchCount = reports.reduce((sum, report) => sum + report.codexPatchCount, 0);
+  const codexRepairCount = reports.filter((report) => report.codexRepairAttempted).length;
+  const codexRepairSegmentCount = reports.reduce((sum, report) => sum + report.codexRepairSegmentCount, 0);
+  const judgeInvocationCount = reports.filter((report) => report.judgeInvoked).length;
+  const eventPatchCount = reports.reduce((sum, report) => sum + report.eventPatchCount, 0);
+  const needsReviewCount = reports.filter((report) => report.status === "needs_review").length;
   const highestSafetyRisk = reports.reduce<SegmentSafetyRisk>(
     (highest, report) => RISK_RANK[report.safetyRisk] > RISK_RANK[highest] ? report.safetyRisk : highest,
     "none",
@@ -268,9 +346,20 @@ export function summarizeSegmentQualityReports(reports: SegmentQualityReport[]):
       || report.repairCount > 0
       || RISK_RANK[report.safetyRisk] >= RISK_RANK.medium
     ).length,
+    blockingCount,
+    patchableCount,
+    warningCount,
+    riskCount,
+    localPatchCount,
+    codexPatchCount,
+    codexRepairCount,
+    codexRepairSegmentCount,
     highestSafetyRisk,
     slowestSegmentIndex: slowest?.segmentIndex,
     slowestDurationMs: slowest?.durationMs || 0,
+    judgeInvocationCount,
+    eventPatchCount,
+    needsReviewCount,
   };
 }
 

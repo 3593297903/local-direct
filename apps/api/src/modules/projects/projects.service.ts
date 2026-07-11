@@ -21,6 +21,7 @@ import type {
   UpdateProjectMemoryDto,
   UpdateStoryLoopDto,
 } from "./projects.dto";
+import { shouldPublishProjectVersionMemory } from "./project-memory-publish-policy";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -1742,11 +1743,33 @@ export class ProjectsService {
 
   async createProject(userId: string, input: CreateProjectDto) {
     if (!userId) throw new BadRequestException("Authenticated user id is required");
+    const publishNarrativeMemory = shouldPublishProjectVersionMemory(input.status);
     const episodeMemory = deriveEpisodeMemory(input);
     const narrativeMemory = deriveNarrativeMemory(input, episodeMemory);
     const qualityCheck = deriveQualityCheck(input, narrativeMemory);
 
     const result = await this.prisma.$transaction(async (prisma) => {
+      if (input.idempotencyKey) {
+        await prisma.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${input.idempotencyKey}))`;
+        const existingVersion = await prisma.projectVersion.findFirst({
+          where: {
+            project: { userId },
+            contextSnapshot: { path: ["saveIdempotencyKey"], equals: input.idempotencyKey },
+          },
+          select: {
+            id: true,
+            versionNumber: true,
+            project: { select: { id: true } },
+          },
+        });
+        if (existingVersion) {
+          return {
+            project: existingVersion.project,
+            version: { id: existingVersion.id },
+            versionNumber: existingVersion.versionNumber,
+          };
+        }
+      }
       const project = input.projectId
         ? await prisma.project.findFirst({
             where: { id: input.projectId, userId },
@@ -1761,7 +1784,7 @@ export class ProjectsService {
               contentType: input.contentType,
               style: input.style,
               duration: input.duration,
-              status: input.status || "draft",
+              status: "draft",
             },
             select: { id: true, storyBible: true, stateVector: true, openLoops: true },
           });
@@ -1776,6 +1799,8 @@ export class ProjectsService {
       const stateVector = pickRecord(narrativeMemory.stateVector);
       const openLoops = asStringArray(narrativeMemory.openLoops, 20);
       const contextSnapshot = {
+        saveIdempotencyKey: input.idempotencyKey || null,
+        memoryPublication: publishNarrativeMemory ? "published" : "deferred_needs_review",
         storyBible,
         narrativeMemory,
         stateVector,
@@ -1840,23 +1865,25 @@ export class ProjectsService {
         });
 
         await prisma.memoryItem.deleteMany({ where: { versionId: version.id } });
-        const memoryItems = deriveMemoryItems(input, episodeMemory, project.id, userId, version.id);
-        if (memoryItems.length) {
-          await prisma.memoryItem.createMany({ data: memoryItems });
-        }
-        await upsertCharacterProfiles(prisma, { userId, projectId: project.id, versionId: version.id, characters: characterProfiles });
-        await upsertProjectVisualEntities(prisma, { userId, projectId: project.id, visualEntities });
-        await upsertStoryLoops(prisma, { userId, projectId: project.id, versionId: version.id, loops: storyLoops });
+        if (publishNarrativeMemory) {
+          const memoryItems = deriveMemoryItems(input, episodeMemory, project.id, userId, version.id);
+          if (memoryItems.length) {
+            await prisma.memoryItem.createMany({ data: memoryItems });
+          }
+          await upsertCharacterProfiles(prisma, { userId, projectId: project.id, versionId: version.id, characters: characterProfiles });
+          await upsertProjectVisualEntities(prisma, { userId, projectId: project.id, visualEntities });
+          await upsertStoryLoops(prisma, { userId, projectId: project.id, versionId: version.id, loops: storyLoops });
 
-        await prisma.project.update({
-          where: { id: project.id },
-          data: {
-            storyBible: toJson(storyBible),
-            contextSummary,
-            stateVector: toJson(stateVector),
-            openLoops: toJson(openLoops),
-          },
-        });
+          await prisma.project.update({
+            where: { id: project.id },
+            data: {
+              storyBible: toJson(storyBible),
+              contextSummary,
+              stateVector: toJson(stateVector),
+              openLoops: toJson(openLoops),
+            },
+          });
+        }
 
         return { project, version, versionNumber: ownedVersion.versionNumber };
       }
@@ -1916,28 +1943,30 @@ export class ProjectsService {
       });
 
       await prisma.memoryItem.deleteMany({ where: { versionId: version.id } });
-      const memoryItems = deriveMemoryItems(input, episodeMemory, project.id, userId, version.id);
-      if (memoryItems.length) {
-        await prisma.memoryItem.createMany({ data: memoryItems });
-      }
-      await upsertCharacterProfiles(prisma, { userId, projectId: project.id, versionId: version.id, characters: characterProfiles });
-      await upsertProjectVisualEntities(prisma, { userId, projectId: project.id, visualEntities });
-      await upsertStoryLoops(prisma, { userId, projectId: project.id, versionId: version.id, loops: storyLoops });
+      if (publishNarrativeMemory) {
+        const memoryItems = deriveMemoryItems(input, episodeMemory, project.id, userId, version.id);
+        if (memoryItems.length) {
+          await prisma.memoryItem.createMany({ data: memoryItems });
+        }
+        await upsertCharacterProfiles(prisma, { userId, projectId: project.id, versionId: version.id, characters: characterProfiles });
+        await upsertProjectVisualEntities(prisma, { userId, projectId: project.id, visualEntities });
+        await upsertStoryLoops(prisma, { userId, projectId: project.id, versionId: version.id, loops: storyLoops });
 
-      await prisma.project.update({
-        where: { id: project.id },
-        data: {
-          storyBible: toJson(storyBible),
-          contextSummary,
-          stateVector: toJson(stateVector),
-          openLoops: toJson(openLoops),
-        },
-      });
+        await prisma.project.update({
+          where: { id: project.id },
+          data: {
+            storyBible: toJson(storyBible),
+            contextSummary,
+            stateVector: toJson(stateVector),
+            openLoops: toJson(openLoops),
+          },
+        });
+      }
 
       return { project, version, versionNumber };
     });
 
-    await syncMemoryEmbeddingVectors(this.prisma, result.version.id);
+    if (publishNarrativeMemory) await syncMemoryEmbeddingVectors(this.prisma, result.version.id);
 
     return { saved: true, projectId: result.project.id, versionId: result.version.id, versionNumber: result.versionNumber };
   }

@@ -18,22 +18,68 @@ export type SegmentContractSafetyPolicy = {
   rewriteHints: Record<string, string>;
 };
 
+export const SEGMENT_CONTRACT_SCHEMA_VERSION = 2 as const;
+export const DEFAULT_COVERAGE_POLICY_VERSION = "2026-07-10.1";
+
+export type SegmentContractEventImportance = "blocking" | "advisory";
+
+export type SegmentEvidenceField =
+  | "visual"
+  | "dialogue"
+  | "shotPurpose"
+  | "videoPrompt"
+  | "firstFramePrompt"
+  | "lastFramePrompt";
+
+export type SegmentEvidenceSelector = {
+  source: "optimizedScript" | "storyboard";
+  shotNumber?: number | "any";
+  fields: SegmentEvidenceField[];
+  requireExecutableShot: boolean;
+};
+
+export type SegmentRepairTarget = {
+  shotNumber: number | "best_match";
+  field: SegmentEvidenceField;
+};
+
 export type SegmentContractEventSlot = {
   id: string;
   label: string;
-  mustIncludeAny: string[];
-  mustIncludeOneOf: string[][];
+  importance: SegmentContractEventImportance;
+  anchorGroups: string[][];
+  conceptGroups: string[][];
+  contradictionGroups: string[][];
+  evidenceSelectors: SegmentEvidenceSelector[];
+  repairTargets: SegmentRepairTarget[];
+  mustIncludeAny?: string[];
+  mustIncludeOneOf?: string[][];
+};
+
+export type CharacterContinuityLock = {
+  characterId: string;
+  displayName: string;
+  factKey: string;
+  expectedValue: string;
+  mode: "must_not_contradict";
+  contradictionSignals: string[][];
+  appliesFromSegment?: number;
+  appliesThroughSegment?: number;
 };
 
 export type SegmentContract = {
+  contractSchemaVersion: typeof SEGMENT_CONTRACT_SCHEMA_VERSION;
+  coveragePolicyVersion: string;
+  sourceHash: string;
   segmentIndex: number;
   title: string;
   sourceText: string;
   durationSeconds: number;
   shotCount: number;
   requiredEvents: string[];
-  requiredEventSlots?: SegmentContractEventSlot[];
+  requiredEventSlots: SegmentContractEventSlot[];
   forbiddenFutureEvents: string[];
+  characterLocks: CharacterContinuityLock[];
   characters: SegmentContractLock[];
   locations: SegmentContractLock[];
   props: SegmentContractLock[];
@@ -48,6 +94,7 @@ export type SegmentContractFallback = {
   fallbackSourceText: string;
   fallbackDurationSeconds: number;
   fallbackShotCount: number;
+  coveragePolicyVersion?: string;
   forbiddenFutureEvents?: string[];
 };
 
@@ -65,14 +112,20 @@ export function normalizeSegmentContract(raw: unknown, fallback: SegmentContract
     ? normalizeStringArray(record.forbiddenFutureEvents, "")
     : normalizeStringArray(fallback.forbiddenFutureEvents || [], "");
   const contractWithoutHash = {
+    contractSchemaVersion: SEGMENT_CONTRACT_SCHEMA_VERSION,
+    coveragePolicyVersion: cleanString(fallback.coveragePolicyVersion)
+      || cleanString(record.coveragePolicyVersion)
+      || DEFAULT_COVERAGE_POLICY_VERSION,
+    sourceHash: cleanString(record.sourceHash) || buildSourceHash(sourceText),
     segmentIndex,
     title,
     sourceText,
     durationSeconds: Math.min(15, roundDuration(durationSeconds)),
     shotCount,
     requiredEvents,
-    requiredEventSlots: normalizeEventSlots(record.requiredEventSlots),
+    requiredEventSlots: normalizeEventSlots(record.requiredEventSlots, shotCount),
     forbiddenFutureEvents,
+    characterLocks: normalizeCharacterContinuityLocks(record.characterLocks, segmentIndex),
     characters: normalizeLocks(record.characters),
     locations: normalizeLocks(record.locations),
     props: normalizeLocks(record.props),
@@ -86,6 +139,11 @@ export function normalizeSegmentContract(raw: unknown, fallback: SegmentContract
 }
 
 export function validateSegmentContract(contract: SegmentContract, expectedIndex?: number) {
+  if (contract.contractSchemaVersion !== SEGMENT_CONTRACT_SCHEMA_VERSION) {
+    throw new Error("SegmentContract has an unsupported contractSchemaVersion");
+  }
+  if (!contract.coveragePolicyVersion?.trim()) throw new Error("SegmentContract is missing coveragePolicyVersion");
+  if (!contract.sourceHash?.trim()) throw new Error("SegmentContract is missing sourceHash");
   if (!Number.isInteger(contract.segmentIndex) || contract.segmentIndex < 1) {
     throw new Error("SegmentContract is missing segmentIndex");
   }
@@ -105,6 +163,19 @@ export function validateSegmentContract(contract: SegmentContract, expectedIndex
   }
   if (!contract.requiredShotBeats.length) {
     throw new Error(`SegmentContract ${contract.segmentIndex} is missing requiredShotBeats`);
+  }
+  const slotIds = new Set<string>();
+  for (const slot of contract.requiredEventSlots || []) {
+    if (!slot.id.trim() || slotIds.has(slot.id)) throw new Error(`SegmentContract ${contract.segmentIndex} has duplicate event slot id`);
+    slotIds.add(slot.id);
+    if (slot.importance === "blocking") {
+      if (!slot.anchorGroups.length || !slot.conceptGroups.length || !slot.evidenceSelectors.length || !slot.repairTargets.length) {
+        throw new Error(`SegmentContract ${contract.segmentIndex} has an incomplete blocking event slot: ${slot.id}`);
+      }
+    }
+    if (slot.repairTargets.some((target) => !isAllowedRepairTarget(target))) {
+      throw new Error(`SegmentContract ${contract.segmentIndex} has an invalid event repair target: ${slot.id}`);
+    }
   }
 }
 
@@ -182,22 +253,136 @@ function normalizeStringArray(value: unknown, fallbackText: string) {
   return Array.from(new Set(fallback)).slice(0, 6);
 }
 
-function normalizeEventSlots(value: unknown): SegmentContractEventSlot[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const slots = value.flatMap((item, index) => {
+function normalizeEventSlots(value: unknown, shotCount: number): SegmentContractEventSlot[] {
+  if (!Array.isArray(value)) return [];
+  const seenIds = new Set<string>();
+  return value.flatMap((item, index) => {
     if (!item || typeof item !== "object") return [];
     const record = item as Record<string, unknown>;
-    const id = cleanString(record.id) || `event_slot_${index + 1}`;
+    let id = cleanString(record.id) || `event_slot_${index + 1}`;
+    if (seenIds.has(id)) id = `${id}_${index + 1}`;
+    seenIds.add(id);
     const label = cleanString(record.label) || id;
-    const mustIncludeAny = normalizeStringArray(record.mustIncludeAny, "");
-    const rawOneOf = Array.isArray(record.mustIncludeOneOf) ? record.mustIncludeOneOf : [];
-    const mustIncludeOneOf = rawOneOf
-      .map((group) => normalizeStringArray(group, ""))
-      .filter((group) => group.length);
-    if (!mustIncludeAny.length && !mustIncludeOneOf.length) return [];
-    return [{ id, label, mustIncludeAny, mustIncludeOneOf }];
+    const legacyMustIncludeAny = normalizeStringArray(record.mustIncludeAny, "");
+    const legacyOneOf = normalizeStringMatrix(record.mustIncludeOneOf);
+    const isLegacy = legacyMustIncludeAny.length > 0 || legacyOneOf.length > 0;
+    const anchorGroups = normalizeStringMatrix(record.anchorGroups).length
+      ? normalizeStringMatrix(record.anchorGroups)
+      : legacyMustIncludeAny.length
+        ? [legacyMustIncludeAny]
+        : [];
+    const conceptGroups = normalizeStringMatrix(record.conceptGroups).length
+      ? normalizeStringMatrix(record.conceptGroups)
+      : legacyOneOf;
+    const contradictionGroups = normalizeStringMatrix(record.contradictionGroups);
+    const evidenceSelectors = normalizeEvidenceSelectors(record.evidenceSelectors, shotCount);
+    const repairTargets = normalizeRepairTargets(record.repairTargets, shotCount);
+    const requestedImportance = record.importance === "blocking" ? "blocking" : "advisory";
+    const strongEnough = anchorGroups.length > 0
+      && conceptGroups.length > 0
+      && evidenceSelectors.length > 0
+      && repairTargets.length > 0;
+    const importance: SegmentContractEventImportance = !isLegacy && requestedImportance === "blocking" && strongEnough
+      ? "blocking"
+      : "advisory";
+    if (!anchorGroups.length && !conceptGroups.length) return [];
+    return [{
+      id,
+      label,
+      importance,
+      anchorGroups,
+      conceptGroups,
+      contradictionGroups,
+      evidenceSelectors,
+      repairTargets,
+      mustIncludeAny: legacyMustIncludeAny.length ? legacyMustIncludeAny : undefined,
+      mustIncludeOneOf: legacyOneOf.length ? legacyOneOf : undefined,
+    }];
   });
-  return slots.length ? slots : undefined;
+}
+
+function normalizeStringMatrix(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((group) => normalizeStringArray(group, ""))
+    .filter((group) => group.length);
+}
+
+function normalizeEvidenceSelectors(value: unknown, shotCount: number): SegmentEvidenceSelector[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    const source = record.source === "optimizedScript" ? "optimizedScript" : record.source === "storyboard" ? "storyboard" : null;
+    if (!source) return [];
+    const shotNumber = record.shotNumber === "any"
+      ? "any"
+      : normalizePositiveInteger(record.shotNumber) || undefined;
+    if (typeof shotNumber === "number" && shotNumber > shotCount) return [];
+    const fields = (Array.isArray(record.fields) ? record.fields : [])
+      .map((field) => String(field || ""))
+      .filter((field): field is SegmentEvidenceField => isEvidenceField(field));
+    const normalizedFields = source === "optimizedScript" ? [] : Array.from(new Set(fields));
+    if (source === "storyboard" && !normalizedFields.length) return [];
+    return [{
+      source,
+      shotNumber,
+      fields: normalizedFields,
+      requireExecutableShot: record.requireExecutableShot !== false,
+    }];
+  });
+}
+
+function normalizeRepairTargets(value: unknown, shotCount: number): SegmentRepairTarget[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    const shotNumber = record.shotNumber === "best_match"
+      ? "best_match"
+      : normalizePositiveInteger(record.shotNumber);
+    const field = String(record.field || "");
+    const target = { shotNumber, field } as SegmentRepairTarget;
+    if (!shotNumber || (typeof shotNumber === "number" && shotNumber > shotCount) || !isAllowedRepairTarget(target)) return [];
+    return [target];
+  });
+}
+
+function normalizeCharacterContinuityLocks(value: unknown, segmentIndex: number): CharacterContinuityLock[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    const characterId = cleanString(record.characterId);
+    const displayName = cleanString(record.displayName);
+    const factKey = cleanString(record.factKey);
+    const expectedValue = cleanString(record.expectedValue);
+    const contradictionSignals = normalizeStringMatrix(record.contradictionSignals);
+    if (!characterId || !displayName || !factKey || !expectedValue || !contradictionSignals.length) return [];
+    const appliesFromSegment = normalizePositiveInteger(record.appliesFromSegment) || undefined;
+    const appliesThroughSegment = normalizePositiveInteger(record.appliesThroughSegment) || undefined;
+    if (appliesFromSegment && appliesFromSegment > segmentIndex) return [];
+    if (appliesThroughSegment && appliesThroughSegment < segmentIndex) return [];
+    return [{
+      characterId,
+      displayName,
+      factKey,
+      expectedValue,
+      mode: "must_not_contradict" as const,
+      contradictionSignals,
+      appliesFromSegment,
+      appliesThroughSegment,
+    }];
+  });
+}
+
+function isEvidenceField(value: string): value is SegmentEvidenceField {
+  return ["visual", "dialogue", "shotPurpose", "videoPrompt", "firstFramePrompt", "lastFramePrompt"].includes(value);
+}
+
+function isAllowedRepairTarget(target: SegmentRepairTarget) {
+  return (target.shotNumber === "best_match" || (Number.isInteger(target.shotNumber) && Number(target.shotNumber) > 0))
+    && isEvidenceField(target.field);
 }
 
 function normalizeLocks(value: unknown): SegmentContractLock[] {
@@ -250,10 +435,17 @@ function normalizeShotBeats(value: unknown, shotCount: number, requiredEvents: s
 }
 
 function isEventSlotCovered(normalizedPrompt: string, slot: SegmentContractEventSlot) {
-  const hasRequiredAnchor = !slot.mustIncludeAny.length
-    || slot.mustIncludeAny.some((item) => normalizedPrompt.includes(normalizeEventCoverageText(item)));
-  if (!hasRequiredAnchor) return false;
-  return slot.mustIncludeOneOf.every((group) =>
+  const anchorGroups = slot.anchorGroups?.length
+    ? slot.anchorGroups
+    : slot.mustIncludeAny?.length
+      ? [slot.mustIncludeAny]
+      : [];
+  const conceptGroups = slot.conceptGroups?.length ? slot.conceptGroups : slot.mustIncludeOneOf || [];
+  const anchorsCovered = anchorGroups.every((group) =>
+    group.some((item) => normalizedPrompt.includes(normalizeEventCoverageText(item))),
+  );
+  if (!anchorsCovered) return false;
+  return conceptGroups.every((group) =>
     group.some((item) => normalizedPrompt.includes(normalizeEventCoverageText(item))),
   );
 }
@@ -336,6 +528,20 @@ function stableStringify(value: unknown): string {
     return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function buildSourceHash(sourceText: string) {
+  return buildStableHash("src", sourceText);
+}
+
+function buildStableHash(prefix: string, value: unknown) {
+  const stable = stableStringify(value);
+  let hash = 2166136261;
+  for (let index = 0; index < stable.length; index += 1) {
+    hash ^= stable.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${prefix}_${(hash >>> 0).toString(36)}`;
 }
 
 function cleanSourceEpisodeLabels(value: string) {

@@ -128,3 +128,80 @@ test("contract event slots reject prompts missing the required information slot"
 
   assert.deepEqual(findMissingSegmentContractRequiredEvents(promptText, contract), ["点出张庆金身份"]);
 });
+
+test("normalizes v2 event slots, continuity locks, versions, and safe repair targets", () => {
+  const contract = normalizeSegmentContract(
+    {
+      contractSchemaVersion: 2,
+      coveragePolicyVersion: "2026-07-10.1",
+      segmentIndex: 6,
+      title: "第6段｜护栏救援",
+      sourceText: "二宝以巡警身份参与护栏救援。",
+      durationSeconds: 12,
+      shotCount: 2,
+      requiredEvents: ["二宝参与护栏救援"],
+      requiredEventSlots: [{
+        id: "erbao_rescue",
+        label: "二宝以巡警身份参与护栏救援",
+        importance: "blocking",
+        anchorGroups: [["二宝"]],
+        conceptGroups: [["护栏", "救援"]],
+        contradictionGroups: [],
+        evidenceSelectors: [{ source: "storyboard", shotNumber: "any", fields: ["visual", "shotPurpose"], requireExecutableShot: true }],
+        repairTargets: [{ shotNumber: "best_match", field: "visual" }],
+      }],
+      characterLocks: [{
+        characterId: "erbao",
+        displayName: "二宝",
+        factKey: "occupation",
+        expectedValue: "巡警",
+        mode: "must_not_contradict",
+        contradictionSignals: [["辞职", "离开警队"]],
+      }],
+    },
+    { segmentIndex: 6, fallbackTitle: "第6段", fallbackSourceText: "fallback", fallbackDurationSeconds: 12, fallbackShotCount: 2 },
+  );
+
+  assert.equal(contract.contractSchemaVersion, 2);
+  assert.equal(contract.coveragePolicyVersion, "2026-07-10.1");
+  assert.match(contract.sourceHash, /^src_[a-z0-9]+$/);
+  assert.equal(contract.requiredEventSlots[0].importance, "blocking");
+  assert.equal(contract.characterLocks[0].mode, "must_not_contradict");
+  assert.doesNotThrow(() => validateSegmentContract(contract, 6));
+});
+
+test("legacy literal slots are advisory and cannot become blocking repairs", () => {
+  const contract = normalizeSegmentContract(
+    {
+      segmentIndex: 1,
+      title: "第1段",
+      sourceText: "庄秦承认婚姻冷淡。",
+      durationSeconds: 12,
+      shotCount: 2,
+      requiredEvents: ["婚姻冷淡"],
+      requiredEventSlots: [{
+        id: "legacy_slot",
+        label: "婚姻冷淡",
+        mustIncludeAny: ["庄秦"],
+        mustIncludeOneOf: [["婚姻冷淡"]],
+      }],
+    },
+    { segmentIndex: 1, fallbackTitle: "第1段", fallbackSourceText: "fallback", fallbackDurationSeconds: 12, fallbackShotCount: 2 },
+  );
+
+  assert.equal(contract.requiredEventSlots[0].importance, "advisory");
+});
+
+test("contract hash changes with source and coverage policy versions", () => {
+  const first = normalizeSegmentContract(
+    { segmentIndex: 1, title: "第1段", sourceText: "原文甲", durationSeconds: 12, shotCount: 2, requiredEvents: ["事件甲"], coveragePolicyVersion: "v1" },
+    { segmentIndex: 1, fallbackTitle: "第1段", fallbackSourceText: "原文甲", fallbackDurationSeconds: 12, fallbackShotCount: 2 },
+  );
+  const second = normalizeSegmentContract(
+    { segmentIndex: 1, title: "第1段", sourceText: "原文乙", durationSeconds: 12, shotCount: 2, requiredEvents: ["事件甲"], coveragePolicyVersion: "v2" },
+    { segmentIndex: 1, fallbackTitle: "第1段", fallbackSourceText: "原文乙", fallbackDurationSeconds: 12, fallbackShotCount: 2 },
+  );
+
+  assert.notEqual(first.sourceHash, second.sourceHash);
+  assert.notEqual(first.contractHash, second.contractHash);
+});

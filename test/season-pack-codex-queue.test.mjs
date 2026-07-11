@@ -144,6 +144,10 @@ test("creates, claims, and completes a season planning job from per-episode inpu
 
     assert.equal(job.status, "pending");
     assert.equal(job.episodeCount, 2);
+    assert.equal(job.featureFlags.contractV2, true);
+    assert.equal(job.featureFlags.coverageSidecar, true);
+    assert.equal(job.featureFlags.localGate, false);
+    assert.equal(job.featureFlags.judge, false);
     assert.match(job.id, /^season-pack-job-/);
     assert.match(job.prompt, /Episode Input Pack/);
     assert.doesNotMatch(job.prompt, /Each AnalysisResult must include/);

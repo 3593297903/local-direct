@@ -83,6 +83,14 @@ test("Codex workers capture CLI output and normalize quota failures", async () =
   assert.match(contractEchoMessage, /Codex returned task prompt or SegmentContract text/);
   assert.doesNotMatch(contractEchoMessage, /forbiddenFutureEvents/);
 
+  const versionMessage = helper.buildCodexFailureMessage(
+    "codex exec exited with code 1",
+    `${"SEGMENT CONTRACT task prompt ".repeat(80)}The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.`,
+  );
+  assert.match(versionMessage, /CODEX_CLI_VERSION_UNSUPPORTED/);
+  assert.match(versionMessage, /Codex CLI 版本过旧/);
+  assert.doesNotMatch(versionMessage, /task prompt or SegmentContract/);
+
   for (const worker of codexWorkers) {
     const source = readFileSync(worker, "utf8");
     assert.match(source, /codex-runtime-utils\.mjs/, `${worker} should import quota normalization helpers`);

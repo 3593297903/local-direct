@@ -3,6 +3,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
+import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.VISUAL_ASSET_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -14,6 +15,7 @@ const workerToken = process.env.VISUAL_ASSET_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-visual-asset-codex", "codex-messages");
 const logDir = path.join(rootDir, ".tmp-visual-asset-codex", "codex-logs");
 const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const runtimeHealth = await startCodexWorkerRuntimeHealth("visual-asset", { rootDir });
 
 console.log("Local Director visual asset Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -26,6 +28,7 @@ const activeTasks = new Set();
 
 while (true) {
   try {
+    runtimeHealth.assertHealthy();
     while (activeTasks.size < concurrency) {
       const task = await claimTask();
       if (!task) break;

@@ -22,6 +22,7 @@ const SegmentSchema = z.object({
 const RequestSchema = z.object({
   projectId: z.string().uuid().optional(),
   mode: z.enum(["standard", "strictUtf8"]).optional(),
+  coverageSidecarEnabled: z.boolean().optional(),
   segments: z.array(SegmentSchema).min(1).max(5),
 });
 

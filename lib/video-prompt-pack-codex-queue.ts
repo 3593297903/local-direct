@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { AnalysisResult } from "../types";
 import type { SegmentContract } from "./batch-segment-contract";
 import {
   assertCleanCodexPromptInput,
@@ -9,6 +10,11 @@ import {
   segmentContractToChineseRenderBlock,
 } from "./codex-prompt-input-compiler";
 import { readVideoPromptOutputJson } from "./video-prompt-codex-queue";
+import {
+  buildSegmentResultHash,
+  type SegmentCoverageSidecar,
+} from "./batch-event-coverage";
+import { applyPromptSafetyPolicyDeep, type PromptSafetyDiff } from "./prompt-safety-policy";
 
 export type VideoPromptPackCodexJobStatus = "pending" | "running" | "completed" | "failed";
 
@@ -25,19 +31,23 @@ export type VideoPromptPackSegmentInput = {
 export type CreateVideoPromptPackCodexJobInput = {
   projectId?: string;
   mode?: VideoPromptPackCodexMode;
+  coverageSidecarEnabled?: boolean;
   segments: VideoPromptPackSegmentInput[];
 };
 
 export type VideoPromptPackSegmentTask = VideoPromptPackSegmentInput & {
   outputFileName: string;
   outputPath: string;
+  coverageOutputPath: string;
 };
 
 export type VideoPromptPackCodexResult = {
   segments: Array<{
     episodeIndex: number;
     outputPath: string;
+    coverageOutputPath: string;
     result: Record<string, unknown>;
+    coverageSidecar: SegmentCoverageSidecar | null;
   }>;
 };
 
@@ -45,6 +55,8 @@ export type VideoPromptPackCodexJob = {
   id: string;
   projectId: string | null;
   mode: VideoPromptPackCodexMode;
+  coverageSidecarEnabled: boolean;
+  safetyDiffs: PromptSafetyDiff[];
   segments: VideoPromptPackSegmentTask[];
   prompt: string;
   status: VideoPromptPackCodexJobStatus;
@@ -94,15 +106,20 @@ export async function createVideoPromptPackCodexJob(
       ...segment,
       outputFileName,
       outputPath: path.join(resultDir(rootDir), fileSegment(jobId), outputFileName),
+      coverageOutputPath: path.join(resultDir(rootDir), fileSegment(jobId), coverageFileName(segment.episodeIndex)),
     };
   });
   const mode = input.mode === "standard" ? "standard" : "strictUtf8";
-  const prompt = buildVideoPromptPackCodexPrompt(jobId, segments, mode);
+  const coverageSidecarEnabled = input.coverageSidecarEnabled !== false;
+  const modelPrepass = applyPromptSafetyPolicyDeep(segments, { phase: "render" });
+  const prompt = buildVideoPromptPackCodexPrompt(jobId, modelPrepass.sourceTextForModel, mode, coverageSidecarEnabled);
   assertCleanCodexPromptInput(prompt, "Video prompt render pack prompt");
   const job: VideoPromptPackCodexJob = {
     id: jobId,
     projectId: input.projectId || null,
     mode,
+    coverageSidecarEnabled,
+    safetyDiffs: modelPrepass.safetyDiffs,
     segments,
     prompt,
     status: "pending",
@@ -191,6 +208,7 @@ function buildVideoPromptPackCodexPrompt(
   jobId: string,
   segments: VideoPromptPackSegmentTask[],
   mode: VideoPromptPackCodexMode,
+  coverageSidecarEnabled: boolean,
 ) {
   const segmentInstructions = segments.flatMap((segment) => [
     `段落 ${segment.episodeIndex}：${compileCodexPromptText(segment.title)}`,
@@ -198,6 +216,7 @@ function buildVideoPromptPackCodexPrompt(
     `镜头数量锁：${segment.shotCount || "按渲染稿锁定"}`,
     segment.segmentContract ? segmentContractToChineseRenderBlock(segment.segmentContract) : "",
     `Output path: ${segment.outputPath}`,
+    coverageSidecarEnabled ? `Optional internal coverage sidecar path: ${segment.coverageOutputPath}` : "",
     "渲染输入：",
     compileCodexPromptText(segment.renderInputScript),
     "",
@@ -240,6 +259,7 @@ function buildVideoPromptPackCodexPrompt(
     "- If there is no spoken line, dialogue must be a concrete no-dialogue value such as \"无\" or \"none\".",
     "- 保留每段的具体渲染输入、镜头数量锁、项目记忆连续性和源文案事件。",
     "- User-facing fields must use natural Chinese labels. Do not output hyphenated English internal IDs, schema names, file-format names, or engineering type names in title, contentType, scene, visual, workflow, or storyboard fields.",
+    "- The main episode JSON must remain a bare video prompt result. Never put coverage receipts, confidence, analysis, or internal metadata inside it.",
     "",
     lexiconBlock,
     lexiconBlock ? "" : "",
@@ -258,7 +278,15 @@ function buildVideoPromptPackCodexPrompt(
     "1. Create every output directory if it does not exist.",
     "2. Write every segment JSON file to the exact output path.",
     "3. Read every JSON file back and confirm it parses.",
-    "4. Final reply must be exactly one line: DONE.",
+    ...(coverageSidecarEnabled
+      ? [
+          "4. After the main JSON parses, you may write the optional coverage sidecar for v2 event slots. It must contain only schemaVersion=1, segmentIndex, contractHash, and receipts with slotId plus up to two path/quote evidence items.",
+          "5. Do not write resultHash in the model sidecar. Local Director computes and injects resultHash only after the main result is read and validated.",
+          "6. Coverage quotes must be exact short substrings from optimizedScript or allowed storyboard user fields. Do not output covered, confidence, analysis, explanations, repairs, or full prompt content in the sidecar.",
+          "7. Sidecar failure must never modify or delete the main episode JSON.",
+        ]
+      : []),
+    "8. Final reply must be exactly one line: DONE.",
   ].join("\n");
 }
 
@@ -309,13 +337,61 @@ function applyJobStatus(job: VideoPromptPackCodexJob): VideoPromptPackCodexJob {
 
 async function readPackResult(job: VideoPromptPackCodexJob): Promise<VideoPromptPackCodexResult> {
   const segments = await Promise.all(
-    job.segments.map(async (segment) => ({
-      episodeIndex: segment.episodeIndex,
-      outputPath: segment.outputPath,
-      result: await readVideoPromptOutputJson(segment.outputPath, `${segment.script}\n${segment.renderInputScript}`),
-    })),
+    job.segments.map(async (segment) => {
+      const result = await readVideoPromptOutputJson(segment.outputPath, `${segment.script}\n${segment.renderInputScript}`);
+      return {
+        episodeIndex: segment.episodeIndex,
+        outputPath: segment.outputPath,
+        coverageOutputPath: segment.coverageOutputPath,
+        result,
+        coverageSidecar: job.coverageSidecarEnabled === false ? null : await readOptionalCoverageSidecar(segment, result),
+      };
+    }),
   );
   return { segments: segments.sort((left, right) => left.episodeIndex - right.episodeIndex) };
+}
+
+async function readOptionalCoverageSidecar(
+  segment: VideoPromptPackSegmentTask,
+  result: Record<string, unknown>,
+): Promise<SegmentCoverageSidecar | null> {
+  if (!segment.segmentContract?.requiredEventSlots?.length) return null;
+  try {
+    const parsed = JSON.parse(await readFile(segment.coverageOutputPath, "utf8")) as Record<string, unknown>;
+    if (
+      parsed.schemaVersion !== 1
+      || Number(parsed.segmentIndex) !== segment.episodeIndex
+      || parsed.contractHash !== segment.segmentContract.contractHash
+      || !Array.isArray(parsed.receipts)
+    ) return null;
+    const knownSlots = new Set(segment.segmentContract.requiredEventSlots.map((slot) => slot.id));
+    const receipts = parsed.receipts.flatMap((receipt) => {
+      if (!receipt || typeof receipt !== "object") return [];
+      const record = receipt as Record<string, unknown>;
+      const slotId = String(record.slotId || "");
+      if (!knownSlots.has(slotId) || !Array.isArray(record.evidence)) return [];
+      const importance = segment.segmentContract?.requiredEventSlots.find((slot) => slot.id === slotId)?.importance;
+      const evidence = record.evidence.slice(0, importance === "blocking" ? 2 : 1).flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        const entry = item as Record<string, unknown>;
+        const pathValue = String(entry.path || "").trim();
+        const quote = String(entry.quote || "").trim();
+        if (!pathValue || !quote || quote.length > 80) return [];
+        return [{ path: pathValue, quote }];
+      });
+      return evidence.length ? [{ slotId, evidence }] : [];
+    });
+    if (!receipts.length) return null;
+    return {
+      schemaVersion: 1,
+      segmentIndex: segment.episodeIndex,
+      contractHash: segment.segmentContract.contractHash,
+      resultHash: buildSegmentResultHash(result as AnalysisResult),
+      receipts,
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function hasValidPackResult(job: VideoPromptPackCodexJob) {
@@ -418,6 +494,10 @@ function jobPath(rootDir: string, jobId: string) {
 
 function episodeFileName(episodeIndex: number) {
   return `episode-${String(episodeIndex).padStart(3, "0")}.json`;
+}
+
+function coverageFileName(episodeIndex: number) {
+  return `episode-${String(episodeIndex).padStart(3, "0")}.coverage.json`;
 }
 
 function createId(prefix: string) {

@@ -51,6 +51,12 @@ cd E:\localdirector
 npm run storyboard:codex-worker
 ```
 
+For the full generation workflow, start all local Codex workers in one terminal:
+
+```powershell
+npm run codex:workers
+```
+
 This worker claims local storyboard panel tasks from the Next.js app, runs `codex exec`, asks Codex to use `$imagegen`, and saves PNG panels under `public/project-assets/storyboards`. It requires the Codex CLI to be installed and logged in on the same machine.
 
 By default the worker runs up to 5 storyboard panel generations in parallel. You can tune it in `.env.local`:

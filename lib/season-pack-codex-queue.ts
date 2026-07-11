@@ -14,6 +14,12 @@ import {
   segmentContractToChineseRenderBlock,
 } from "./codex-prompt-input-compiler";
 import { findInternalPromptToken, sanitizeInternalPromptTokens } from "./internal-prompt-token-sanitizer";
+import {
+  createBatchEventFeatureSnapshot,
+  normalizeBatchEventFeatureSnapshot,
+  type BatchEventFeatureSnapshot,
+} from "./batch-event-feature-flags";
+import { applyPromptSafetyPolicyDeep, type PromptSafetyDiff } from "./prompt-safety-policy";
 
 export type SeasonPackCodexJobStatus = "pending" | "running" | "completed" | "failed";
 export type SeasonPackSegmentCountMode = "fixed" | "auto";
@@ -94,6 +100,8 @@ export type SeasonPackCodexJob = {
   contentType: string;
   style: string;
   projectMemory: string;
+  featureFlags: BatchEventFeatureSnapshot;
+  safetyDiffs: PromptSafetyDiff[];
   prompt: string;
   status: SeasonPackCodexJobStatus;
   packDir: string;
@@ -202,7 +210,8 @@ export async function createSeasonPackCodexJob(
   const segmentCountMode: SeasonPackSegmentCountMode = input.segmentCountMode === "auto" ? "auto" : "fixed";
   const requestedEpisodeCount = segmentCountMode === "auto" ? null : input.episodeCount || 1;
   const episodeCount = requestedEpisodeCount || 0;
-  const prompt = buildSeasonPackCodexPrompt({
+  const featureFlags = createBatchEventFeatureSnapshot(process.env, now);
+  const modelPrepass = applyPromptSafetyPolicyDeep({
     ...input,
     duration,
     contentType,
@@ -210,7 +219,12 @@ export async function createSeasonPackCodexJob(
     projectMemory,
     segmentCountMode,
     episodeCount,
-  }, { packDir, episodesDir, manifestPath, seasonPlanPath });
+  }, { phase: "planning" });
+  const prompt = buildSeasonPackCodexPrompt(
+    modelPrepass.sourceTextForModel,
+    { packDir, episodesDir, manifestPath, seasonPlanPath },
+    featureFlags,
+  );
   assertCleanCodexPromptInput(prompt, "Season pack planning prompt");
   const job: SeasonPackCodexJob = {
     id: jobId,
@@ -224,6 +238,8 @@ export async function createSeasonPackCodexJob(
     contentType,
     style,
     projectMemory,
+    featureFlags,
+    safetyDiffs: modelPrepass.safetyDiffs,
     prompt,
     status: "pending",
     packDir,
@@ -327,6 +343,7 @@ function buildSeasonPackCodexPrompt(
     projectMemory: string;
   },
   paths: { packDir: string; episodesDir: string; manifestPath: string; seasonPlanPath: string },
+  featureFlags: BatchEventFeatureSnapshot,
 ) {
   const isAuto = input.segmentCountMode === "auto";
   const exampleLast = episodeFileName(isAuto ? MAX_EPISODE_COUNT : input.episodeCount);
@@ -349,6 +366,17 @@ function buildSeasonPackCodexPrompt(
   const requiredEpisodeFilesInstruction = isAuto
     ? "- 在分段目录中为每一个识别出的段落写一个段落输入文件。识别段数必须是 1-30，并且必须和 manifest.generatedEpisodes 一致。"
     : `- 在分段目录中写 ${input.episodeCount} 个段落输入文件。`;
+  const contractRules = featureFlags.contractV2
+    ? [
+        "- 包含第二版段落生成契约：每个锁定段落对应一份契约，机器字段包括 contractSchemaVersion=2, coveragePolicyVersion, segmentIndex, title, sourceText, durationSeconds, shotCount, requiredEvents, requiredEventSlots, forbiddenFutureEvents, characterLocks, characters, locations, props, requiredShotBeats, safetyPolicy。",
+        "- requiredEvents 只用于帮助模型理解，不得作为逐字硬匹配依据。真正阻断级事件必须写入 requiredEventSlots。",
+        "- requiredEventSlots 每项必须包含 id, label, importance, anchorGroups, conceptGroups, contradictionGroups, evidenceSelectors, repairTargets。blocking 槽必须完整；不完整或不确定的槽写为 advisory。",
+        "- evidenceSelectors 只能引用 optimizedScript 或 storyboard 的 visual/dialogue/shotPurpose/videoPrompt/firstFramePrompt/lastFramePrompt。",
+        "- repairTargets 只能引用 storyboard 叶子字段，使用 shotNumber 数字或 best_match；禁止把 workflow.fullVideoPrompt、workflow.filmScript 或 workflow.concisePrompt 作为修复目标。",
+        "- 人物身份、关系、服装、伤势和道具归属等不变事实写入 characterLocks 或相应连续性锁，mode 使用 must_not_contradict；不要把仅需保持不变的事实写成 requiredEventSlot。",
+        "- 只有本段必须主动展示某个身份或关系时，才为它额外创建 requiredEventSlot。最终生成段落不得出现 forbiddenFutureEvents。",
+      ]
+    : ["- 当前批次未启用第二版事件覆盖契约，只需按锁定剧情节拍和镜头数量生成稳定分段规划。"];
   return [
     "你正在通过本地 Codex CLI worker 执行 Local Director 多段规划任务。",
     "请用一次长上下文阅读完整原文，并生成规划文件包。",
@@ -381,8 +409,7 @@ function buildSeasonPackCodexPrompt(
     "- 不要让后续渲染 worker 决定某个镜头是否挪到下一段；所有移动和拆分都必须在规划阶段完成。",
     "- 如果某个节拍本身超过 15 秒，先把它拆成更小的节拍，再写入 season-plan.json。",
     "- 尽量包含 segments 或 lockedSegments 数组，字段包括 segmentIndex, title, beatStart, beatEnd, beatIds, estimatedDurationSeconds, shotCount, sourceText。",
-    "- 包含 segmentContracts：每个锁定段落对应一份段落契约，机器字段包括 segmentIndex, title, sourceText, durationSeconds, shotCount, requiredEvents, forbiddenFutureEvents, characters, locations, props, requiredShotBeats, safetyPolicy。",
-    "- 段落契约是渲染硬约束：必须覆盖 requiredEvents，最终生成段落不得出现 forbiddenFutureEvents。",
+    ...contractRules,
     "- 每段必须 <=15 秒。理想段长是 9-14.8 秒。低于 7 秒的段落除非是刻意钩子，否则应优先和相邻段合并。",
     "- 为所有请求段落建立段落承接关系，字段包括 startState, endState, carriedHooks, resolvedHooks, nextBridge, timelinePosition。",
     "- 所有段落必须和同一份项目固定记忆、角色称呼、地点称呼和道具称呼保持一致。",
@@ -491,7 +518,12 @@ async function listJobs(rootDir: string) {
 
 async function readJob(rootDir: string, jobId: string): Promise<SeasonPackCodexJob> {
   try {
-    return JSON.parse(await readFile(jobPath(rootDir, jobId), "utf8")) as SeasonPackCodexJob;
+    const parsed = JSON.parse(await readFile(jobPath(rootDir, jobId), "utf8")) as SeasonPackCodexJob;
+    return {
+      ...parsed,
+      featureFlags: normalizeBatchEventFeatureSnapshot(parsed.featureFlags, parsed.createdAt),
+      safetyDiffs: Array.isArray(parsed.safetyDiffs) ? parsed.safetyDiffs : [],
+    };
   } catch (error) {
     throw new SeasonPackCodexQueueError(
       (error as NodeJS.ErrnoException).code === "ENOENT" ? "Season pack Codex job not found" : "Season pack Codex job could not be read",
@@ -514,7 +546,7 @@ async function readSeasonPackResult(job: SeasonPackCodexJob): Promise<SeasonPack
   const sourceContext = parseSeasonSourceContext(job.script);
   const manifest = await readOptionalJson(job.manifestPath);
   const rawSeasonPlan = sanitizeSeasonPlanningPlaceholders(await readOptionalJson(job.seasonPlanPath)) as Record<string, unknown> | null;
-  const lockedSeasonPlan = buildLockedSeasonPlan(rawSeasonPlan);
+  const lockedSeasonPlan = buildLockedSeasonPlan(rawSeasonPlan, job.featureFlags.coveragePolicyVersion);
   const episodeCount = resolveSeasonPackEpisodeCount(job, manifest, lockedSeasonPlan.segments.length);
   validateLockedSeasonPlanCount(lockedSeasonPlan.segments, episodeCount);
   const lockedSegmentsByIndex = new Map(lockedSeasonPlan.segments.map((segment) => [segment.segmentIndex, segment]));
@@ -596,16 +628,17 @@ async function isValidSeasonPack(job: SeasonPackCodexJob) {
   }
 }
 
-function buildLockedSeasonPlan(seasonPlan: Record<string, unknown> | null) {
+function buildLockedSeasonPlan(seasonPlan: Record<string, unknown> | null, coveragePolicyVersion: string) {
   const beats = normalizeSeasonPlanBeats(seasonPlan);
   const segments = beats.length ? packBeatsIntoLockedSegments(beats) : normalizeSeasonPlanSegments(seasonPlan);
-  const segmentContracts = normalizeSeasonPlanSegmentContracts(seasonPlan, segments);
+  const segmentContracts = normalizeSeasonPlanSegmentContracts(seasonPlan, segments, coveragePolicyVersion);
   return { beats, segments, segmentContracts };
 }
 
 function normalizeSeasonPlanSegmentContracts(
   seasonPlan: Record<string, unknown> | null,
   segments: LockedSeasonSegment[],
+  coveragePolicyVersion: string,
 ) {
   const rawContracts = Array.isArray(seasonPlan?.segmentContracts)
     ? seasonPlan.segmentContracts
@@ -630,6 +663,7 @@ function normalizeSeasonPlanSegmentContracts(
       fallbackSourceText: segment.sourceText,
       fallbackDurationSeconds: segment.estimatedDurationSeconds,
       fallbackShotCount: segment.shotCount,
+      coveragePolicyVersion,
       forbiddenFutureEvents: futureEvents,
     });
     validateSegmentContract(contract, segment.segmentIndex);

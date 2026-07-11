@@ -61,6 +61,10 @@ Write-Host "Terminal 2:" -ForegroundColor Cyan
 Write-Host "  cd $root"
 Write-Host "  npm run dev:local"
 Write-Host ""
+Write-Host "Terminal 3 (all Codex workers):" -ForegroundColor Cyan
+Write-Host "  cd $root"
+Write-Host "  npm run codex:workers"
+Write-Host ""
 Write-Host "Open:" -ForegroundColor Cyan
 Write-Host "  http://localhost:3100/dashboard"
 Write-Host "  http://localhost:3100/projects"

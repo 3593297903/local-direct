@@ -3,6 +3,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
+import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.PROMPT_SAFETY_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -11,6 +12,7 @@ const idleLogMs = positiveInteger(process.env.PROMPT_SAFETY_CODEX_IDLE_LOG_MS, 3
 const taskTimeoutMs = positiveInteger(process.env.PROMPT_SAFETY_CODEX_TASK_TIMEOUT_MS, 20 * 60_000);
 const workerToken = process.env.PROMPT_SAFETY_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-prompt-safety-codex", "codex-messages");
+const runtimeHealth = await startCodexWorkerRuntimeHealth("prompt-safety", { rootDir });
 
 console.log("Local Director prompt safety Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -21,6 +23,7 @@ let lastIdleLogAt = 0;
 
 while (true) {
   try {
+    runtimeHealth.assertHealthy();
     const task = await claimTask();
     if (!task) {
       logIdle();
