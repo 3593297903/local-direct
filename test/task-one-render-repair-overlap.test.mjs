@@ -30,6 +30,8 @@ test("repair scheduler overlaps later render work and deduplicates fingerprints"
   assert.deepEqual(started.sort((a, b) => a - b), [1, 2, 3]);
   assert.equal(scheduler.snapshot().activeCount, 3);
   releases.splice(0).forEach((release) => release());
+  await new Promise((resolve) => setImmediate(resolve));
+  releases.splice(0).forEach((release) => release());
   await scheduler.waitForIdle();
   assert.deepEqual(started.sort((a, b) => a - b), [1, 2, 3, 4]);
 });
@@ -56,4 +58,3 @@ test("one hundred deterministic scheduling samples never exceed three active rep
     assert.equal(scheduler.snapshot().completedCount, count);
   }
 });
-
