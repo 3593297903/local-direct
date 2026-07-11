@@ -2,10 +2,23 @@ export type PromptSafetyPolicyPhase = "planning" | "render" | "quality" | "repai
 
 export type PromptSafetyPolicySeverity = "high" | "medium" | "low";
 
+export type PromptSafetyPathClass =
+  | "EXECUTABLE_VISUAL"
+  | "EXECUTABLE_AUDIO_TEXT"
+  | "NEGATIVE_CONSTRAINT"
+  | "NARRATIVE_METADATA"
+  | "CANONICAL_EXECUTABLE"
+  | "ARCHIVE_DERIVED";
+
+export type PromptSafetyPolarity = "affirmative" | "negative_constraint" | "negated_fact";
+
+export type PromptSafetyDecisionSeverity = "blocking" | "risk" | "warning";
+
 export type PromptSafetyContext = {
   phase: PromptSafetyPolicyPhase;
   path?: string;
   field?: string;
+  segmentIndex?: number;
 };
 
 export type PromptSafetyRule = {
@@ -26,6 +39,31 @@ export type PromptSafetyPolicyFinding = {
   reason: string;
   path?: string;
   field?: string;
+};
+
+export type PromptSafetySemanticFinding = {
+  fingerprint: string;
+  ruleId: string;
+  severity: PromptSafetyDecisionSeverity;
+  policySeverity: PromptSafetyPolicySeverity;
+  match: string;
+  replacement?: string;
+  reason: string;
+  normalizedClause: string;
+  semanticGroup: string;
+  pathClass: PromptSafetyPathClass;
+  polarity: PromptSafetyPolarity;
+  primaryPath: string;
+  affectedPaths: string[];
+  affectedPathCount: number;
+  requiresCodexRepair: boolean;
+};
+
+export type PromptSafetyTreeResult<T> = {
+  value: T;
+  findings: PromptSafetySemanticFinding[];
+  diffs: PromptSafetyDiff[];
+  highestRisk: PromptSafetyRisk;
 };
 
 export type PromptSafetyRisk = "none" | "low" | "medium" | "high";
@@ -120,6 +158,7 @@ export const PROMPT_SAFETY_POLICY_RULES: PromptSafetyRule[] = [
     id: "suicide",
     severity: "high",
     pattern: /\u81ea\u6740|\u4e0a\u540a/gu,
+    negativePromptReplacement: zh("\u5177\u4f53\u81ea\u4f24\u884c\u4e3a"),
     reason: zh("\u9ad8\u5371\u81ea\u4f24\u8868\u8fbe"),
     appliesTo: ALL_PHASES,
   },
@@ -127,6 +166,7 @@ export const PROMPT_SAFETY_POLICY_RULES: PromptSafetyRule[] = [
     id: "sexual_violence",
     severity: "high",
     pattern: /\u5f3a\u5978|\u6027\u4fb5/gu,
+    negativePromptReplacement: zh("\u5177\u4f53\u6027\u66b4\u529b\u884c\u4e3a"),
     reason: zh("\u9ad8\u5371\u6027\u66b4\u529b\u8868\u8fbe"),
     appliesTo: ALL_PHASES,
   },
@@ -189,6 +229,220 @@ function isNegativePromptContext(context: PromptSafetyContext) {
   return /(^|\.)(fullNegativePrompt|negativePrompt)$/.test(context.path || "")
     || context.field === "negativePrompt"
     || context.field === "fullNegativePrompt";
+}
+
+const NEGATIVE_CONSTRAINT_PATTERN = /\u4e0d\u8981|\u907f\u514d|\u7981\u6b62|\u4e0d\u5c55\u793a|\u4e0d\u51fa\u73b0|\u4e0d\u5f97|\u675c\u7edd|\u53bb\u9664|\u62d2\u7edd/;
+const NEGATED_FACT_PATTERN = /\u6ca1\u6709|\u672a\u89c1|\u5e76\u65e0|\u5e76\u6ca1\u6709|\u6392\u9664|\u4e0d\u5b58\u5728|\u672a\u53d1\u73b0|\u65e0\u6cd5\u8bc1\u5b9e/;
+
+export function classifyPromptSafetyPath(path: string): PromptSafetyPathClass {
+  const normalized = String(path || "").replace(/^result\./, "").replace(/\.value$/, "");
+  if (/(^|\.)(fullNegativePrompt|negativePrompt)$/.test(normalized)) return "NEGATIVE_CONSTRAINT";
+  if (/^storyboard\[\d+\]\.(sound|dialogue)$/.test(normalized)) return "EXECUTABLE_AUDIO_TEXT";
+  if (/^storyboard\[\d+\]\.(scene|visual|shotType|composition|cameraMovement|lighting|emotion|transition|shotPurpose|firstFramePrompt|videoPrompt|lastFramePrompt)$/.test(normalized)) {
+    return "EXECUTABLE_VISUAL";
+  }
+  if (/^workflow\.(fullVideoPrompt|concisePrompt)$/.test(normalized)) return "CANONICAL_EXECUTABLE";
+  if (/^workflow\.(screenplay|filmScript)$/.test(normalized)) return "ARCHIVE_DERIVED";
+  return "NARRATIVE_METADATA";
+}
+
+function clauseAroundMatch(text: string, index: number) {
+  const boundaries = /[\n\r。！？；]/;
+  let start = index;
+  let end = index;
+  while (start > 0 && !boundaries.test(text[start - 1])) start -= 1;
+  while (end < text.length && !boundaries.test(text[end])) end += 1;
+  return text.slice(start, end).trim();
+}
+
+function classifyPromptSafetyPolarity(
+  text: string,
+  index: number,
+  pathClass: PromptSafetyPathClass,
+): PromptSafetyPolarity {
+  if (pathClass === "NEGATIVE_CONSTRAINT") return "negative_constraint";
+  const clause = clauseAroundMatch(text, index);
+  const localPrefix = clause.slice(0, Math.max(0, index - Math.max(0, text.lastIndexOf(clause))));
+  const nearby = `${localPrefix}${clause}`.slice(-32);
+  if (NEGATIVE_CONSTRAINT_PATTERN.test(nearby)) return "negative_constraint";
+  if (NEGATED_FACT_PATTERN.test(nearby)) return "negated_fact";
+  return "affirmative";
+}
+
+function decisionSeverityForMatch(
+  rule: PromptSafetyRule,
+  pathClass: PromptSafetyPathClass,
+  polarity: PromptSafetyPolarity,
+  replacement?: string,
+): PromptSafetyDecisionSeverity {
+  if (rule.severity === "low") return "warning";
+  if (pathClass === "ARCHIVE_DERIVED") return "warning";
+  if (pathClass === "NARRATIVE_METADATA") return polarity === "affirmative" ? "risk" : "warning";
+  if (polarity !== "affirmative" || pathClass === "NEGATIVE_CONSTRAINT") return "risk";
+  if (replacement) return "risk";
+  return rule.severity === "high" ? "blocking" : "risk";
+}
+
+function normalizeSemanticClause(clause: string, match: string, polarity: PromptSafetyPolarity) {
+  if (polarity !== "affirmative") return match.normalize("NFKC").replace(/\s+/g, "").toLowerCase();
+  return clause
+    .normalize("NFKC")
+    .replace(/\s+/g, "")
+    .replace(/[，。；：、“”‘’（）()《》【】]/g, "")
+    .toLowerCase();
+}
+
+function stableSafetyHash(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `ps_${(hash >>> 0).toString(36)}`;
+}
+
+function pathPriority(pathClass: PromptSafetyPathClass) {
+  if (pathClass === "EXECUTABLE_VISUAL") return 0;
+  if (pathClass === "EXECUTABLE_AUDIO_TEXT") return 1;
+  if (pathClass === "CANONICAL_EXECUTABLE") return 2;
+  if (pathClass === "NEGATIVE_CONSTRAINT") return 3;
+  if (pathClass === "NARRATIVE_METADATA") return 4;
+  return 5;
+}
+
+type RawSemanticFinding = Omit<PromptSafetySemanticFinding, "affectedPaths" | "affectedPathCount"> & { path: string };
+
+function analyzeStringSafety(
+  text: string,
+  context: PromptSafetyContext,
+  path: string,
+): { text: string; findings: RawSemanticFinding[]; diffs: PromptSafetyDiff[] } {
+  let next = text;
+  const findings: RawSemanticFinding[] = [];
+  const diffs: PromptSafetyDiff[] = [];
+  for (const rule of PROMPT_SAFETY_POLICY_RULES) {
+    if (!rule.appliesTo.includes(context.phase)) continue;
+    rule.pattern.lastIndex = 0;
+    const matches = Array.from(text.matchAll(rule.pattern));
+    for (const match of matches) {
+      const matchIndex = match.index || 0;
+      const pathClass = classifyPromptSafetyPath(path);
+      const polarity = classifyPromptSafetyPolarity(text, matchIndex, pathClass);
+      const effective = effectivePolicyForMatch(rule, text, matchIndex, { ...context, path });
+      const replacement = polarity === "negative_constraint"
+        ? rule.negativePromptReplacement || effective.replacement
+        : effective.replacement;
+      const severity = decisionSeverityForMatch(rule, pathClass, polarity, replacement);
+      const clause = clauseAroundMatch(text, matchIndex);
+      const normalizedClause = normalizeSemanticClause(clause, match[0], polarity);
+      const semanticGroup = `${rule.id}:${polarity === "affirmative" ? "affirmative" : "negative"}`;
+      const fingerprint = stableSafetyHash([
+        context.segmentIndex || 0,
+        rule.id,
+        normalizedClause,
+        semanticGroup,
+      ].join("|"));
+      findings.push({
+        fingerprint,
+        ruleId: rule.id,
+        severity,
+        policySeverity: rule.severity,
+        match: match[0],
+        replacement,
+        reason: effective.reason,
+        normalizedClause,
+        semanticGroup,
+        pathClass,
+        polarity,
+        primaryPath: path,
+        path,
+        requiresCodexRepair: severity === "blocking",
+      });
+      if (replacement) {
+        diffs.push({
+          path,
+          ruleId: rule.id,
+          severity: rule.severity,
+          before: text,
+          after: text.replace(rule.pattern, replacement),
+          phase: context.phase,
+          reason: effective.reason,
+        });
+      }
+    }
+    if (matches.some((match) => {
+      const polarity = classifyPromptSafetyPolarity(text, match.index || 0, classifyPromptSafetyPath(path));
+      const effective = effectivePolicyForMatch(rule, text, match.index || 0, { ...context, path });
+      return Boolean(polarity === "negative_constraint" ? rule.negativePromptReplacement || effective.replacement : effective.replacement);
+    })) {
+      rule.pattern.lastIndex = 0;
+      next = next.replace(rule.pattern, (matched, ...args) => {
+        const offset = Number(args[args.length - 2]) || 0;
+        const polarity = classifyPromptSafetyPolarity(text, offset, classifyPromptSafetyPath(path));
+        const effective = effectivePolicyForMatch(rule, text, offset, { ...context, path });
+        return (polarity === "negative_constraint" ? rule.negativePromptReplacement || effective.replacement : effective.replacement) || matched;
+      });
+    }
+  }
+  return { text: next, findings, diffs };
+}
+
+export function deduplicatePromptSafetyFindings(findings: RawSemanticFinding[]): PromptSafetySemanticFinding[] {
+  const grouped = new Map<string, RawSemanticFinding[]>();
+  for (const finding of findings) {
+    const current = grouped.get(finding.fingerprint) || [];
+    current.push(finding);
+    grouped.set(finding.fingerprint, current);
+  }
+  return Array.from(grouped.values()).map((items) => {
+    const sorted = [...items].sort((left, right) => pathPriority(left.pathClass) - pathPriority(right.pathClass));
+    const primary = sorted[0];
+    const affectedPaths = Array.from(new Set(items.map((item) => item.path))).sort();
+    const strongest = items.reduce((current, item) => {
+      const rank = { warning: 0, risk: 1, blocking: 2 } as const;
+      return rank[item.severity] > rank[current.severity] ? item : current;
+    }, primary);
+    const { path: _path, ...base } = primary;
+    return {
+      ...base,
+      severity: strongest.severity,
+      requiresCodexRepair: strongest.severity === "blocking",
+      affectedPaths,
+      affectedPathCount: affectedPaths.length,
+    };
+  });
+}
+
+export function analyzePromptSafetyTree<T>(
+  value: T,
+  options: PromptSafetyContext & { rootPath?: string },
+): PromptSafetyTreeResult<T> {
+  const rawFindings: RawSemanticFinding[] = [];
+  const diffs: PromptSafetyDiff[] = [];
+  function visit(item: unknown, path: string): unknown {
+    if (typeof item === "string") {
+      const analyzed = analyzeStringSafety(item, options, path);
+      rawFindings.push(...analyzed.findings);
+      diffs.push(...analyzed.diffs);
+      return analyzed.text;
+    }
+    if (Array.isArray(item)) return item.map((entry, index) => visit(entry, `${path}[${index}]`));
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.entries(item as Record<string, unknown>).map(([key, entry]) => {
+      const entryPath = options.rootPath && key === "value" && Object.keys(item as object).length === 1
+        ? options.rootPath
+        : path ? `${path}.${key}` : key;
+      return [key, visit(entry, entryPath)];
+    }));
+  }
+  const nextValue = visit(value, options.rootPath && !(value && typeof value === "object") ? options.rootPath : "") as T;
+  const findings = deduplicatePromptSafetyFindings(rawFindings);
+  const highestRisk = findings.some((finding) => finding.policySeverity === "high")
+    ? "high"
+    : findings.some((finding) => finding.policySeverity === "medium")
+      ? "medium"
+      : findings.length ? "low" : "none";
+  return { value: nextValue, findings, diffs, highestRisk };
 }
 
 function hasNegativeInstructionContext(text: string, index: number) {

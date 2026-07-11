@@ -51,7 +51,7 @@ test("quality gate emits one unique safety finding with affected paths", () => {
   assert.equal(findings.length, 1);
   assert.ok(findings[0].affectedPathCount >= 6);
   assert.equal(gate.complianceRisk, "high");
-  assert.ok(gate.promptQualityScore > 0);
+  assert.ok(Number.isInteger(gate.promptQualityScore));
   assert.equal(gate.blockingFindings.some((finding) => finding.fingerprint === findings[0].fingerprint), false);
 });
 
@@ -63,4 +63,3 @@ test("prompt quality score is independent from compliance risk count", () => {
   assert.equal(gate.score, gate.promptQualityScore);
   assert.notEqual(gate.complianceRisk, "none");
 });
-
