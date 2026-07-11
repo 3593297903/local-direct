@@ -183,6 +183,7 @@ model Project {
 model ProjectVersion {
   id                    String           @id @default(uuid()) @db.Uuid
   projectId             String           @db.Uuid
+  saveIdempotencyKey    String?          @unique
   versionNumber         Int
   title                 String
   originalScript        String

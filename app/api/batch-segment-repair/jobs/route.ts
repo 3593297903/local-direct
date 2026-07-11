@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { createBatchSegmentRepairCodexJob } from "@/lib/batch-segment-repair-codex-queue";
 import { CODEX_QUOTA_EXHAUSTED_CODE, assertCodexRuntimeAvailable } from "@/lib/codex-runtime-state";
+import { fileJobRouteError } from "@/lib/file-job-route-error";
 
 export const runtime = "nodejs";
 
@@ -33,13 +34,12 @@ export async function POST(request: Request) {
   } catch (error: any) {
     const isQuotaError = error?.code === CODEX_QUOTA_EXHAUSTED_CODE
       || String(error?.message || "").includes(CODEX_QUOTA_EXHAUSTED_CODE);
-    return NextResponse.json(
-      {
-        ok: false,
-        error: error?.message || "Batch segment repair job creation failed",
-        code: isQuotaError ? CODEX_QUOTA_EXHAUSTED_CODE : undefined,
-      },
-      { status: isQuotaError ? 429 : 400 },
-    );
+    if (isQuotaError) {
+      return NextResponse.json(
+        { ok: false, error: error?.message || "Codex is unavailable", code: CODEX_QUOTA_EXHAUSTED_CODE },
+        { status: 429 },
+      );
+    }
+    return fileJobRouteError(error, "Batch segment repair job creation failed");
   }
 }

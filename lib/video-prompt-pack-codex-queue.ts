@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import type { AnalysisResult } from "../types";
 import type { SegmentContract } from "./batch-segment-contract";
@@ -15,6 +15,17 @@ import {
   type SegmentCoverageSidecar,
 } from "./batch-event-coverage";
 import { applyPromptSafetyPolicyDeep, type PromptSafetyDiff } from "./prompt-safety-policy";
+import { readCodexRuntimeHealth } from "./codex-runtime-health";
+import {
+  atomicReplaceJson,
+  claimNextFileJob,
+  ensureFileJobStore,
+  FileJobLeaseError,
+  finishPendingFileJob,
+  finishRunningFileJob,
+  getFileJob,
+  putPendingFileJob,
+} from "./file-job-store";
 
 export type VideoPromptPackCodexJobStatus = "pending" | "running" | "completed" | "failed";
 
@@ -29,6 +40,7 @@ export type VideoPromptPackSegmentInput = {
 };
 
 export type CreateVideoPromptPackCodexJobInput = {
+  idempotencyKey?: string;
   projectId?: string;
   mode?: VideoPromptPackCodexMode;
   coverageSidecarEnabled?: boolean;
@@ -53,6 +65,7 @@ export type VideoPromptPackCodexResult = {
 
 export type VideoPromptPackCodexJob = {
   id: string;
+  idempotencyKey: string | null;
   projectId: string | null;
   mode: VideoPromptPackCodexMode;
   coverageSidecarEnabled: boolean;
@@ -60,6 +73,11 @@ export type VideoPromptPackCodexJob = {
   segments: VideoPromptPackSegmentTask[];
   prompt: string;
   status: VideoPromptPackCodexJobStatus;
+  leaseId: string | null;
+  workerId: string | null;
+  heartbeatAt?: string;
+  attempt: number;
+  fencingToken: number;
   result: VideoPromptPackCodexResult | null;
   error: string | null;
   createdAt: string;
@@ -77,17 +95,22 @@ type QueueOptions = {
 type ClaimOptions = QueueOptions & {
   order?: "oldest" | "newest";
   runningTimeoutMs?: number;
+  workerId?: string;
 };
 
 const TASK_ROOT = ".tmp-video-prompt-pack-codex";
-const JOB_DIR = "jobs";
+const LEGACY_JOB_DIR = "jobs";
+const LEGACY_MIGRATION_LOCK_DIR = "legacy-migration.lock";
 const RESULT_DIR = "results";
 const MAX_PACK_SEGMENTS = 5;
 
 export class VideoPromptPackCodexQueueError extends Error {
-  constructor(message: string) {
+  readonly code: string;
+
+  constructor(message: string, code = "RENDER_PACK_JOB_INVALID") {
     super(message);
     this.name = "VideoPromptPackCodexQueueError";
+    this.code = code;
   }
 }
 
@@ -98,8 +121,20 @@ export async function createVideoPromptPackCodexJob(
   validateCreateInput(input);
 
   const rootDir = resolveRootDir(options);
+  await ensureFileJobStore(rootDir, TASK_ROOT);
+  await migrateLegacyVideoPromptPackJobs(rootDir);
   const now = new Date().toISOString();
-  const jobId = createId("video-prompt-pack-job");
+  const idempotencyKey = normalizeRenderPackIdempotencyKey(input.idempotencyKey);
+  const jobId = idempotencyKey
+    ? `video-prompt-pack-job-${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`
+    : createId("video-prompt-pack-job");
+  if (idempotencyKey) {
+    try {
+      return await getFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, jobId);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "File job not found") throw error;
+    }
+  }
   const segments = input.segments.map((segment) => {
     const outputFileName = episodeFileName(segment.episodeIndex);
     return {
@@ -116,6 +151,7 @@ export async function createVideoPromptPackCodexJob(
   assertCleanCodexPromptInput(prompt, "Video prompt render pack prompt");
   const job: VideoPromptPackCodexJob = {
     id: jobId,
+    idempotencyKey,
     projectId: input.projectId || null,
     mode,
     coverageSidecarEnabled,
@@ -123,56 +159,61 @@ export async function createVideoPromptPackCodexJob(
     segments,
     prompt,
     status: "pending",
+    leaseId: null,
+    workerId: null,
+    attempt: 0,
+    fencingToken: 0,
     result: null,
     error: null,
     createdAt: now,
     updatedAt: now,
   };
-
-  await ensureQueueDirs(rootDir);
-  await writeJob(rootDir, job);
-  return job;
+  return putPendingFileJob(rootDir, TASK_ROOT, job);
 }
 
 export async function getVideoPromptPackCodexJob(jobId: string, options: QueueOptions = {}) {
   const rootDir = resolveRootDir(options);
-  const job = await readJob(rootDir, jobId);
-  return syncAndSaveJob(rootDir, job);
+  await migrateLegacyVideoPromptPackJobs(rootDir);
+  try {
+    const job = normalizeStoredRenderPackJob(await getFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, jobId));
+    return syncAndSaveJob(rootDir, job);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === "JOB_STORAGE_BUSY") {
+      throw new VideoPromptPackCodexQueueError("Render Pack queue storage is temporarily busy", "JOB_STORAGE_BUSY");
+    }
+    throw new VideoPromptPackCodexQueueError(
+      error instanceof Error && error.message === "File job not found"
+        ? "Video prompt render pack Codex job not found"
+        : "Video prompt render pack Codex job could not be read",
+      error instanceof Error && error.message === "File job not found" ? "JOB_NOT_FOUND" : "RENDER_PACK_JOB_INVALID",
+    );
+  }
 }
 
 export async function claimNextVideoPromptPackCodexJob(options: ClaimOptions = {}) {
   const rootDir = resolveRootDir(options);
-  const jobs = await listJobs(rootDir);
-  const syncedJobs = await Promise.all(jobs.map((job) => syncAndSaveJob(rootDir, job)));
-  const recoverableJobs = syncedJobs.map((job) => recoverStaleRunningJob(job, options.runningTimeoutMs));
-  await Promise.all(
-    recoverableJobs.map((job, index) =>
-      job === syncedJobs[index] ? Promise.resolve() : writeJob(rootDir, applyJobStatus(job)),
-    ),
-  );
-
-  const order = options.order === "newest" ? "newest" : "oldest";
-  const direction = order === "oldest" ? 1 : -1;
-  const next = recoverableJobs
-    .filter((job) => job.status === "pending")
-    .sort((left, right) => direction * (Date.parse(left.createdAt) - Date.parse(right.createdAt)))[0];
-  if (!next) return null;
-
-  const now = new Date().toISOString();
-  const job: VideoPromptPackCodexJob = {
-    ...next,
-    status: "running",
-    startedAt: now,
-    updatedAt: now,
-    error: null,
-  };
-  await writeJob(rootDir, job);
-  return job;
+  await migrateLegacyVideoPromptPackJobs(rootDir);
+  return claimNextFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, {
+    order: options.order,
+    runningTimeoutMs: options.runningTimeoutMs,
+    workerId: options.workerId,
+    canRecoverRunningJob: (job) => canRecoverRenderPackJob(rootDir, job, options.runningTimeoutMs),
+  });
 }
 
-export async function completeVideoPromptPackCodexJob(jobId: string, options: QueueOptions = {}) {
+export async function completeVideoPromptPackCodexJob(
+  jobId: string,
+  leaseId: string,
+  fencingToken: number,
+  options: QueueOptions = {},
+) {
   const rootDir = resolveRootDir(options);
-  const job = await readJob(rootDir, jobId);
+  const job = normalizeStoredRenderPackJob(await getFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, jobId));
+  assertRenderPackLease(job, leaseId, fencingToken);
+  if (job.status === "completed") return job;
+  if (job.status === "pending") {
+    throw new VideoPromptPackCodexQueueError("Render Pack lease is stale or invalid", "JOB_LEASE_LOST");
+  }
   const result = await readPackResult(job);
   const now = new Date().toISOString();
   const updated: VideoPromptPackCodexJob = {
@@ -183,25 +224,40 @@ export async function completeVideoPromptPackCodexJob(jobId: string, options: Qu
     completedAt: now,
     updatedAt: now,
   };
-  await writeJob(rootDir, updated);
+  if (job.status === "running") {
+    return finishRunningFileJob(rootDir, TASK_ROOT, updated, "completed");
+  }
+  await persistRenderPackState(rootDir, job.status, updated);
   return updated;
 }
 
 export async function failVideoPromptPackCodexJob(
   jobId: string,
+  leaseId: string,
+  fencingToken: number,
   message: string | undefined,
   options: QueueOptions = {},
 ) {
   const rootDir = resolveRootDir(options);
-  const job = await readJob(rootDir, jobId);
+  const job = normalizeStoredRenderPackJob(await getFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, jobId));
+  assertRenderPackLease(job, leaseId, fencingToken);
+  if (job.status === "failed") return job;
+  if (job.status !== "running") {
+    throw new VideoPromptPackCodexQueueError("Completed Render Pack cannot be failed", "JOB_ALREADY_COMPLETED");
+  }
   const updated = applyJobStatus({
     ...job,
     status: "failed",
     error: message || "Codex video prompt render pack generation failed",
     updatedAt: new Date().toISOString(),
   });
-  await writeJob(rootDir, updated);
-  return updated;
+  return finishRunningFileJob(rootDir, TASK_ROOT, updated, "failed");
+}
+
+function assertRenderPackLease(job: VideoPromptPackCodexJob, leaseId: string, fencingToken: number) {
+  if (!leaseId || job.leaseId !== leaseId || !Number.isInteger(fencingToken) || job.fencingToken !== fencingToken) {
+    throw new VideoPromptPackCodexQueueError("Render Pack lease is stale or invalid", "JOB_LEASE_LOST");
+  }
 }
 
 function buildVideoPromptPackCodexPrompt(
@@ -294,7 +350,21 @@ async function syncAndSaveJob(rootDir: string, job: VideoPromptPackCodexJob) {
   const synced = await syncJobFromOutputFiles(job);
   const finalized = applyJobStatus(synced);
   if (JSON.stringify(finalized) !== JSON.stringify(job)) {
-    await writeJob(rootDir, finalized);
+    if (finalized.status === "completed" && (job.status === "running" || job.status === "pending")) {
+      try {
+        return job.status === "running"
+          ? await finishRunningFileJob(rootDir, TASK_ROOT, finalized, "completed")
+          : await finishPendingFileJob(rootDir, TASK_ROOT, finalized, "completed");
+      } catch (error) {
+        if (error instanceof FileJobLeaseError) {
+          return normalizeStoredRenderPackJob(
+            await getFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, job.id),
+          );
+        }
+        throw error;
+      }
+    }
+    await persistRenderPackState(rootDir, job.status, finalized);
   }
   return finalized;
 }
@@ -309,21 +379,6 @@ async function syncJobFromOutputFiles(job: VideoPromptPackCodexJob) {
     result: await readPackResult(job),
     error: null,
     completedAt: job.completedAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-function recoverStaleRunningJob(job: VideoPromptPackCodexJob, runningTimeoutMs: number | undefined) {
-  if (!runningTimeoutMs || runningTimeoutMs <= 0 || job.status !== "running") return job;
-
-  const startedAtMs = Date.parse(job.startedAt || job.updatedAt || job.createdAt);
-  if (!Number.isFinite(startedAtMs) || Date.now() - startedAtMs < runningTimeoutMs) return job;
-
-  return {
-    ...job,
-    status: "pending" as const,
-    startedAt: undefined,
-    error: "Previous Codex run exceeded the video prompt render pack task timeout and was returned to the queue",
     updatedAt: new Date().toISOString(),
   };
 }
@@ -407,41 +462,115 @@ async function hasValidPackResult(job: VideoPromptPackCodexJob) {
   }
 }
 
-async function listJobs(rootDir: string) {
-  await ensureQueueDirs(rootDir);
-  const entries = await readdir(jobDir(rootDir), { withFileTypes: true });
-  const jobs = await Promise.all(
-    entries
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-      .map((entry) => readJob(rootDir, entry.name.replace(/\.json$/, ""))),
-  );
-  return jobs.sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+function normalizeStoredRenderPackJob(job: VideoPromptPackCodexJob): VideoPromptPackCodexJob {
+  return {
+    ...job,
+    idempotencyKey: job.idempotencyKey || null,
+    mode: job.mode === "standard" ? "standard" : "strictUtf8",
+    leaseId: job.leaseId || null,
+    workerId: job.workerId || null,
+    attempt: Math.max(0, Number(job.attempt) || 0),
+    fencingToken: Math.max(0, Number(job.fencingToken) || 0),
+  };
 }
 
-async function readJob(rootDir: string, jobId: string): Promise<VideoPromptPackCodexJob> {
-  try {
-    const job = JSON.parse(await readFile(jobPath(rootDir, jobId), "utf8")) as VideoPromptPackCodexJob;
-    return {
-      ...job,
-      mode: job.mode === "strictUtf8" ? "strictUtf8" : "standard",
-    };
-  } catch (error) {
-    throw new VideoPromptPackCodexQueueError(
-      (error as NodeJS.ErrnoException).code === "ENOENT"
-        ? "Video prompt render pack Codex job not found"
-        : "Video prompt render pack Codex job could not be read",
-    );
+async function canRecoverRenderPackJob(
+  rootDir: string,
+  job: VideoPromptPackCodexJob,
+  runningTimeoutMs = 0,
+) {
+  const runtime = await readCodexRuntimeHealth("video-prompt-pack", {
+    rootDir,
+    maxAgeMs: Math.min(Math.max(30_000, Math.floor(runningTimeoutMs / 4)), 90_000),
+  });
+  if (runtime.status === "healthy") return false;
+  const recentWindowMs = Math.min(Math.max(30_000, Math.floor(runningTimeoutMs / 3)), 5 * 60_000);
+  for (const segment of job.segments) {
+    try {
+      const outputStat = await stat(segment.outputPath);
+      if (Date.now() - outputStat.mtimeMs < recentWindowMs) return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return true;
+}
+
+async function persistRenderPackState(
+  rootDir: string,
+  previousStatus: VideoPromptPackCodexJobStatus,
+  job: VideoPromptPackCodexJob,
+) {
+  await ensureFileJobStore(rootDir, TASK_ROOT);
+  const target = renderPackStatePath(rootDir, job.status, job.id);
+  await atomicReplaceJson(target, job, { rootDir });
+  if (previousStatus !== job.status) {
+    await rm(renderPackStatePath(rootDir, previousStatus, job.id), { force: true });
   }
 }
 
-async function writeJob(rootDir: string, job: VideoPromptPackCodexJob) {
-  await ensureQueueDirs(rootDir);
-  await writeFile(jobPath(rootDir, job.id), `${JSON.stringify(job, null, 2)}\n`, "utf8");
+async function migrateLegacyVideoPromptPackJobs(rootDir: string) {
+  await ensureFileJobStore(rootDir, TASK_ROOT);
+  const lockPath = path.join(rootDir, TASK_ROOT, LEGACY_MIGRATION_LOCK_DIR);
+  try {
+    await mkdir(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      try {
+        const lockStat = await stat(lockPath);
+        if (Date.now() - lockStat.mtimeMs <= 60_000) return;
+        await rm(lockPath, { recursive: true, force: true });
+        return migrateLegacyVideoPromptPackJobs(rootDir);
+      } catch (lockError) {
+        if ((lockError as NodeJS.ErrnoException).code === "ENOENT") {
+          return migrateLegacyVideoPromptPackJobs(rootDir);
+        }
+        throw lockError;
+      }
+    }
+    throw error;
+  }
+  try {
+    await migrateLegacyVideoPromptPackJobsUnlocked(rootDir);
+  } finally {
+    await rm(lockPath, { recursive: true, force: true });
+  }
 }
 
-async function ensureQueueDirs(rootDir: string) {
-  await mkdir(jobDir(rootDir), { recursive: true });
-  await mkdir(resultDir(rootDir), { recursive: true });
+async function migrateLegacyVideoPromptPackJobsUnlocked(rootDir: string) {
+  const legacyDir = path.join(rootDir, TASK_ROOT, LEGACY_JOB_DIR);
+  const entries = await readdir(legacyDir, { withFileTypes: true }).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  });
+  for (const entry of entries.filter((item) => item.isFile() && item.name.endsWith(".json"))) {
+    const legacyPath = path.join(legacyDir, entry.name);
+    let legacy: VideoPromptPackCodexJob;
+    try {
+      legacy = normalizeStoredRenderPackJob(JSON.parse(await readFile(legacyPath, "utf8")) as VideoPromptPackCodexJob);
+    } catch {
+      continue;
+    }
+    try {
+      await getFileJob(rootDir, TASK_ROOT, legacy.id);
+      await rm(legacyPath, { force: true });
+      continue;
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "File job not found") throw error;
+    }
+    const migrated = legacy.status === "running"
+      ? {
+          ...legacy,
+          status: "failed" as const,
+          leaseId: null,
+          workerId: null,
+          error: "Legacy running Render Pack was not re-executed automatically; create a new idempotent job to retry.",
+          updatedAt: new Date().toISOString(),
+        }
+      : legacy;
+    await atomicReplaceJson(renderPackStatePath(rootDir, migrated.status, migrated.id), migrated, { rootDir });
+    await rm(legacyPath, { force: true });
+  }
 }
 
 function validateCreateInput(input: CreateVideoPromptPackCodexJobInput) {
@@ -477,19 +606,26 @@ function validateCreateInput(input: CreateVideoPromptPackCodexJobInput) {
 }
 
 function resolveRootDir(options: QueueOptions) {
-  return options.rootDir || process.cwd();
+  return path.resolve(options.rootDir || process.cwd());
 }
 
-function jobDir(rootDir: string) {
-  return path.join(rootDir, TASK_ROOT, JOB_DIR);
+function normalizeRenderPackIdempotencyKey(value: unknown) {
+  const key = String(value || "").trim();
+  if (!key) return null;
+  if (key.length > 400) throw new VideoPromptPackCodexQueueError("Render pack idempotencyKey is too long");
+  return key;
 }
 
 function resultDir(rootDir: string) {
   return path.join(rootDir, TASK_ROOT, RESULT_DIR);
 }
 
-function jobPath(rootDir: string, jobId: string) {
-  return path.join(jobDir(rootDir), `${fileSegment(jobId)}.json`);
+function renderPackStatePath(
+  rootDir: string,
+  status: VideoPromptPackCodexJobStatus,
+  jobId: string,
+) {
+  return path.join(rootDir, TASK_ROOT, status, `${fileSegment(jobId)}.json`);
 }
 
 function episodeFileName(episodeIndex: number) {

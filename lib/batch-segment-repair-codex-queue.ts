@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import {
   assertCleanCodexPromptInput,
@@ -11,6 +11,8 @@ import {
   type BatchSegmentRepairOperation,
   type BatchSegmentRepairPatchResult,
 } from "./batch-segment-repair-patch";
+import { atomicMoveFile, atomicReplaceJson } from "./file-job-store";
+import { readCodexRuntimeHealth } from "./codex-runtime-health";
 
 export type BatchSegmentRepairCodexJobStatus = "pending" | "running" | "completed" | "failed";
 
@@ -55,6 +57,10 @@ export type BatchSegmentRepairCodexJob = {
   outputPath: string;
   status: BatchSegmentRepairCodexJobStatus;
   leaseId: string | null;
+  workerId: string | null;
+  heartbeatAt?: string;
+  attempt: number;
+  fencingToken: number;
   result: BatchSegmentRepairPatchResult | null;
   error: string | null;
   createdAt: string;
@@ -64,11 +70,12 @@ export type BatchSegmentRepairCodexJob = {
 };
 
 type QueueOptions = { rootDir?: string };
-type ClaimOptions = QueueOptions & { order?: "oldest" | "newest"; runningTimeoutMs?: number };
+type ClaimOptions = QueueOptions & { order?: "oldest" | "newest"; runningTimeoutMs?: number; workerId?: string };
 
 const TASK_ROOT = ".tmp-batch-segment-repair-codex";
 const RESULT_DIR = "results";
 const CLAIM_LOCK_DIR = "claim-locks";
+const CREATE_LOCK_DIR = "create-locks";
 const STATE_DIRS: Record<BatchSegmentRepairCodexJobStatus, string> = {
   pending: "pending",
   running: "running",
@@ -76,9 +83,12 @@ const STATE_DIRS: Record<BatchSegmentRepairCodexJobStatus, string> = {
   failed: "failed",
 };
 export class BatchSegmentRepairCodexQueueError extends Error {
-  constructor(message: string) {
+  readonly code: string;
+
+  constructor(message: string, code = "REPAIR_JOB_INVALID") {
     super(message);
     this.name = "BatchSegmentRepairCodexQueueError";
+    this.code = code;
   }
 }
 
@@ -92,36 +102,61 @@ export async function createBatchSegmentRepairCodexJob(
   const now = new Date().toISOString();
   const idempotencyKey = buildRepairIdempotencyKey(normalized);
   const id = `batch-segment-repair-job-${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`;
-  const existing = await locateJob(rootDir, id);
-  if (existing) return existing.job;
-  const outputPath = path.join(rootDir, TASK_ROOT, RESULT_DIR, `${id}.json`);
-  const prompt = buildRepairPrompt(normalized, outputPath);
-  assertCleanCodexPromptInput(prompt, "Batch segment repair Codex prompt");
-  const job: BatchSegmentRepairCodexJob = {
-    id,
-    idempotencyKey,
-    projectId: normalized.projectId || null,
-    batchId: normalized.batchId,
-    segmentIndex: normalized.segmentIndex,
-    slotId: normalized.slotId || null,
-    contractHash: normalized.contractHash,
-    resultHash: normalized.resultHash,
-    sourceTextForModel: normalized.sourceTextForModel,
-    allowedPaths: normalized.allowedPaths,
-    currentValues: normalized.currentValues,
-    findings: normalized.findings,
-    forbiddenFutureEvents: normalized.forbiddenFutureEvents,
-    prompt,
-    outputPath,
-    status: "pending",
-    leaseId: null,
-    result: null,
-    error: null,
-    createdAt: now,
-    updatedAt: now,
-  };
-  await writeJobAt(jobPath(rootDir, "pending", id), job);
-  return job;
+  const createLockPath = path.join(rootDir, TASK_ROOT, CREATE_LOCK_DIR, id);
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      await mkdir(createLockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const existing = await locateJob(rootDir, id);
+      if (existing) return existing.job;
+      await recoverStaleDirectoryLock(createLockPath);
+      await wait(25);
+      continue;
+    }
+
+    try {
+      const existing = await locateJob(rootDir, id);
+      if (existing) return existing.job;
+      const outputPath = path.join(rootDir, TASK_ROOT, RESULT_DIR, `${id}.json`);
+      const prompt = buildRepairPrompt(normalized, outputPath);
+      assertCleanCodexPromptInput(prompt, "Batch segment repair Codex prompt");
+      const job: BatchSegmentRepairCodexJob = {
+        id,
+        idempotencyKey,
+        projectId: normalized.projectId || null,
+        batchId: normalized.batchId,
+        segmentIndex: normalized.segmentIndex,
+        slotId: normalized.slotId || null,
+        contractHash: normalized.contractHash,
+        resultHash: normalized.resultHash,
+        sourceTextForModel: normalized.sourceTextForModel,
+        allowedPaths: normalized.allowedPaths,
+        currentValues: normalized.currentValues,
+        findings: normalized.findings,
+        forbiddenFutureEvents: normalized.forbiddenFutureEvents,
+        prompt,
+        outputPath,
+        status: "pending",
+        leaseId: null,
+        workerId: null,
+        attempt: 0,
+        fencingToken: 0,
+        result: null,
+        error: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await writeJobAt(rootDir, jobPath(rootDir, "pending", id), job);
+      return job;
+    } finally {
+      await rm(createLockPath, { recursive: true, force: true });
+    }
+  }
+  throw new BatchSegmentRepairCodexQueueError(
+    "Timed out waiting for the idempotent repair job create lock",
+    "JOB_STORAGE_BUSY",
+  );
 }
 
 function buildRepairIdempotencyKey(input: ReturnType<typeof validateCreateInput>) {
@@ -136,8 +171,8 @@ export async function getBatchSegmentRepairCodexJob(jobId: string, options: Queu
   const rootDir = resolveRootDir(options);
   await ensureQueueDirs(rootDir);
   const located = await locateJob(rootDir, jobId);
-  if (!located) throw new BatchSegmentRepairCodexQueueError("Batch segment repair job not found");
-  return located.job;
+  if (!located) throw new BatchSegmentRepairCodexQueueError("Batch segment repair job not found", "JOB_NOT_FOUND");
+  return syncLateRepairResult(rootDir, jobId);
 }
 
 export async function claimNextBatchSegmentRepairCodexJob(options: ClaimOptions = {}) {
@@ -169,7 +204,7 @@ export async function claimNextBatchSegmentRepairCodexJob(options: ClaimOptions 
     }
     try {
       try {
-        await rename(sourcePath, runningPath);
+        await atomicMoveFile(sourcePath, runningPath, { rootDir });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
@@ -179,11 +214,15 @@ export async function claimNextBatchSegmentRepairCodexJob(options: ClaimOptions 
         ...candidate.job,
         status: "running",
         leaseId: randomUUID(),
+        workerId: options.workerId || `repair-worker-${process.pid}`,
+        heartbeatAt: now,
+        attempt: Math.max(0, Number(candidate.job.attempt) || 0) + 1,
+        fencingToken: Math.max(0, Number(candidate.job.fencingToken) || 0) + 1,
         startedAt: now,
         updatedAt: now,
         error: null,
       };
-      await writeJobAt(runningPath, claimed);
+      await writeJobAt(rootDir, runningPath, claimed);
       return claimed;
     } finally {
       await rm(claimLockPath, { recursive: true, force: true });
@@ -195,46 +234,42 @@ export async function claimNextBatchSegmentRepairCodexJob(options: ClaimOptions 
 export async function completeBatchSegmentRepairCodexJob(
   jobId: string,
   leaseId: string,
+  fencingToken: number,
   options: QueueOptions = {},
 ) {
   const rootDir = resolveRootDir(options);
-  const runningPath = jobPath(rootDir, "running", jobId);
-  const job = await readJobAt(runningPath);
-  assertLease(job, leaseId);
-  const result = await readAndValidateRepairResult(job);
-  const now = new Date().toISOString();
-  const completed: BatchSegmentRepairCodexJob = {
-    ...job,
-    status: "completed",
-    result,
-    error: null,
-    completedAt: now,
-    updatedAt: now,
-  };
-  await writeJobAt(runningPath, completed);
-  await rename(runningPath, jobPath(rootDir, "completed", jobId));
-  return completed;
+  return syncLateRepairResult(rootDir, jobId, { leaseId, fencingToken });
 }
 
 export async function failBatchSegmentRepairCodexJob(
   jobId: string,
   leaseId: string,
+  fencingToken: number,
   message: string | undefined,
   options: QueueOptions = {},
 ) {
   const rootDir = resolveRootDir(options);
-  const runningPath = jobPath(rootDir, "running", jobId);
-  const job = await readJobAt(runningPath);
-  assertLease(job, leaseId);
-  const failed: BatchSegmentRepairCodexJob = {
-    ...job,
-    status: "failed",
-    error: message || "Batch segment repairs-only Codex job failed",
-    updatedAt: new Date().toISOString(),
-  };
-  await writeJobAt(runningPath, failed);
-  await rename(runningPath, jobPath(rootDir, "failed", jobId));
-  return failed;
+  return withRepairJobStateLock(rootDir, jobId, async () => {
+    const located = await locateJob(rootDir, jobId);
+    if (!located) throw new BatchSegmentRepairCodexQueueError("Batch segment repair job not found", "JOB_NOT_FOUND");
+    const job = located.job;
+    assertLease(job, leaseId, fencingToken);
+    if (located.status === "failed") return job;
+    if (located.status !== "running") {
+      throw new BatchSegmentRepairCodexQueueError("Completed repair job cannot be failed", "JOB_ALREADY_COMPLETED");
+    }
+    const now = new Date().toISOString();
+    const failed: BatchSegmentRepairCodexJob = {
+      ...job,
+      status: "failed",
+      error: message || "Batch segment repairs-only Codex job failed",
+      heartbeatAt: now,
+      updatedAt: now,
+    };
+    await writeJobAt(rootDir, located.filePath, failed);
+    await atomicMoveFile(located.filePath, jobPath(rootDir, "failed", jobId), { rootDir });
+    return failed;
+  });
 }
 
 function validateCreateInput(input: CreateBatchSegmentRepairCodexJobInput) {
@@ -339,27 +374,89 @@ async function locateJob(rootDir: string, jobId: string) {
   return null;
 }
 
+async function syncLateRepairResult(
+  rootDir: string,
+  jobId: string,
+  expectedLease?: { leaseId: string; fencingToken: number },
+) {
+  return withRepairJobStateLock(rootDir, jobId, async () => {
+    const located = await locateJob(rootDir, jobId);
+    if (!located) throw new BatchSegmentRepairCodexQueueError("Batch segment repair job not found", "JOB_NOT_FOUND");
+    const job = located.job;
+    if (expectedLease) assertLease(job, expectedLease.leaseId, expectedLease.fencingToken);
+    if (located.status === "completed") return job;
+    if (located.status === "failed") {
+      if (expectedLease) {
+        throw new BatchSegmentRepairCodexQueueError("Failed repair job cannot be completed", "JOB_ALREADY_FAILED");
+      }
+      return job;
+    }
+    if (expectedLease && located.status !== "running") {
+      throw new BatchSegmentRepairCodexQueueError("Repair job lease is stale or invalid", "JOB_LEASE_LOST");
+    }
+    let result: BatchSegmentRepairCodexJob["result"];
+    try {
+      result = await readAndValidateRepairResult(job);
+    } catch (error) {
+      if (expectedLease) throw error;
+      return job;
+    }
+    const now = new Date().toISOString();
+    const completed: BatchSegmentRepairCodexJob = {
+      ...job,
+      status: "completed",
+      result,
+      error: null,
+      heartbeatAt: now,
+      completedAt: job.completedAt || now,
+      updatedAt: now,
+    };
+    await writeJobAt(rootDir, located.filePath, completed);
+    await atomicMoveFile(located.filePath, jobPath(rootDir, "completed", completed.id), { rootDir });
+    return completed;
+  });
+}
+
 async function recoverStaleRunningJobs(rootDir: string, runningTimeoutMs = 0) {
   if (!runningTimeoutMs) return;
+  const runtime = await readCodexRuntimeHealth("batch-segment-repair", {
+    rootDir,
+    maxAgeMs: Math.min(Math.max(30_000, Math.floor(runningTimeoutMs / 4)), 90_000),
+  });
+  if (runtime.status === "healthy") return;
   const entries = await readdir(stateDir(rootDir, "running"), { withFileTypes: true });
   for (const entry of entries.filter((item) => item.isFile() && item.name.endsWith(".json"))) {
-    const runningPath = path.join(stateDir(rootDir, "running"), entry.name);
-    const job = await readJobAt(runningPath);
-    const startedAt = Date.parse(job.startedAt || job.updatedAt);
-    if (!Number.isFinite(startedAt) || Date.now() - startedAt < runningTimeoutMs) continue;
-    const recovered: BatchSegmentRepairCodexJob = {
-      ...job,
-      status: "pending",
-      leaseId: null,
-      error: "Repair task returned to pending after lease timeout",
-      updatedAt: new Date().toISOString(),
-    };
-    await writeJobAt(runningPath, recovered);
-    try {
-      await rename(runningPath, path.join(stateDir(rootDir, "pending"), entry.name));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+    const jobId = entry.name.replace(/\.json$/, "");
+    await withRepairJobStateLock(rootDir, jobId, async () => {
+      const runningPath = path.join(stateDir(rootDir, "running"), entry.name);
+      let job: BatchSegmentRepairCodexJob;
+      try {
+        job = await readJobAt(runningPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      const startedAt = Date.parse(job.heartbeatAt || job.startedAt || job.updatedAt);
+      if (!Number.isFinite(startedAt) || Date.now() - startedAt < runningTimeoutMs) return;
+      try {
+        const outputStat = await stat(job.outputPath);
+        const recentWindowMs = Math.min(Math.max(30_000, Math.floor(runningTimeoutMs / 3)), 5 * 60_000);
+        if (Date.now() - outputStat.mtimeMs < recentWindowMs) return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      const recovered: BatchSegmentRepairCodexJob = {
+        ...job,
+        status: "pending",
+        leaseId: null,
+        workerId: null,
+        heartbeatAt: new Date().toISOString(),
+        error: "Repair task returned to pending after lease timeout",
+        updatedAt: new Date().toISOString(),
+      };
+      await writeJobAt(rootDir, runningPath, recovered);
+      await atomicMoveFile(runningPath, path.join(stateDir(rootDir, "pending"), entry.name), { rootDir });
+    });
   }
 }
 
@@ -377,10 +474,49 @@ async function recoverStaleRepairClaimLocks(rootDir: string, staleMs = 60_000) {
   }
 }
 
-function assertLease(job: BatchSegmentRepairCodexJob, leaseId: string) {
+function assertLease(job: BatchSegmentRepairCodexJob, leaseId: string, fencingToken: number) {
   if (!leaseId || job.leaseId !== leaseId) {
-    throw new BatchSegmentRepairCodexQueueError("Repair job lease is stale or invalid");
+    throw new BatchSegmentRepairCodexQueueError("Repair job lease is stale or invalid", "JOB_LEASE_LOST");
   }
+  if (!Number.isInteger(fencingToken) || job.fencingToken !== fencingToken) {
+    throw new BatchSegmentRepairCodexQueueError("Repair job fencing token is stale or invalid", "JOB_LEASE_LOST");
+  }
+}
+
+async function recoverStaleDirectoryLock(target: string, staleMs = 60_000) {
+  try {
+    const info = await stat(target);
+    if (Date.now() - info.mtimeMs > staleMs) await rm(target, { recursive: true, force: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function wait(delayMs: number) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function withRepairJobStateLock<T>(rootDir: string, jobId: string, callback: () => Promise<T>) {
+  const lockPath = path.join(rootDir, TASK_ROOT, CLAIM_LOCK_DIR, path.basename(jobId));
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      await mkdir(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await recoverStaleDirectoryLock(lockPath);
+      await wait(25);
+      continue;
+    }
+    try {
+      return await callback();
+    } finally {
+      await rm(lockPath, { recursive: true, force: true });
+    }
+  }
+  throw new BatchSegmentRepairCodexQueueError(
+    "Timed out waiting for the repair job state lock",
+    "JOB_STORAGE_BUSY",
+  );
 }
 
 function normalizeRepairPath(value: string) {
@@ -414,6 +550,7 @@ async function ensureQueueDirs(rootDir: string) {
     ...Object.values(STATE_DIRS).map((dir) => mkdir(path.join(rootDir, TASK_ROOT, dir), { recursive: true })),
     mkdir(path.join(rootDir, TASK_ROOT, RESULT_DIR), { recursive: true }),
     mkdir(path.join(rootDir, TASK_ROOT, CLAIM_LOCK_DIR), { recursive: true }),
+    mkdir(path.join(rootDir, TASK_ROOT, CREATE_LOCK_DIR), { recursive: true }),
   ]);
 }
 
@@ -421,14 +558,6 @@ async function readJobAt(filePath: string) {
   return JSON.parse(await readFile(filePath, "utf8")) as BatchSegmentRepairCodexJob;
 }
 
-async function writeJobAt(filePath: string, job: BatchSegmentRepairCodexJob) {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${randomUUID().slice(0, 6)}.tmp`;
-  await writeFile(tempPath, `${JSON.stringify(job, null, 2)}\n`, "utf8");
-  try {
-    await rename(tempPath, filePath);
-  } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => undefined);
-    throw error;
-  }
+async function writeJobAt(rootDir: string, filePath: string, job: BatchSegmentRepairCodexJob) {
+  await atomicReplaceJson(filePath, job, { rootDir });
 }

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { createVideoPromptPackCodexJob } from "@/lib/video-prompt-pack-codex-queue";
 import { CODEX_QUOTA_EXHAUSTED_CODE, assertCodexRuntimeAvailable } from "@/lib/codex-runtime-state";
 import type { SegmentContract } from "@/lib/batch-segment-contract";
+import { fileJobRouteError } from "@/lib/file-job-route-error";
 
 export const runtime = "nodejs";
 
@@ -20,6 +21,7 @@ const SegmentSchema = z.object({
 });
 
 const RequestSchema = z.object({
+  idempotencyKey: z.string().min(1).max(400).optional(),
   projectId: z.string().uuid().optional(),
   mode: z.enum(["standard", "strictUtf8"]).optional(),
   coverageSidecarEnabled: z.boolean().optional(),
@@ -34,9 +36,12 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ ok: true, job }, { status: 201 });
   } catch (error: any) {
     const isQuotaError = error?.code === CODEX_QUOTA_EXHAUSTED_CODE || String(error?.message || "").includes(CODEX_QUOTA_EXHAUSTED_CODE);
-    return NextResponse.json(
-      { ok: false, error: error?.message || "Video prompt render pack Codex job creation failed", code: isQuotaError ? CODEX_QUOTA_EXHAUSTED_CODE : undefined },
-      { status: isQuotaError ? 429 : 400 },
-    );
+    if (isQuotaError) {
+      return NextResponse.json(
+        { ok: false, error: error?.message || "Codex is unavailable", code: CODEX_QUOTA_EXHAUSTED_CODE },
+        { status: 429 },
+      );
+    }
+    return fileJobRouteError(error, "Video prompt render pack Codex job creation failed");
   }
 }

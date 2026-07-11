@@ -2,11 +2,13 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { failBatchSegmentRepairCodexJob } from "@/lib/batch-segment-repair-codex-queue";
 import { isCodexQuotaExhaustedMessage, markCodexQuotaExhausted } from "@/lib/codex-runtime-state";
+import { fileJobRouteError } from "@/lib/file-job-route-error";
 
 export const runtime = "nodejs";
 
 const RequestSchema = z.object({
   leaseId: z.string().uuid(),
+  fencingToken: z.number().int().positive(),
   message: z.string().max(10_000).optional(),
 });
 
@@ -21,16 +23,13 @@ export async function POST(request: Request, context: { params: Promise<{ jobId:
   }
   try {
     const { jobId } = await context.params;
-    const { leaseId, message } = RequestSchema.parse(await request.json());
+    const { leaseId, fencingToken, message } = RequestSchema.parse(await request.json());
     if (isCodexQuotaExhaustedMessage(message)) {
       await markCodexQuotaExhausted("batch-segment-repair", message);
     }
-    const job = await failBatchSegmentRepairCodexJob(jobId, leaseId, message);
+    const job = await failBatchSegmentRepairCodexJob(jobId, leaseId, fencingToken, message);
     return NextResponse.json({ ok: true, job });
   } catch (error: any) {
-    return NextResponse.json(
-      { ok: false, error: error?.message || "Batch segment repair task failure report failed" },
-      { status: 400 },
-    );
+    return fileJobRouteError(error, "Batch segment repair task failure report failed");
   }
 }

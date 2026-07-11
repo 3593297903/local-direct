@@ -1,8 +1,16 @@
 import { NextResponse } from "next/server";
+import { z } from "zod";
 import { failVideoPromptPackCodexJob } from "@/lib/video-prompt-pack-codex-queue";
 import { isCodexQuotaExhaustedMessage, markCodexQuotaExhausted } from "@/lib/codex-runtime-state";
+import { fileJobRouteError } from "@/lib/file-job-route-error";
 
 export const runtime = "nodejs";
+
+const RequestSchema = z.object({
+  leaseId: z.string().uuid(),
+  fencingToken: z.number().int().positive(),
+  message: z.string().max(10_000).optional(),
+});
 
 function isWorkerAuthorized(request: Request) {
   const token = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_TOKEN;
@@ -17,17 +25,13 @@ export async function POST(request: Request, context: { params: Promise<{ jobId:
 
   try {
     const params = await context.params;
-    const body = await request.json().catch(() => ({}));
-    const message = typeof body?.message === "string" ? body.message : undefined;
+    const { leaseId, fencingToken, message } = RequestSchema.parse(await request.json());
     if (isCodexQuotaExhaustedMessage(message)) {
       await markCodexQuotaExhausted("video-prompt-pack", message);
     }
-    const job = await failVideoPromptPackCodexJob(params.jobId, message);
+    const job = await failVideoPromptPackCodexJob(params.jobId, leaseId, fencingToken, message);
     return NextResponse.json({ ok: true, job });
   } catch (error: any) {
-    return NextResponse.json(
-      { ok: false, error: error?.message || "Video prompt render pack Codex job failure update failed" },
-      { status: 400 },
-    );
+    return fileJobRouteError(error, "Video prompt render pack Codex job failure update failed");
   }
 }

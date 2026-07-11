@@ -4,6 +4,7 @@ import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
 import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
+import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.VIDEO_PROMPT_PACK_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -12,8 +13,15 @@ const idleLogMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_IDLE_LOG_M
 const taskTimeoutMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_TASK_TIMEOUT_MS, 30 * 60_000);
 const concurrency = Math.max(1, Math.min(4, positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_CONCURRENCY, 4)));
 const workerToken = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_TOKEN || "";
+const workerId = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_ID || `video-prompt-pack-${process.pid}`;
 const messageDir = path.join(rootDir, ".tmp-video-prompt-pack-codex", "codex-messages");
+const workerLock = await acquireWorkerFleetLock("video-prompt-pack-worker", { rootDir });
+if (!workerLock.acquired) {
+  console.log(`Video prompt Render Pack worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
+  process.exit(0);
+}
 const runtimeHealth = await startCodexWorkerRuntimeHealth("video-prompt-pack", { rootDir });
+installWorkerShutdown(workerLock);
 
 console.log("Local Director video prompt Render Pack Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -59,13 +67,23 @@ while (true) {
 
 async function processTask(task) {
   console.log(`Claimed video prompt Render Pack job ${task.id} (${task.segments?.length || 0} segments).`);
+  let outputReady = false;
   try {
     await withCodexCliSlot("primary", task.id, () => runCodex(task));
     await assertOutputJsonFiles(task);
+    outputReady = true;
     await completeTask(task);
     console.log(`Completed video prompt Render Pack job ${task.id}.`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error?.errorCode === "JOB_LEASE_LOST") {
+      console.warn(`Discarded stale Render Pack lease for ${task.id}; a newer worker owns the job.`);
+      return;
+    }
+    if (outputReady && isTransientWorkerRequestError(error)) {
+      console.warn(`Render Pack output for ${task.id} is complete; completion will be reconciled from disk: ${message}`);
+      return;
+    }
     await failTask(task, message).catch((failError) => {
       console.error(`Could not report failed video prompt Render Pack job ${task.id}:`, failError);
     });
@@ -79,27 +97,66 @@ async function claimTask() {
 }
 
 async function completeTask(task) {
-  await postJson(`/api/video-prompt-packs/jobs/${encodeURIComponent(task.id)}/complete`, {});
+  await postJson(`/api/video-prompt-packs/jobs/${encodeURIComponent(task.id)}/complete`, {
+    leaseId: task.leaseId,
+    fencingToken: task.fencingToken,
+  });
 }
 
 async function failTask(task, message) {
-  await postJson(`/api/video-prompt-packs/jobs/${encodeURIComponent(task.id)}/fail`, { message });
+  await postJson(`/api/video-prompt-packs/jobs/${encodeURIComponent(task.id)}/fail`, {
+    leaseId: task.leaseId,
+    fencingToken: task.fencingToken,
+    message,
+  });
 }
 
 async function postJson(pathname, body) {
-  const response = await fetch(`${apiBaseUrl}${pathname}`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(workerToken ? { "x-video-prompt-pack-codex-token": workerToken } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await response.json().catch(() => null);
-  if (!response.ok || !data?.ok) {
-    throw new Error(data?.error || `Video prompt Render Pack Codex worker request failed: ${response.status}`);
+  const retryDelaysMs = [0, 25, 75, 200, 500];
+  for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
+    if (retryDelaysMs[attempt]) await delay(retryDelaysMs[attempt]);
+    let response;
+    try {
+      response = await fetch(`${apiBaseUrl}${pathname}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-worker-id": workerId,
+          ...(workerToken ? { "x-video-prompt-pack-codex-token": workerToken } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (error) {
+      if (attempt < retryDelaysMs.length - 1) continue;
+      throw new WorkerRequestError(error instanceof Error ? error.message : "Render Pack API is unavailable", null, 0, true);
+    }
+    const data = await response.json().catch(() => null);
+    if (response.ok && data?.ok) return data;
+    const requestError = new WorkerRequestError(
+      data?.error || `Video prompt Render Pack Codex worker request failed: ${response.status}`,
+      data?.errorCode,
+      response.status,
+      response.status >= 500,
+    );
+    if (requestError.errorCode !== "JOB_STORAGE_BUSY" || attempt === retryDelaysMs.length - 1) {
+      throw requestError;
+    }
   }
-  return data;
+  throw new WorkerRequestError("Video prompt Render Pack request retry budget exhausted", "JOB_STORAGE_BUSY", 503);
+}
+
+class WorkerRequestError extends Error {
+  constructor(message, errorCode, status, transient = false) {
+    super(message);
+    this.name = "WorkerRequestError";
+    this.errorCode = errorCode || null;
+    this.status = status;
+    this.transient = transient || errorCode === "JOB_STORAGE_BUSY";
+  }
+}
+
+function isTransientWorkerRequestError(error) {
+  return error instanceof WorkerRequestError && error.transient;
 }
 
 function buildCodexPrompt(task) {
@@ -226,4 +283,16 @@ function resolveCodexCommand() {
 
 function shouldRunCodexThroughShell(command) {
   return process.platform === "win32" || /[\\/\s]/.test(command);
+}
+
+function installWorkerShutdown(lock) {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await lock.release().catch(() => undefined);
+    process.exit(0);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
 }

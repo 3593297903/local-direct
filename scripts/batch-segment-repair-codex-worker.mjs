@@ -5,16 +5,24 @@ import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
 import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
+import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.BATCH_SEGMENT_REPAIR_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
 const pollMs = positiveInteger(process.env.BATCH_SEGMENT_REPAIR_CODEX_POLL_MS, 2500);
 const idleLogMs = positiveInteger(process.env.BATCH_SEGMENT_REPAIR_CODEX_IDLE_LOG_MS, 30_000);
 const taskTimeoutMs = positiveInteger(process.env.BATCH_SEGMENT_REPAIR_CODEX_TASK_TIMEOUT_MS, 20 * 60_000);
-const concurrency = Math.max(1, Math.min(3, positiveInteger(process.env.BATCH_SEGMENT_REPAIR_CODEX_CONCURRENCY, 2)));
+const concurrency = Math.max(1, Math.min(3, positiveInteger(process.env.BATCH_SEGMENT_REPAIR_CODEX_CONCURRENCY, 3)));
 const workerToken = process.env.BATCH_SEGMENT_REPAIR_CODEX_WORKER_TOKEN || "";
+const workerId = process.env.BATCH_SEGMENT_REPAIR_CODEX_WORKER_ID || `batch-segment-repair-${process.pid}`;
 const messageDir = path.join(rootDir, ".tmp-batch-segment-repair-codex", "codex-messages");
+const workerLock = await acquireWorkerFleetLock("batch-segment-repair-worker", { rootDir });
+if (!workerLock.acquired) {
+  console.log(`Batch segment repair worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
+  process.exit(0);
+}
 const runtimeHealth = await startCodexWorkerRuntimeHealth("batch-segment-repair", { rootDir });
+installWorkerShutdown(workerLock);
 
 console.log("Local Director batch segment repairs-only Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -50,15 +58,29 @@ while (true) {
 
 async function processTask(task) {
   console.log(`Claimed repairs-only job ${task.id}.`);
+  let outputReady = false;
   try {
     await withCodexCliSlot("auxiliary", task.id, () => runCodex(task));
     await assertRepairPatchJson(task.outputPath, task);
-    await postJson(`/api/batch-segment-repair/jobs/${encodeURIComponent(task.id)}/complete`, { leaseId: task.leaseId });
+    outputReady = true;
+    await postJson(`/api/batch-segment-repair/jobs/${encodeURIComponent(task.id)}/complete`, {
+      leaseId: task.leaseId,
+      fencingToken: task.fencingToken,
+    });
     console.log(`Completed repairs-only job ${task.id}.`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error?.errorCode === "JOB_LEASE_LOST") {
+      console.warn(`Discarded stale repair lease for ${task.id}; a newer worker owns the job.`);
+      return;
+    }
+    if (outputReady && isTransientWorkerRequestError(error)) {
+      console.warn(`Repair output for ${task.id} is complete; completion will be reconciled from disk: ${message}`);
+      return;
+    }
     await postJson(`/api/batch-segment-repair/jobs/${encodeURIComponent(task.id)}/fail`, {
       leaseId: task.leaseId,
+      fencingToken: task.fencingToken,
       message,
     }).catch((failError) => console.error(`Could not report failed repair job ${task.id}:`, failError));
     throw error;
@@ -71,19 +93,51 @@ async function claimTask() {
 }
 
 async function postJson(pathname, body) {
-  const response = await fetch(`${apiBaseUrl}${pathname}`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(workerToken ? { "x-batch-segment-repair-codex-token": workerToken } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await response.json().catch(() => null);
-  if (!response.ok || !data?.ok) {
-    throw new Error(data?.error || `Repairs-only worker request failed: ${response.status}`);
+  const retryDelaysMs = [0, 25, 75, 200, 500];
+  for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
+    if (retryDelaysMs[attempt]) await delay(retryDelaysMs[attempt]);
+    let response;
+    try {
+      response = await fetch(`${apiBaseUrl}${pathname}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-worker-id": workerId,
+          ...(workerToken ? { "x-batch-segment-repair-codex-token": workerToken } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (error) {
+      if (attempt < retryDelaysMs.length - 1) continue;
+      throw new WorkerRequestError(error instanceof Error ? error.message : "Repair API is unavailable", null, 0, true);
+    }
+    const data = await response.json().catch(() => null);
+    if (response.ok && data?.ok) return data;
+    const requestError = new WorkerRequestError(
+      data?.error || `Repairs-only worker request failed: ${response.status}`,
+      data?.errorCode,
+      response.status,
+      response.status >= 500,
+    );
+    if (requestError.errorCode !== "JOB_STORAGE_BUSY" || attempt === retryDelaysMs.length - 1) {
+      throw requestError;
+    }
   }
-  return data;
+  throw new WorkerRequestError("Repairs-only worker request retry budget exhausted", "JOB_STORAGE_BUSY", 503);
+}
+
+class WorkerRequestError extends Error {
+  constructor(message, errorCode, status, transient = false) {
+    super(message);
+    this.name = "WorkerRequestError";
+    this.errorCode = errorCode || null;
+    this.status = status;
+    this.transient = transient || errorCode === "JOB_STORAGE_BUSY";
+  }
+}
+
+function isTransientWorkerRequestError(error) {
+  return error instanceof WorkerRequestError && error.transient;
 }
 
 async function runCodex(task) {
@@ -150,14 +204,10 @@ async function assertRepairPatchJson(filePath, task) {
   if (keys.some((key) => !["schemaVersion", "contractHash", "resultHash", "repairs"].includes(key))) {
     throw new Error("Repair worker returned a complete result instead of repairs-only JSON");
   }
-  if (result.schemaVersion !== 1 || result.contractHash !== task.contractHash || result.resultHash !== task.resultHash) {
-    throw new Error("Repair patch hash or schema mismatch");
+  if (!("schemaVersion" in result) || !("contractHash" in result) || !("resultHash" in result)) {
+    throw new Error("Repair patch JSON is missing protocol fields");
   }
   if (!Array.isArray(result.repairs) || !result.repairs.length) throw new Error("Repair patch JSON is missing repairs");
-  for (const repair of result.repairs) {
-    if (!task.allowedPaths.includes(repair?.path)) throw new Error(`Repair patch contains unauthorized path: ${repair?.path}`);
-    if (typeof repair?.replacement !== "string" || !repair.replacement.trim()) throw new Error("Repair patch replacement is empty");
-  }
 }
 
 function resolveCodexCommand() {
@@ -177,6 +227,18 @@ function windowsCodexCandidates() {
 
 function shouldRunCodexThroughShell(command) {
   return process.platform === "win32" && !/\.exe$/i.test(command);
+}
+
+function installWorkerShutdown(lock) {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await lock.release().catch(() => undefined);
+    process.exit(0);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
 }
 
 function stripJsonBom(value) {

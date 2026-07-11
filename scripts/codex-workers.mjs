@@ -1,7 +1,13 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
 
 const rootDir = process.cwd();
+const fleetLock = await acquireWorkerFleetLock("codex-workers", { rootDir });
+if (!fleetLock.acquired) {
+  console.log(`Local Director Codex worker fleet is already running (pid=${fleetLock.owner?.pid || "unknown"}).`);
+  process.exit(0);
+}
 const workers = [
   ["season", "season-pack-codex-worker.mjs"],
   ["render-pack", "video-prompt-pack-codex-worker.mjs"],
@@ -67,5 +73,8 @@ function stopAll() {
   stopping = true;
   console.log("Stopping Local Director Codex workers...");
   for (const child of children) child.kill();
-  setTimeout(() => process.exit(0), 250).unref();
+  setTimeout(async () => {
+    await fleetLock.release().catch(() => undefined);
+    process.exit(0);
+  }, 250).unref();
 }
