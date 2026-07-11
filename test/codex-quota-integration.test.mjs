@@ -59,7 +59,11 @@ test("Codex job APIs reject or pause work when the global Codex quota circuit is
     const source = readFileSync(route, "utf8");
     assert.match(source, /getCodexRuntimeState/, `${route} should check global Codex runtime state while polling`);
     assert.match(source, /codexUnavailable/, `${route} should tell the UI that Codex is unavailable`);
-    assert.match(source, /fail.*Codex.*Job/, `${route} should fail stale pending work instead of letting the UI time out`);
+    if (route.includes("video-prompt-packs")) {
+      assert.doesNotMatch(source, /failVideoPromptPackCodexJob/, `${route} must preserve leased or pending work for recovery`);
+    } else {
+      assert.match(source, /fail.*Codex.*Job/, `${route} should fail stale pending work instead of letting the UI time out`);
+    }
   }
 
   for (const route of codexFailRoutes) {

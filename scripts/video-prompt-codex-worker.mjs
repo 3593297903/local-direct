@@ -5,6 +5,7 @@ import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
 import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
+import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.VIDEO_PROMPT_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -14,7 +15,13 @@ const taskTimeoutMs = positiveInteger(process.env.VIDEO_PROMPT_CODEX_TASK_TIMEOU
 const concurrency = Math.max(1, Math.min(5, positiveInteger(process.env.VIDEO_PROMPT_CODEX_CONCURRENCY, 3)));
 const workerToken = process.env.VIDEO_PROMPT_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-video-prompt-codex", "codex-messages");
+const workerLock = await acquireWorkerFleetLock("video-prompt-worker", { rootDir });
+if (!workerLock.acquired) {
+  console.log(`Video prompt worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
+  process.exit(0);
+}
 const runtimeHealth = await startCodexWorkerRuntimeHealth("video-prompt", { rootDir });
+installWorkerShutdown(workerLock);
 
 console.log("Local Director video prompt Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -278,4 +285,16 @@ function delay(ms) {
 
 function safeFileName(value) {
   return path.basename(String(value || "").replace(/[\\/:*?"<>|]+/g, "-"));
+}
+
+function installWorkerShutdown(lock) {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await lock.release().catch(() => undefined);
+    process.exit(0);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
 }

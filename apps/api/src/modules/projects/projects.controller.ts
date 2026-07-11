@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Body, Controller, Delete, Get, Param, Patch, Post, Req, UseGuards } from "@nestjs/common";
 import { ok } from "../../common/api-response";
 import { JwtAuthGuard } from "../auth/jwt-auth.guard";
@@ -59,8 +60,13 @@ export class ProjectsController {
   }
 
   @Post()
-  async createProject(@Req() request: { user: { id: string } }, @Body() body: CreateProjectDto) {
-    const result = await this.projectsService.createProject(request.user.id, body);
+  async createProject(
+    @Req() request: { user: { id: string }; headers?: Record<string, string | string[] | undefined> },
+    @Body() body: CreateProjectDto,
+  ) {
+    const incomingRequestId = request.headers?.["x-request-id"];
+    const requestId = (Array.isArray(incomingRequestId) ? incomingRequestId[0] : incomingRequestId) || randomUUID();
+    const result = await this.projectsService.createProject(request.user.id, body, String(requestId));
     return ok(result);
   }
 

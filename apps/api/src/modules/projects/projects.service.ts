@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { BadRequestException, Injectable } from "@nestjs/common";
 import {
   MemoryItemType,
@@ -8,7 +9,8 @@ import {
   VisualEntityStatus,
   VisualEntityType,
 } from "@prisma/client";
-import type { Prisma, Project } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import type { Project } from "@prisma/client";
 import { PrismaService } from "../../prisma/prisma.service";
 import type {
   CreateProjectDto,
@@ -22,6 +24,7 @@ import type {
   UpdateStoryLoopDto,
 } from "./projects.dto";
 import { shouldPublishProjectVersionMemory } from "./project-memory-publish-policy";
+import { ProjectSaveException } from "./project-save.error";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -770,6 +773,47 @@ function buildDirectorContextText(input: {
       "如果当前文案与历史冲突，保留当前文案，并用自然方式解释承接。",
     ]),
   ].filter(Boolean).join("\n\n");
+}
+
+const PROJECT_SAVE_TRANSACTION_RETRY_DELAYS_MS = [0, 50, 150, 400, 800] as const;
+const PROJECT_SAVE_REPLAY_WAIT_DELAYS_MS = [100, 200, 400, 800, 1_600, 3_200] as const;
+
+type ProjectSaveTransactionResult = {
+  project: { id: string };
+  version: { id: string };
+  versionNumber: number;
+  idempotentReplay: boolean;
+};
+
+class ProjectSaveLockBusyError extends Error {
+  constructor() {
+    super("Project save lock is busy");
+    this.name = "ProjectSaveLockBusyError";
+  }
+}
+
+function waitForProjectSaveRetry(delayMs: number) {
+  const jitterMs = delayMs > 0 ? Math.floor(Math.random() * Math.min(100, Math.ceil(delayMs / 3))) : 0;
+  return new Promise<void>((resolve) => setTimeout(resolve, delayMs + jitterMs));
+}
+
+function prismaErrorCode(error: unknown) {
+  return error instanceof Prisma.PrismaClientKnownRequestError ? error.code : "";
+}
+
+function badRequestMessage(error: BadRequestException) {
+  const response = error.getResponse();
+  if (typeof response === "string") return response;
+  if (response && typeof response === "object" && "message" in response) {
+    const message = (response as { message?: string | string[] }).message;
+    return Array.isArray(message) ? message.join("; ") : message || error.message;
+  }
+  return error.message;
+}
+
+function scopedProjectSaveIdempotencyKey(userId: string, key: string | undefined) {
+  const normalized = cleanText(key, 240);
+  return normalized ? `${userId}:${normalized}` : undefined;
 }
 
 function buildDirectorContextTextV2(input: {
@@ -1741,17 +1785,74 @@ export class ProjectsService {
     };
   }
 
-  async createProject(userId: string, input: CreateProjectDto) {
-    if (!userId) throw new BadRequestException("Authenticated user id is required");
+  async createProject(userId: string, input: CreateProjectDto, requestId: string = randomUUID()) {
+    if (!userId) {
+      throw new ProjectSaveException({
+        code: "PROJECT_VALIDATION_FAILED",
+        message: "Authenticated user id is required",
+        retryable: false,
+        requestId,
+        status: 400,
+      });
+    }
     const publishNarrativeMemory = shouldPublishProjectVersionMemory(input.status);
     const episodeMemory = deriveEpisodeMemory(input);
     const narrativeMemory = deriveNarrativeMemory(input, episodeMemory);
     const qualityCheck = deriveQualityCheck(input, narrativeMemory);
+    const saveIdempotencyKey = scopedProjectSaveIdempotencyKey(userId, input.idempotencyKey);
+    const findSavedIdempotentVersion = async (): Promise<ProjectSaveTransactionResult | null> => {
+      if (!saveIdempotencyKey) return null;
+      const rows = await this.prisma.$queryRaw<Array<{
+        id: string;
+        versionNumber: number;
+        projectId: string;
+      }>>`
+        SELECT "id", "versionNumber", "projectId"
+        FROM "ProjectVersion"
+        WHERE "saveIdempotencyKey" = ${saveIdempotencyKey}
+        LIMIT 1
+      `;
+      const existingVersion = rows[0];
+      return existingVersion
+        ? {
+            project: { id: existingVersion.projectId },
+            version: { id: existingVersion.id },
+            versionNumber: existingVersion.versionNumber,
+            idempotentReplay: true,
+          }
+        : null;
+    };
+    let result: ProjectSaveTransactionResult | undefined;
+    let finalError: unknown;
 
-    const result = await this.prisma.$transaction(async (prisma) => {
-      if (input.idempotencyKey) {
-        await prisma.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${input.idempotencyKey}))`;
-        const existingVersion = await prisma.projectVersion.findFirst({
+    for (let attempt = 0; attempt < PROJECT_SAVE_TRANSACTION_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        result = await this.prisma.$transaction(async (prisma) => {
+      if (saveIdempotencyKey) {
+        const lockRows = await prisma.$queryRaw<Array<{ acquired: boolean }>>`
+          SELECT pg_try_advisory_xact_lock(hashtextextended(${saveIdempotencyKey}, 0)) AS "acquired"
+        `;
+        if (!lockRows[0]?.acquired) throw new ProjectSaveLockBusyError();
+
+        const idempotentRows = await prisma.$queryRaw<Array<{
+          id: string;
+          versionNumber: number;
+          projectId: string;
+        }>>`
+          SELECT "id", "versionNumber", "projectId"
+          FROM "ProjectVersion"
+          WHERE "saveIdempotencyKey" = ${saveIdempotencyKey}
+          LIMIT 1
+        `;
+        let existingVersion = idempotentRows[0]
+          ? {
+              id: idempotentRows[0].id,
+              versionNumber: idempotentRows[0].versionNumber,
+              project: { id: idempotentRows[0].projectId },
+            }
+          : null;
+        if (!existingVersion && input.idempotencyKey) {
+          existingVersion = await prisma.projectVersion.findFirst({
           where: {
             project: { userId },
             contextSnapshot: { path: ["saveIdempotencyKey"], equals: input.idempotencyKey },
@@ -1762,11 +1863,20 @@ export class ProjectsService {
             project: { select: { id: true } },
           },
         });
+          if (existingVersion) {
+            await prisma.$executeRaw`
+              UPDATE "ProjectVersion"
+              SET "saveIdempotencyKey" = ${saveIdempotencyKey}
+              WHERE "id" = ${existingVersion.id}::uuid
+            `;
+          }
+        }
         if (existingVersion) {
           return {
             project: existingVersion.project,
             version: { id: existingVersion.id },
             versionNumber: existingVersion.versionNumber,
+            idempotentReplay: true,
           };
         }
       }
@@ -1831,6 +1941,7 @@ export class ProjectsService {
             storyboardImageUrl: input.storyboardImageUrl,
             storyboardImagePrompt: input.storyboardImagePrompt,
             fullVideoPrompt: input.fullVideoPrompt,
+            saveIdempotencyKey,
             episodeSummary: episodeMemory.episodeSummary,
             endingState: episodeMemory.endingState,
             characterState: episodeMemory.characterState,
@@ -1885,7 +1996,7 @@ export class ProjectsService {
           });
         }
 
-        return { project, version, versionNumber: ownedVersion.versionNumber };
+        return { project, version, versionNumber: ownedVersion.versionNumber, idempotentReplay: false };
       }
 
       const latestVersion = await prisma.projectVersion.findFirst({
@@ -1909,6 +2020,7 @@ export class ProjectsService {
           storyboardImageUrl: input.storyboardImageUrl,
           storyboardImagePrompt: input.storyboardImagePrompt,
           fullVideoPrompt: input.fullVideoPrompt,
+          saveIdempotencyKey,
           episodeSummary: episodeMemory.episodeSummary,
           endingState: episodeMemory.endingState,
           characterState: episodeMemory.characterState,
@@ -1963,12 +2075,120 @@ export class ProjectsService {
         });
       }
 
-      return { project, version, versionNumber };
-    });
+      return { project, version, versionNumber, idempotentReplay: false };
+        }, {
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+          maxWait: 5_000,
+          timeout: 60_000,
+        });
+        break;
+      } catch (error) {
+        finalError = error;
 
-    if (publishNarrativeMemory) await syncMemoryEmbeddingVectors(this.prisma, result.version.id);
+        if (saveIdempotencyKey && (error instanceof ProjectSaveLockBusyError || prismaErrorCode(error) === "P2002")) {
+          let existingVersion: ProjectSaveTransactionResult | null;
+          try {
+            existingVersion = await findSavedIdempotentVersion();
+          } catch (lookupError) {
+            finalError = lookupError;
+            break;
+          }
+          if (existingVersion) {
+            result = existingVersion;
+            break;
+          }
+        }
 
-    return { saved: true, projectId: result.project.id, versionId: result.version.id, versionNumber: result.versionNumber };
+        const code = prismaErrorCode(error);
+        const retryableTransactionFailure =
+          error instanceof ProjectSaveLockBusyError || code === "P2002" || code === "P2034";
+        const nextDelay = PROJECT_SAVE_TRANSACTION_RETRY_DELAYS_MS[attempt + 1];
+        if (retryableTransactionFailure && nextDelay !== undefined) {
+          await waitForProjectSaveRetry(nextDelay);
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (!result && saveIdempotencyKey && finalError instanceof ProjectSaveLockBusyError) {
+      for (const delayMs of PROJECT_SAVE_REPLAY_WAIT_DELAYS_MS) {
+        await waitForProjectSaveRetry(delayMs);
+        let existingVersion: ProjectSaveTransactionResult | null;
+        try {
+          existingVersion = await findSavedIdempotentVersion();
+        } catch (lookupError) {
+          finalError = lookupError;
+          break;
+        }
+        if (existingVersion) {
+          result = existingVersion;
+          break;
+        }
+      }
+    }
+
+    if (!result) {
+      if (finalError instanceof ProjectSaveException) throw finalError;
+      if (finalError instanceof BadRequestException) {
+        throw new ProjectSaveException({
+          code: "PROJECT_VALIDATION_FAILED",
+          message: badRequestMessage(finalError),
+          retryable: false,
+          requestId,
+          status: 400,
+        });
+      }
+      if (finalError instanceof ProjectSaveLockBusyError) {
+        throw new ProjectSaveException({
+          code: "PROJECT_LOCK_BUSY",
+          message: "项目保存队列正忙，请使用同一请求稍后重试。",
+          retryable: true,
+          requestId,
+          status: 423,
+        });
+      }
+      const code = prismaErrorCode(finalError);
+      if (code === "P2002" || code === "P2034") {
+        throw new ProjectSaveException({
+          code: "PROJECT_VERSION_CONFLICT",
+          message: "项目版本在保存期间发生变化，请使用同一请求重试。",
+          retryable: true,
+          requestId,
+          status: 409,
+        });
+      }
+      throw new ProjectSaveException({
+        code: "PROJECT_DB_SAVE_FAILED",
+        message: "项目暂时无法保存，请稍后使用同一请求重试。",
+        retryable: true,
+        requestId,
+        status: 503,
+      });
+    }
+
+    if (publishNarrativeMemory) {
+      try {
+        await syncMemoryEmbeddingVectors(this.prisma, result.version.id);
+      } catch {
+        throw new ProjectSaveException({
+          code: "PROJECT_DB_SAVE_FAILED",
+          message: "项目已写入，但记忆索引暂时无法同步，请使用同一请求重试。",
+          retryable: true,
+          requestId,
+          status: 503,
+        });
+      }
+    }
+
+    return {
+      saved: true,
+      projectId: result.project.id,
+      versionId: result.version.id,
+      versionNumber: result.versionNumber,
+      idempotentReplay: result.idempotentReplay,
+      requestId,
+    };
   }
 
   async updateProjectMemory(userId: string, projectId: string, input: UpdateProjectMemoryDto) {

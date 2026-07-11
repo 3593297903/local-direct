@@ -112,7 +112,8 @@ export function validateBatchSegmentRepairPatchResult(
   if (Object.keys(record).some((key) => !topKeys.has(key)) || !Array.isArray(record.repairs)) {
     throw new Error("Repair output must be repairs-only JSON");
   }
-  if (record.schemaVersion !== 1 || record.contractHash !== options.contractHash || record.resultHash !== options.resultHash) {
+  const schemaVersion = normalizeRepairSchemaVersion(record.schemaVersion);
+  if (record.contractHash !== options.contractHash || record.resultHash !== options.resultHash) {
     throw new Error("Repair output hash or schema does not match");
   }
   const allowedPaths = new Set(options.allowedPaths.map(normalizeBatchSegmentRepairPath));
@@ -150,11 +151,17 @@ export function validateBatchSegmentRepairPatchResult(
     };
   });
   return {
-    schemaVersion: 1,
+    schemaVersion,
     contractHash: options.contractHash,
     resultHash: options.resultHash,
     repairs,
   };
+}
+
+function normalizeRepairSchemaVersion(value: unknown): 1 {
+  if (typeof value === "number" && value === 1) return 1;
+  if (typeof value === "string" && /^1(?:\.0+)?$/.test(value.trim())) return 1;
+  throw new Error("Repair output schemaVersion must be numeric version 1");
 }
 
 export function buildBatchSegmentResultHash(value: unknown) {

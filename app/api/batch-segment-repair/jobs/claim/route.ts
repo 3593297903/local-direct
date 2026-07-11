@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { claimNextBatchSegmentRepairCodexJob } from "@/lib/batch-segment-repair-codex-queue";
 import { getCodexRuntimeState } from "@/lib/codex-runtime-state";
+import { fileJobRouteError } from "@/lib/file-job-route-error";
 
 export const runtime = "nodejs";
 
@@ -14,17 +15,18 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false, error: "Unauthorized batch segment repair worker" }, { status: 401 });
   }
   try {
+    if (/^(1|true|yes|on)$/i.test(process.env.CODEX_FILE_QUEUE_CLAIMS_PAUSED || "")) {
+      return NextResponse.json({ ok: true, task: null, claimsPaused: true });
+    }
     const codexState = await getCodexRuntimeState();
     if (!codexState.available) return NextResponse.json({ ok: true, task: null, codexUnavailable: codexState });
     const task = await claimNextBatchSegmentRepairCodexJob({
       order: process.env.BATCH_SEGMENT_REPAIR_CODEX_ORDER === "newest" ? "newest" : "oldest",
       runningTimeoutMs: Number.parseInt(process.env.BATCH_SEGMENT_REPAIR_CODEX_TASK_TIMEOUT_MS || "1200000", 10),
+      workerId: request.headers.get("x-worker-id") || undefined,
     });
     return NextResponse.json({ ok: true, task });
   } catch (error: any) {
-    return NextResponse.json(
-      { ok: false, error: error?.message || "Batch segment repair task claim failed" },
-      { status: 400 },
-    );
+    return fileJobRouteError(error, "Batch segment repair task claim failed");
   }
 }

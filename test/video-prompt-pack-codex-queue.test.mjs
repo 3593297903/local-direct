@@ -156,7 +156,7 @@ test("creates, claims, and completes a video prompt render pack job with indepen
       writeFileSync(segment.outputPath, JSON.stringify(sampleAnalysisResult(segment.title), null, 2), "utf8");
     }
 
-    const completed = await completeVideoPromptPackCodexJob(job.id, { rootDir });
+    const completed = await completeVideoPromptPackCodexJob(job.id, claimed.leaseId, claimed.fencingToken, { rootDir });
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.segments.length, 5);
     assert.deepEqual(completed.result.segments.map((segment) => segment.episodeIndex), [1, 2, 3, 4, 5]);
@@ -333,7 +333,7 @@ test("coverage sidecars stay separate and never make a valid main result fail", 
     assert.match(claimed.prompt, /slotId=recognition/);
     assert.match(claimed.prompt, /storyboard\[\*\]\.dialogue/);
 
-    const completed = await completeVideoPromptPackCodexJob(job.id, { rootDir });
+    const completed = await completeVideoPromptPackCodexJob(job.id, claimed.leaseId, claimed.fencingToken, { rootDir });
     assert.equal(completed.result.segments[0].result.coverage, undefined);
     assert.equal(completed.result.segments[0].coverageSidecar.receipts[0].slotId, "recognition");
     assert.match(completed.result.segments[0].coverageSidecar.resultHash, /^sr_[a-z0-9]+$/);
@@ -353,7 +353,12 @@ test("coverage sidecars stay separate and never make a valid main result fail", 
     mkdirSync(path.dirname(invalidClaimed.segments[0].outputPath), { recursive: true });
     writeFileSync(invalidClaimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("第2段")), "utf8");
     writeFileSync(invalidClaimed.segments[0].coverageOutputPath, "{not-json", "utf8");
-    const invalidCompleted = await completeVideoPromptPackCodexJob(invalidJob.id, { rootDir });
+    const invalidCompleted = await completeVideoPromptPackCodexJob(
+      invalidJob.id,
+      invalidClaimed.leaseId,
+      invalidClaimed.fencingToken,
+      { rootDir },
+    );
     assert.equal(invalidCompleted.result.segments[0].coverageSidecar, null);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
@@ -382,7 +387,7 @@ test("a batch snapshot can disable coverage sidecars without changing the main r
     mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
     writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("第1段"), null, 2), "utf8");
     writeFileSync(claimed.segments[0].coverageOutputPath, "{ invalid sidecar", "utf8");
-    const completed = await completeVideoPromptPackCodexJob(job.id, { rootDir });
+    const completed = await completeVideoPromptPackCodexJob(job.id, claimed.leaseId, claimed.fencingToken, { rootDir });
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.segments[0].coverageSidecar, null);
   } finally {

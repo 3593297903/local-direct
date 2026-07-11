@@ -3,7 +3,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
+import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
 import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
+import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.VISUAL_ASSET_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -15,7 +17,13 @@ const workerToken = process.env.VISUAL_ASSET_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-visual-asset-codex", "codex-messages");
 const logDir = path.join(rootDir, ".tmp-visual-asset-codex", "codex-logs");
 const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const workerLock = await acquireWorkerFleetLock("visual-asset-worker", { rootDir });
+if (!workerLock.acquired) {
+  console.log(`Visual asset worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
+  process.exit(0);
+}
 const runtimeHealth = await startCodexWorkerRuntimeHealth("visual-asset", { rootDir });
+installWorkerShutdown(workerLock);
 
 console.log("Local Director visual asset Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -56,7 +64,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed visual asset task ${task.id} for @${task.entityKey}.`);
   try {
-    await runCodex(task);
+    await withCodexCliSlot("auxiliary", task.id, () => runCodex(task));
     await assertOutputFile(task.outputPath);
     const logPath = codexLogPath(task);
     const completed = await completeTask(task, {
@@ -272,4 +280,16 @@ function logIdle() {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function installWorkerShutdown(lock) {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await lock.release().catch(() => undefined);
+    process.exit(0);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
 }

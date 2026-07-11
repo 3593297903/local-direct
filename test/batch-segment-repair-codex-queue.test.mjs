@@ -80,7 +80,16 @@ test("repair queue creates a repairs-only prompt and completes a strict patch re
       ],
     }, null, 2));
 
-    const completed = await completeBatchSegmentRepairCodexJob(claimed.id, claimed.leaseId, { rootDir });
+    await assert.rejects(
+      () => completeBatchSegmentRepairCodexJob(
+        claimed.id,
+        claimed.leaseId,
+        claimed.fencingToken + 1,
+        { rootDir },
+      ),
+      /lease|fencing/i,
+    );
+    const completed = await completeBatchSegmentRepairCodexJob(claimed.id, claimed.leaseId, claimed.fencingToken, { rootDir });
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.repairs.length, 1);
 
@@ -103,7 +112,7 @@ test("repair queue rejects complete AnalysisResult fallback and unauthorized pat
       workflow: { fullVideoPrompt: "不允许" },
     }));
     await assert.rejects(
-      () => completeBatchSegmentRepairCodexJob(first.id, firstClaim.leaseId, { rootDir }),
+      () => completeBatchSegmentRepairCodexJob(first.id, firstClaim.leaseId, firstClaim.fencingToken, { rootDir }),
       /repairs-only|repairs/i,
     );
 
@@ -121,7 +130,7 @@ test("repair queue rejects complete AnalysisResult fallback and unauthorized pat
       }],
     }));
     await assert.rejects(
-      () => completeBatchSegmentRepairCodexJob(second.id, secondClaim.leaseId, { rootDir }),
+      () => completeBatchSegmentRepairCodexJob(second.id, secondClaim.leaseId, secondClaim.fencingToken, { rootDir }),
       /unauthorized|path/i,
     );
 
@@ -139,7 +148,7 @@ test("repair queue rejects complete AnalysisResult fallback and unauthorized pat
       }],
     }));
     await assert.rejects(
-      () => completeBatchSegmentRepairCodexJob(third.id, thirdClaim.leaseId, { rootDir }),
+      () => completeBatchSegmentRepairCodexJob(third.id, thirdClaim.leaseId, thirdClaim.fencingToken, { rootDir }),
       /unknown slotId/i,
     );
   } finally {

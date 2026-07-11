@@ -77,11 +77,11 @@ test("NestJS projects module uses JWT user ownership with Prisma-backed service"
   assert.doesNotMatch(controller, /@Query\("userId"\)/);
   assert.match(controller, /ProjectsService/);
   assert.match(controller, /listProjects\(request\.user\.id\)/);
-  assert.match(controller, /createProject\(request\.user\.id, body\)/);
+  assert.match(controller, /createProject\(request\.user\.id, body, String\(requestId\)\)/);
   assert.doesNotMatch(controller, /Project module skeleton/);
   assert.match(service, /prisma\.project\.findMany/);
   assert.match(service, /prisma\.project\.create/);
-  assert.match(service, /createProject\(userId: string, input: CreateProjectDto\)/);
+  assert.match(service, /createProject\(userId: string, input: CreateProjectDto, requestId: string = randomUUID\(\)\)/);
   assert.doesNotMatch(service, /input\.userId/);
   assert.doesNotMatch(dto, /userId!:/);
   assert.match(module, /imports: \[AuthModule\]/);

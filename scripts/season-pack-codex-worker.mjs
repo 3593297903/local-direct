@@ -5,6 +5,7 @@ import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
 import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
+import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.SEASON_PACK_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -13,7 +14,13 @@ const idleLogMs = positiveInteger(process.env.SEASON_PACK_CODEX_IDLE_LOG_MS, 30_
 const taskTimeoutMs = positiveInteger(process.env.SEASON_PACK_CODEX_TASK_TIMEOUT_MS, 60 * 60_000);
 const workerToken = process.env.SEASON_PACK_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-season-pack-codex", "codex-messages");
+const workerLock = await acquireWorkerFleetLock("season-pack-worker", { rootDir });
+if (!workerLock.acquired) {
+  console.log(`Season pack worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
+  process.exit(0);
+}
 const runtimeHealth = await startCodexWorkerRuntimeHealth("season-pack", { rootDir });
+installWorkerShutdown(workerLock);
 
 console.log("Local Director season pack Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -300,4 +307,16 @@ function delay(ms) {
 
 function safeFileName(value) {
   return path.basename(String(value || "").replace(/[\\/:*?"<>|]+/g, "-"));
+}
+
+function installWorkerShutdown(lock) {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await lock.release().catch(() => undefined);
+    process.exit(0);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
 }
