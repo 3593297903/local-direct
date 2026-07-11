@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import os from "node:os";
+import path from "node:path";
+import { rmSync } from "node:fs";
+import test, { after } from "node:test";
+
+const slotTestRoot = path.join(os.tmpdir(), `localdirector-cli-slots-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+process.env.CODEX_CLI_SLOT_ROOT_DIR = slotTestRoot;
+after(() => {
+  delete process.env.CODEX_CLI_SLOT_ROOT_DIR;
+  rmSync(slotTestRoot, { recursive: true, force: true });
+});
 
 test("global CLI slots start at four and reserve primary render capacity", async () => {
   const { resolveCodexCliSlotConfig, resolveCodexCliSlotCandidates } = await import("../scripts/codex-cli-slot-coordinator.mjs");

@@ -2,7 +2,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-const rootDir = process.cwd();
+const rootDir = path.resolve(process.env.CODEX_CLI_SLOT_ROOT_DIR || process.cwd());
 const slotRoot = path.join(rootDir, ".tmp-codex-runtime", "cli-slots");
 const primaryWaiterRoot = path.join(slotRoot, "primary-waiters");
 const auxiliaryWaiterRoot = path.join(slotRoot, "auxiliary-waiters");
