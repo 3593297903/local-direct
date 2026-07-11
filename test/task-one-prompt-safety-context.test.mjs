@@ -161,3 +161,19 @@ test("one semantic risk copied across canonical and negative fields becomes one 
   assert.match(woundFindings[0].fingerprint, /^ps_/);
 });
 
+test("twenty-segment redacted replay keeps negated facts and negative lists out of Codex repair", () => {
+  for (let segmentIndex = 1; segmentIndex <= 20; segmentIndex += 1) {
+    const result = analyzePromptSafetyTree({
+      optimizedScript: `第${segmentIndex}段核验结论：没有尸体特写，未见血泊，排除自杀。`,
+      workflow: {
+        fullVideoPrompt: "画面保持克制，不展示伤口特写，不出现真实警徽。",
+        fullNegativePrompt: "不要尸体特写，不要血泊，不要真实警服。",
+      },
+      storyboard: [{
+        visual: "人物在普通办公室核对资料，画面不展示伤害细节。",
+        negativePrompt: "避免尸体细节、血泊和真实机构徽章。",
+      }],
+    }, { phase: "quality", segmentIndex });
+    assert.equal(result.findings.some((finding) => finding.requiresCodexRepair), false);
+  }
+});

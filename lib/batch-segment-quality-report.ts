@@ -21,6 +21,7 @@ export type SegmentQualityReport = {
   repairCount: number;
   repairReasons: string[];
   qualityScore: number;
+  promptQualityScore: number;
   qualityFindings: string[];
   blockingCount: number;
   patchableCount: number;
@@ -32,6 +33,7 @@ export type SegmentQualityReport = {
   codexRepairAttempted: boolean;
   codexRepairSegmentCount: number;
   safetyRisk: SegmentSafetyRisk;
+  complianceRisk: SegmentSafetyRisk;
   safetyFindings: string[];
   contractHash?: string;
   renderHash: string;
@@ -144,6 +146,14 @@ export function createSegmentQualityReport(input: CreateSegmentQualityReportInpu
         riskCount: 0,
       };
   const safety = detectSegmentSafetyRisk([collectSafetyText(input.result), input.sourceText].join("\n"));
+  const gateSafety = input.qualityGate
+    ? {
+        risk: input.qualityGate.complianceRisk,
+        findings: input.qualityGate.findings
+          .filter((finding) => finding.code === "sensitive_term")
+          .map((finding) => `${finding.ruleId || "safety"}: ${finding.message} (${finding.affectedPathCount || 1} 路径)`),
+      }
+    : safety;
   const patchDiffs = input.patchDiffs || [];
   const localPatchCount = patchDiffs.filter((patch) => patch.patchSource === "local").length;
   const codexPatchCount = patchDiffs.filter((patch) => patch.patchSource === "codex").length;
@@ -174,6 +184,7 @@ export function createSegmentQualityReport(input: CreateSegmentQualityReportInpu
     repairCount: input.repairCount || 0,
     repairReasons: input.repairReasons || [],
     qualityScore: quality.score,
+    promptQualityScore: quality.score,
     qualityFindings: quality.findings,
     blockingCount: quality.blockingCount,
     patchableCount: quality.patchableCount,
@@ -184,8 +195,9 @@ export function createSegmentQualityReport(input: CreateSegmentQualityReportInpu
     patchDiffs,
     codexRepairAttempted: Boolean(input.codexRepairAttempted),
     codexRepairSegmentCount,
-    safetyRisk: safety.risk,
-    safetyFindings: safety.findings,
+    safetyRisk: gateSafety.risk,
+    complianceRisk: gateSafety.risk,
+    safetyFindings: Array.from(new Set(gateSafety.findings)),
     contractHash: input.contractHash,
     renderHash: stableReportHash(promptText),
     sourceHash: stableReportHash(input.sourceText),
