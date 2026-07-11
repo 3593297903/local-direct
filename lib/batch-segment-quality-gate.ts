@@ -6,7 +6,13 @@ import {
   sanitizeInternalPromptTokens,
   sanitizeInternalPromptTokensDeep,
 } from "./internal-prompt-token-sanitizer";
-import { applyPromptSafetyPolicy } from "./prompt-safety-policy";
+import {
+  analyzePromptSafetyTree,
+  applyPromptSafetyPolicy,
+  type PromptSafetyPathClass,
+  type PromptSafetyPolarity,
+  type PromptSafetyRisk,
+} from "./prompt-safety-policy";
 
 export type BatchSegmentQualitySeverity = "blocking" | "patchable" | "warning" | "risk";
 
@@ -49,6 +55,12 @@ export type BatchSegmentQualityFinding = {
   currentLength?: number;
   minimumLength?: number;
   targetLength?: number;
+  fingerprint?: string;
+  ruleId?: string;
+  pathClass?: PromptSafetyPathClass;
+  polarity?: PromptSafetyPolarity;
+  affectedPaths?: string[];
+  affectedPathCount?: number;
 };
 
 export type QualityPatchDiff = {
@@ -68,6 +80,8 @@ export type DeterministicQualityPatchResult<T extends AnalysisResult> = {
 
 export type BatchSegmentQualityGate = {
   score: number;
+  promptQualityScore: number;
+  complianceRisk: PromptSafetyRisk;
   findings: BatchSegmentQualityFinding[];
   blockingFindings: BatchSegmentQualityFinding[];
   patchableFindings: BatchSegmentQualityFinding[];
@@ -76,6 +90,7 @@ export type BatchSegmentQualityGate = {
 };
 
 export type BatchSegmentQualityOptions = {
+  segmentIndex?: number;
   minFullPromptLength?: number;
   expectedShotCount?: number;
   sourceShotCount?: number;
@@ -444,33 +459,6 @@ function collectStringQualityFindings(
         currentValue: value,
       });
     }
-    const safety = applyPromptSafetyPolicy(value, { phase: "quality", path });
-    for (const safetyFinding of safety.findings) {
-      findings.push({
-        severity: safetyFinding.severity === "high" && !safetyFinding.replacement
-          ? "blocking"
-          : safetyFinding.severity === "low"
-            ? "warning"
-            : "risk",
-        code: "sensitive_term",
-        message: safetyFinding.reason,
-        path,
-        currentValue: value,
-      });
-    }
-    for (const [pattern] of [] as Array<[RegExp, string]>) {
-      pattern.lastIndex = 0;
-      if (pattern.test(value)) {
-        findings.push({
-          severity: "risk",
-          code: "sensitive_term",
-          message: "鍖呭惈鍙湰鍦拌閬跨殑 Seedance 椋庨櫓琛ㄨ揪",
-          path,
-          currentValue: value,
-        });
-        break;
-      }
-    }
     return;
   }
   if (Array.isArray(value)) {
@@ -493,6 +481,11 @@ export function evaluateBatchSegmentQuality(
     ? cleanText(options.fullPromptText)
     : cleanText(result.workflow?.fullVideoPrompt);
   const serialized = JSON.stringify(result);
+  const safetyAnalysis = analyzePromptSafetyTree(result, {
+    phase: "quality",
+    segmentIndex: options.segmentIndex || options.contract?.segmentIndex || 0,
+    rootPath: "result",
+  });
 
   if (!storyboard.length) {
     findings.push({ severity: "blocking", code: "missing_storyboard", message: "缺少 storyboard 镜头列表" });
@@ -523,6 +516,21 @@ export function evaluateBatchSegmentQuality(
   collectStringQualityFindings(result, "result", findings);
   if (fullPromptText) collectStringQualityFindings(fullPromptText, "workflow.fullVideoPrompt", findings);
   collectPlaceholderFindings(result, "result", findings);
+  for (const safetyFinding of safetyAnalysis.findings) {
+    findings.push({
+      severity: safetyFinding.severity,
+      code: "sensitive_term",
+      message: safetyFinding.reason,
+      path: safetyFinding.primaryPath,
+      currentValue: safetyFinding.match,
+      fingerprint: safetyFinding.fingerprint,
+      ruleId: safetyFinding.ruleId,
+      pathClass: safetyFinding.pathClass,
+      polarity: safetyFinding.polarity,
+      affectedPaths: safetyFinding.affectedPaths,
+      affectedPathCount: safetyFinding.affectedPathCount,
+    });
+  }
 
   if (!options.contract && options.expectedShotCount && storyboard.length && storyboard.length !== options.expectedShotCount) {
     findings.push({
@@ -742,16 +750,24 @@ export function evaluateBatchSegmentQuality(
   const patchableFindings = findings.filter((finding) => finding.severity === "patchable");
   const warningFindings = findings.filter((finding) => finding.severity === "warning");
   const riskFindings = findings.filter((finding) => finding.severity === "risk");
-  const score = Math.max(
+  const promptQualityScore = Math.max(
     0,
     100
       - blockingFindings.length * 30
       - patchableFindings.length * 8
-      - warningFindings.length * 3
-      - riskFindings.length * 5,
+      - warningFindings.length * 3,
   );
 
-  return { score, findings, blockingFindings, patchableFindings, warningFindings, riskFindings };
+  return {
+    score: promptQualityScore,
+    promptQualityScore,
+    complianceRisk: safetyAnalysis.highestRisk,
+    findings,
+    blockingFindings,
+    patchableFindings,
+    warningFindings,
+    riskFindings,
+  };
 }
 
 function normalizePatchPath(path: string | undefined) {
@@ -837,24 +853,27 @@ export function applyDeterministicQualityPatchWithDiff<T extends AnalysisResult>
 
   for (const finding of findings) {
     if (!isPatchEligibleFinding(finding)) continue;
-    const path = normalizePatchPath(finding.path);
-    if (!path || seenPaths.has(path)) continue;
-    seenPaths.add(path);
+    const candidatePaths = finding.affectedPaths?.length ? finding.affectedPaths : [finding.path || ""];
+    for (const candidatePath of candidatePaths) {
+      const path = normalizePatchPath(candidatePath);
+      if (!path || seenPaths.has(path)) continue;
+      seenPaths.add(path);
 
-    const before = getValueAtPath(patched, path);
-    const after = patchValueForFinding(patched, path, finding);
-    if (JSON.stringify(before) === JSON.stringify(after)) continue;
+      const before = getValueAtPath(patched, path);
+      const after = patchValueForFinding(patched, path, finding);
+      if (JSON.stringify(before) === JSON.stringify(after)) continue;
 
-    patched = setValueAtPath(patched, path, after);
-    patchDiffs.push({
-      path,
-      code: finding.code,
-      severity: finding.severity as Extract<BatchSegmentQualitySeverity, "patchable" | "risk">,
-      before,
-      after,
-      patchSource: "local",
-      reason: finding.message,
-    });
+      patched = setValueAtPath(patched, path, after);
+      patchDiffs.push({
+        path,
+        code: finding.code,
+        severity: finding.severity as Extract<BatchSegmentQualitySeverity, "patchable" | "risk">,
+        before,
+        after,
+        patchSource: "local",
+        reason: finding.message,
+      });
+    }
   }
 
   return { result: patched, patchDiffs };
