@@ -1,8 +1,9 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import type { SegmentStateRecord } from "./batch-segment-progress";
 
-export type SegmentBatchCacheDocument = {
+export type SegmentBatchCacheDocumentV1 = {
   schemaVersion: 1;
   batchId: string;
   projectId?: string | null;
@@ -22,6 +23,31 @@ export type SegmentBatchCacheDocument = {
   leaseExpiresAt?: string;
 };
 
+export type SegmentBatchCacheDocumentV2 = {
+  schemaVersion: 2;
+  revision: number;
+  batchId: string;
+  durableBatchId: string;
+  projectId?: string | null;
+  sourceHash: string;
+  contractHash: string;
+  resolvedSegmentCount: number;
+  updatedAt: string;
+  phase?: string;
+  segmentStates: SegmentStateRecord[];
+  activeJobIds: string[];
+  qualityReports: unknown[];
+  segments: unknown[];
+  needsReviewSegments: unknown[];
+  coverageStage?: string;
+  renderRound?: number;
+  repairAttempts?: Array<[string, number]>;
+  leaseOwnerId?: string;
+  leaseExpiresAt?: string;
+};
+
+export type SegmentBatchCacheDocument = SegmentBatchCacheDocumentV1 | SegmentBatchCacheDocumentV2;
+
 type CacheOptions = { rootDir?: string };
 const CACHE_DIR = ".tmp-segment-batch-cache";
 
@@ -36,6 +62,13 @@ export async function writeSegmentBatchCache(
   await acquireCacheLock(lockPath);
   try {
     const current = await readSegmentBatchCache(document.batchId, options);
+    if (
+      current?.schemaVersion === 2
+      && document.schemaVersion === 2
+      && document.revision < current.revision
+    ) {
+      throw new Error("Segment batch cache revision is stale");
+    }
     if (
       current?.leaseOwnerId
       && current.leaseOwnerId !== document.leaseOwnerId
@@ -64,7 +97,9 @@ export async function readSegmentBatchCache(batchId: string, options: CacheOptio
 }
 
 function validateCacheDocument(value: SegmentBatchCacheDocument) {
-  if (!value || typeof value !== "object" || value.schemaVersion !== 1) throw new Error("Segment batch cache schema is invalid");
+  if (!value || typeof value !== "object" || (value.schemaVersion !== 1 && value.schemaVersion !== 2)) {
+    throw new Error("Segment batch cache schema is invalid");
+  }
   const batchId = validateBatchId(value.batchId);
   if (!value.sourceHash || !value.contractHash) throw new Error("Segment batch cache identity is incomplete");
   if (!Number.isInteger(value.resolvedSegmentCount) || value.resolvedSegmentCount < 1 || value.resolvedSegmentCount > 30) {
@@ -76,7 +111,57 @@ function validateCacheDocument(value: SegmentBatchCacheDocument) {
   if (value.segmentStates && !Array.isArray(value.segmentStates)) throw new Error("Segment batch cache states are invalid");
   if (value.repairAttempts && !Array.isArray(value.repairAttempts)) throw new Error("Segment batch cache repairAttempts is invalid");
   if (value.leaseExpiresAt && !Number.isFinite(Date.parse(value.leaseExpiresAt))) throw new Error("Segment batch cache lease expiry is invalid");
+  if (value.schemaVersion === 2) {
+    if (!Number.isInteger(value.revision) || value.revision < 0) throw new Error("Segment batch cache revision is invalid");
+    if (!value.durableBatchId || !Array.isArray(value.activeJobIds) || !Array.isArray(value.segmentStates)) {
+      throw new Error("Segment batch cache v2 state is incomplete");
+    }
+  }
   return { ...value, batchId };
+}
+
+export function migrateSegmentBatchCacheDocument(
+  value: SegmentBatchCacheDocument,
+  now = Date.now(),
+): SegmentBatchCacheDocumentV2 {
+  const validated = validateCacheDocument(value);
+  if (validated.schemaVersion === 2) return validated;
+  const legacyStates = new Map((validated.segmentStates || []).map((state) => [state.index, state]));
+  const savedStatuses = new Map<number, string>();
+  for (const segment of validated.segments) {
+    if (!segment || typeof segment !== "object") continue;
+    const record = segment as Record<string, unknown>;
+    const index = Number(record.episodeIndex);
+    if (Number.isInteger(index)) savedStatuses.set(index, String(record.status || "cached"));
+  }
+  const segmentStates: SegmentStateRecord[] = Array.from(
+    { length: validated.resolvedSegmentCount },
+    (_, offset) => {
+      const index = offset + 1;
+      const status = savedStatuses.get(index) || legacyStates.get(index)?.status || "pending";
+      const review = status === "needs_review" || status === "review_saved";
+      const saved = status === "saved" || status === "review_saved";
+      const cached = status === "cached" || status === "needs_review" || saved;
+      return {
+        index,
+        generationStatus: cached ? "settled" : status === "running" ? "rendering" : "pending",
+        qualityStatus: review ? "needs_review" : cached ? "passed" : "unknown",
+        saveStatus: saved ? (review ? "review_saved" : "saved") : cached ? "cached" : "not_ready",
+        revision: 0,
+        saveRetryCount: 0,
+        message: legacyStates.get(index)?.message,
+        updatedAt: now,
+      };
+    },
+  );
+  return {
+    ...validated,
+    schemaVersion: 2,
+    revision: 0,
+    durableBatchId: validated.batchId,
+    segmentStates,
+    activeJobIds: [],
+  };
 }
 
 async function acquireCacheLock(lockPath: string) {

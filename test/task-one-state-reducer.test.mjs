@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
+import { rmSync } from "node:fs";
 import test from "node:test";
 
 process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({ module: "commonjs", moduleResolution: "node" });
@@ -12,6 +15,10 @@ const {
   deriveBatchPhaseFromSegmentStates,
   progressStatusFromSegmentState,
 } = require("../lib/batch-segment-progress.ts");
+const {
+  migrateSegmentBatchCacheDocument,
+  writeSegmentBatchCache,
+} = require("../lib/segment-batch-cache.ts");
 
 test("orthogonal reducer preserves quality while save fails and resumes", () => {
   let state = createInitialSegmentState(1, { contractHash: "contract-a" });
@@ -68,3 +75,52 @@ test("batch phase derives from records instead of scattered counters", () => {
   assert.equal(deriveBatchPhaseFromSegmentStates([saved, review]), "needs_review");
 });
 
+test("cache v1 migrates to complete v2 state without truncating segment results", () => {
+  const promptText = "完整提示词".repeat(1000);
+  const migrated = migrateSegmentBatchCacheDocument({
+    schemaVersion: 1,
+    batchId: "batch-migrate",
+    sourceHash: "src",
+    contractHash: "contract",
+    resolvedSegmentCount: 2,
+    updatedAt: new Date(0).toISOString(),
+    qualityReports: [],
+    needsReviewSegments: [],
+    segmentStates: [{ index: 1, status: "saved", message: "done" }],
+    segments: [{ episodeIndex: 1, status: "saved", promptText, result: { title: "one" } }],
+  }, 123);
+
+  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.durableBatchId, "batch-migrate");
+  assert.equal(migrated.segmentStates[0].saveStatus, "saved");
+  assert.equal(migrated.segments[0].promptText, promptText);
+});
+
+test("cache v2 rejects a lower revision and preserves the newer document", async () => {
+  const rootDir = path.join(os.tmpdir(), `task-one-cache-v2-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const state = createInitialSegmentState(1, { updatedAt: 1 });
+  const base = {
+    schemaVersion: 2,
+    revision: 2,
+    batchId: "task-one-v2",
+    durableBatchId: "task-one-v2",
+    sourceHash: "src",
+    contractHash: "contract",
+    resolvedSegmentCount: 1,
+    updatedAt: new Date().toISOString(),
+    segmentStates: [state],
+    activeJobIds: [],
+    qualityReports: [],
+    needsReviewSegments: [],
+    segments: [{ episodeIndex: 1, promptText: "完整结果", result: { title: "one" } }],
+  };
+  try {
+    await writeSegmentBatchCache(base, { rootDir });
+    await assert.rejects(
+      () => writeSegmentBatchCache({ ...base, revision: 1 }, { rootDir }),
+      /revision is stale/i,
+    );
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
