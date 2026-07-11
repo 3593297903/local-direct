@@ -8,7 +8,7 @@ const primaryWaiterRoot = path.join(slotRoot, "primary-waiters");
 const auxiliaryWaiterRoot = path.join(slotRoot, "auxiliary-waiters");
 
 export function resolveCodexCliSlotConfig(env = process.env) {
-  const maxSlots = clampInteger(env.CODEX_CLI_MAX_SLOTS, 4, 1, 8);
+  const maxSlots = clampInteger(env.CODEX_CLI_MAX_SLOTS, 4, 1, 4);
   return {
     maxSlots,
     primaryReservedSlots: clampInteger(

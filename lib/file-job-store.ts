@@ -200,6 +200,7 @@ export async function claimNextFileJob<T extends FileJobRecord>(
     runningTimeoutMs?: number;
     workerId?: string;
     canRecoverRunningJob?: (job: T) => boolean | Promise<boolean>;
+    claimLeaseWriteOptions?: Omit<AtomicReplaceJsonOptions, "rootDir">;
   } = {},
 ) {
   await ensureFileJobStore(rootDir, namespace);
@@ -250,8 +251,13 @@ export async function claimNextFileJob<T extends FileJobRecord>(
         startedAt: now,
         updatedAt: now,
       } as T;
-      await writeJobFile(rootDir, runningPath, claimed);
-      return claimed;
+      try {
+        await writeJobFile(rootDir, runningPath, claimed, options.claimLeaseWriteOptions);
+        return claimed;
+      } catch (error) {
+        await rollbackIncompleteClaim(rootDir, runningPath, pendingPath, candidate.job);
+        throw error;
+      }
     } finally {
       await rm(claimLockPath, { recursive: true, force: true });
     }
@@ -352,7 +358,6 @@ async function recoverStaleFileJobs<T extends FileJobRecord>(
   runningTimeoutMs = 0,
   canRecoverRunningJob?: (job: T) => boolean | Promise<boolean>,
 ) {
-  if (!runningTimeoutMs) return;
   const runningDir = stateDir(rootDir, namespace, "running");
   const entries = (await readdir(runningDir, { withFileTypes: true }))
     .filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
@@ -371,23 +376,58 @@ async function recoverStaleFileJobs<T extends FileJobRecord>(
         await renameWithRetry(runningPath, path.join(stateDir(rootDir, namespace, job.status), entry.name));
         continue;
       }
+      const hasValidRunningLease = job.status === "running" && Boolean(job.leaseId);
+      if (!hasValidRunningLease) {
+        const recovered = buildRecoveredPendingJob(job);
+        await writeJobFile(rootDir, runningPath, recovered);
+        await renameWithRetry(runningPath, path.join(stateDir(rootDir, namespace, "pending"), entry.name));
+        continue;
+      }
+      if (!runningTimeoutMs) continue;
       const heartbeatAt = Date.parse(job.heartbeatAt || job.startedAt || job.updatedAt);
       if (!Number.isFinite(heartbeatAt) || Date.now() - heartbeatAt < runningTimeoutMs) continue;
       if (canRecoverRunningJob && !(await canRecoverRunningJob(job))) continue;
-      const recovered = {
-        ...job,
-        status: "pending" as const,
-        leaseId: null,
-        workerId: null,
-        heartbeatAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      } as T;
+      const recovered = buildRecoveredPendingJob(job);
       await writeJobFile(rootDir, runningPath, recovered);
       await renameWithRetry(runningPath, path.join(stateDir(rootDir, namespace, "pending"), entry.name));
     } finally {
       await release();
     }
   }
+}
+
+async function rollbackIncompleteClaim<T extends FileJobRecord>(
+  rootDir: string,
+  runningPath: string,
+  pendingPath: string,
+  originalJob: T,
+) {
+  let resetError: unknown;
+  try {
+    await writeJobFile(rootDir, runningPath, buildRecoveredPendingJob(originalJob));
+  } catch (error) {
+    resetError = error;
+  }
+  try {
+    await renameWithRetry(runningPath, pendingPath);
+  } catch (error) {
+    throw new FileJobStorageError("Could not roll an incomplete file job claim back to pending", { cause: error });
+  }
+  if (resetError) {
+    // The pending file is still reclaimable: the next successful claim rewrites its full lease state.
+  }
+}
+
+function buildRecoveredPendingJob<T extends FileJobRecord>(job: T) {
+  return {
+    ...job,
+    status: "pending" as const,
+    leaseId: null,
+    workerId: null,
+    heartbeatAt: new Date().toISOString(),
+    startedAt: undefined,
+    updatedAt: new Date().toISOString(),
+  } as T;
 }
 
 async function recoverStaleClaimLocks(rootDir: string, namespace: string, staleMs = 60_000) {
@@ -451,6 +491,11 @@ async function readJobFile<T>(target: string) {
   return JSON.parse(await readFile(target, "utf8")) as T;
 }
 
-async function writeJobFile(rootDir: string, target: string, job: unknown) {
-  await atomicReplaceJson(target, job, { rootDir });
+async function writeJobFile(
+  rootDir: string,
+  target: string,
+  job: unknown,
+  options: Omit<AtomicReplaceJsonOptions, "rootDir"> = {},
+) {
+  await atomicReplaceJson(target, job, { rootDir, ...options });
 }

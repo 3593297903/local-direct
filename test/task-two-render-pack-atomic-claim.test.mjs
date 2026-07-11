@@ -121,6 +121,99 @@ test("a recovered file job rejects completion from the stale fenced lease", asyn
   }
 });
 
+test("a claim lease write EPERM rolls the moved job back so exactly one later claim can execute it", async () => {
+  const rootDir = path.join(os.tmpdir(), `localdirector-claim-rollback-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const namespace = ".tmp-claim-rollback-test";
+  const now = new Date().toISOString();
+  try {
+    await putPendingFileJob(rootDir, namespace, {
+      id: "rollback-job",
+      status: "pending",
+      leaseId: null,
+      workerId: null,
+      attempt: 0,
+      fencingToken: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await assert.rejects(
+      () => claimNextFileJob(rootDir, namespace, {
+        workerId: "worker-failing-lease-write",
+        claimLeaseWriteOptions: {
+          retryDelaysMs: [0],
+          renameImpl: async () => {
+            const error = new Error("simulated sharing violation");
+            error.code = "EPERM";
+            throw error;
+          },
+        },
+      }),
+      (error) => error?.code === "JOB_STORAGE_BUSY",
+    );
+
+    const pendingPath = path.join(rootDir, namespace, "pending", "rollback-job.json");
+    const runningPath = path.join(rootDir, namespace, "running", "rollback-job.json");
+    assert.equal(existsSync(pendingPath), true);
+    assert.equal(existsSync(runningPath), false);
+
+    const laterClaims = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+      claimNextFileJob(rootDir, namespace, { workerId: `worker-retry-${index}` })));
+    const executableClaims = laterClaims.filter(Boolean);
+    assert.equal(executableClaims.length, 1);
+    assert.equal(executableClaims[0].id, "rollback-job");
+    assert.equal(executableClaims[0].attempt, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("malformed jobs in running recover regardless of timeout or global worker health", async () => {
+  const cases = [
+    { namespace: ".tmp-invalid-running-status", status: "pending", leaseId: null },
+    { namespace: ".tmp-invalid-running-lease", status: "running", leaseId: null },
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const rootDir = path.join(os.tmpdir(), `localdirector-invalid-running-${index}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const now = new Date().toISOString();
+    try {
+      const id = `invalid-running-${index}`;
+      await putPendingFileJob(rootDir, scenario.namespace, {
+        id,
+        status: "pending",
+        leaseId: null,
+        workerId: null,
+        attempt: 0,
+        fencingToken: 0,
+        createdAt: now,
+        updatedAt: now,
+      });
+      const pendingPath = path.join(rootDir, scenario.namespace, "pending", `${id}.json`);
+      const runningPath = path.join(rootDir, scenario.namespace, "running", `${id}.json`);
+      const malformed = JSON.parse(readFileSync(pendingPath, "utf8"));
+      writeFileSync(pendingPath, JSON.stringify({
+        ...malformed,
+        status: scenario.status,
+        leaseId: scenario.leaseId,
+        workerId: "healthy-global-worker",
+        heartbeatAt: now,
+      }, null, 2));
+      renameSync(pendingPath, runningPath);
+
+      const reclaimed = await claimNextFileJob(rootDir, scenario.namespace, {
+        workerId: "worker-reclaimer",
+        runningTimeoutMs: 60 * 60_000,
+        canRecoverRunningJob: () => false,
+      });
+      assert.equal(reclaimed?.id, id);
+      assert.equal(reclaimed?.status, "running");
+      assert.ok(reclaimed?.leaseId);
+      assert.equal(reclaimed?.attempt, 1);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("legacy running Render Pack jobs migrate to failed without automatic re-execution", async () => {
   const rootDir = path.join(os.tmpdir(), `localdirector-render-legacy-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   try {

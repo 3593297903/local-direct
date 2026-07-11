@@ -92,3 +92,40 @@ test("worker fleet lock rejects a reused Windows pid with a different start time
     rmSync(rootDir, { recursive: true, force: true });
   }
 });
+
+test("each Codex worker class admits only one live instance", async () => {
+  const { acquireWorkerFleetLock } = await import("../scripts/worker-singleton-lock.mjs");
+  const rootDir = path.join(os.tmpdir(), `localdirector-worker-classes-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const workerNames = [
+    "season-pack-worker",
+    "video-prompt-worker",
+    "event-coverage-worker",
+    "prompt-safety-worker",
+    "storyboard-worker",
+    "visual-asset-worker",
+    "video-prompt-pack-worker",
+    "batch-segment-repair-worker",
+  ];
+  try {
+    for (const [index, workerName] of workerNames.entries()) {
+      const first = await acquireWorkerFleetLock(workerName, {
+        rootDir,
+        pid: 2_000 + index,
+        startTime: 20_000 + index,
+        isProcessAlive: () => true,
+      });
+      const duplicate = await acquireWorkerFleetLock(workerName, {
+        rootDir,
+        pid: 3_000 + index,
+        startTime: 30_000 + index,
+        isProcessAlive: () => true,
+      });
+      assert.equal(first.acquired, true, workerName);
+      assert.equal(duplicate.acquired, false, workerName);
+      assert.equal(duplicate.owner.leaseId, first.owner.leaseId, workerName);
+      await first.release();
+    }
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
