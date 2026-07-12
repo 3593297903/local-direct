@@ -104,8 +104,74 @@ export function createInitialSegmentStates(
   ));
 }
 
+function isPersistedSaveStatus(status: SegmentSaveStatus) {
+  return status === "saved" || status === "review_saved";
+}
+
+export function isLegalSegmentStateEvent(state: SegmentStateRecord, event: SegmentStateEvent) {
+  switch (event.type) {
+    case "RENDER_STARTED":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && ["pending", "rendered", "settled"].includes(state.generationStatus);
+    case "RENDER_SUCCEEDED":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && ["pending", "rendering", "rendered"].includes(state.generationStatus);
+    case "QUALITY_PASSED":
+    case "QUALITY_NEEDS_REVIEW":
+    case "QUALITY_BLOCKED":
+      return Boolean(state.resultHash)
+        && ["rendered", "repair_detached", "settled"].includes(state.generationStatus);
+    case "REPAIR_QUEUED":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && !["repair_pending", "repair_running"].includes(state.generationStatus);
+    case "REPAIR_STARTED":
+      return state.generationStatus === "repair_pending" || state.generationStatus === "repair_detached";
+    case "REPAIR_DETACHED":
+      return state.generationStatus === "repair_running"
+        && (!state.activeRepairJobId || state.activeRepairJobId === event.jobId);
+    case "REPAIR_COMPLETED":
+      return ["repair_pending", "repair_running", "repair_detached"].includes(state.generationStatus)
+        && Boolean(state.activeRepairJobId)
+        && state.activeRepairJobId === event.jobId;
+    case "REPAIR_FAILED":
+      return ["repair_pending", "repair_running", "repair_detached"].includes(state.generationStatus)
+        && (!event.jobId || !state.activeRepairJobId || state.activeRepairJobId === event.jobId);
+    case "CACHE_READY":
+      return Boolean(state.resultHash)
+        && state.qualityStatus !== "unknown"
+        && !isPersistedSaveStatus(state.saveStatus);
+    case "SAVE_STARTED":
+      return state.saveStatus === "cached";
+    case "SAVE_SUCCEEDED":
+      return Boolean(state.resultHash)
+        && state.qualityStatus !== "unknown"
+        && (state.saveStatus === "saving" || state.saveStatus === "cached" || state.saveStatus === "not_ready");
+    case "SAVE_FAILED":
+      return state.saveStatus === "saving";
+    case "SAVE_RESUMED":
+      return state.saveStatus === "save_failed";
+    case "LATE_PATCH_AVAILABLE":
+      return isPersistedSaveStatus(state.saveStatus)
+        && (!state.activeRepairJobId || state.activeRepairJobId === event.jobId);
+    case "PROGRESS_UPDATED":
+    case "MESSAGE_UPDATED":
+      return true;
+  }
+}
+
+function reportIllegalSegmentStateEvent(state: SegmentStateRecord, event: SegmentStateEvent) {
+  if (process.env.NODE_ENV === "production") return;
+  console.warn(
+    `[segment-state] ignored illegal ${event.type} for segment ${state.index} at revision ${state.revision}`,
+  );
+}
+
 export function reduceSegmentState(state: SegmentStateRecord, event: SegmentStateEvent): SegmentStateRecord {
   if (event.baseRevision !== undefined && event.baseRevision !== state.revision) return state;
+  if (!isLegalSegmentStateEvent(state, event)) {
+    reportIllegalSegmentStateEvent(state, event);
+    return state;
+  }
   const next: SegmentStateRecord = {
     ...state,
     revision: state.revision + 1,
@@ -187,7 +253,7 @@ export function reduceSegmentState(state: SegmentStateRecord, event: SegmentStat
         message: event.message,
       };
     case "SAVE_RESUMED":
-      return { ...next, saveStatus: "cached", lastErrorCode: undefined };
+      return { ...next, saveStatus: "cached", lastErrorCode: undefined, message: undefined };
     case "LATE_PATCH_AVAILABLE":
       return { ...next, latePatchAvailable: true, activeRepairJobId: event.jobId };
     case "PROGRESS_UPDATED":
@@ -296,6 +362,10 @@ export function createResumableBatchSaveController<T>(input: {
     if (entry.status === "saved" || entry.status === "review_saved") return;
     entry.payload = payload;
     entry.review = Boolean(options.review);
+    if (entry.status === "save_failed") {
+      emit(entry);
+      return;
+    }
     entry.status = "cached";
     entry.lastResult = undefined;
     emit(entry);

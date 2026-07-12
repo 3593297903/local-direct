@@ -10,6 +10,9 @@ const {
   analyzePromptSafetyTree,
   classifyPromptSafetyPath,
 } = require("../lib/prompt-safety-policy.ts");
+const {
+  applyDeterministicQualityPatchWithDiff,
+} = require("../lib/batch-segment-quality-gate.ts");
 
 const pathCases = [
   ["storyboard[0].visual", "EXECUTABLE_VISUAL"],
@@ -219,6 +222,48 @@ test("metadata and archive fields stay byte-for-byte unchanged after local safet
   assert.deepEqual(result.value.storyboard[0].shotPurpose, input.storyboard[0].shotPurpose);
   assert.deepEqual(result.value.workflow.concisePrompt, input.workflow.concisePrompt);
   assert.deepEqual(result.value.workflow.filmScript, input.workflow.filmScript);
+});
+
+test("deterministic quality patch never rewrites metadata or archive paths", () => {
+  const input = {
+    optimizedScript: "single-segment AnalysisResult 调试摘要",
+    workflow: {
+      concisePrompt: "single-segment AnalysisResult 归档摘要",
+    },
+    storyboard: [{
+      shotPurpose: "交代线索",
+      videoPrompt: "镜头缓慢推近桌面的聊天记录。",
+    }],
+  };
+  const result = applyDeterministicQualityPatchWithDiff(input, [
+    {
+      code: "field_below_target",
+      severity: "patchable",
+      path: "storyboard[0].shotPurpose",
+      affectedPaths: ["storyboard[0].shotPurpose"],
+      message: "镜头目的偏短",
+    },
+    {
+      code: "internal_token",
+      severity: "patchable",
+      path: "workflow.concisePrompt",
+      affectedPaths: ["workflow.concisePrompt"],
+      message: "归档字段包含内部标识",
+    },
+    {
+      code: "field_below_target",
+      severity: "patchable",
+      path: "storyboard[0].videoPrompt",
+      affectedPaths: ["storyboard[0].videoPrompt"],
+      message: "视频提示词偏短",
+    },
+  ]);
+
+  assert.equal(result.result.optimizedScript, input.optimizedScript);
+  assert.equal(result.result.workflow.concisePrompt, input.workflow.concisePrompt);
+  assert.equal(result.result.storyboard[0].shotPurpose, input.storyboard[0].shotPurpose);
+  assert.notEqual(result.result.storyboard[0].videoPrompt, input.storyboard[0].videoPrompt);
+  assert.deepEqual(result.patchDiffs.map((diff) => diff.path), ["storyboard[0].videoPrompt"]);
 });
 
 test("twenty-segment redacted replay keeps negated facts and negative lists out of Codex repair", () => {

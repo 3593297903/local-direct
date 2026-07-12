@@ -6,7 +6,11 @@ process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({ module: "commonjs", modu
 const require = createRequire(import.meta.url);
 require("ts-node/register/transpile-only");
 
-const { decideLateRepairMerge } = require("../lib/batch-repair-scheduler.ts");
+const {
+  createBatchInvocationLedger,
+  decideLateRepairMerge,
+  shouldContinueDetachedRepairObservation,
+} = require("../lib/batch-repair-scheduler.ts");
 
 test("completed matching repair merges once before save", () => {
   const decision = decideLateRepairMerge({
@@ -76,5 +80,23 @@ test("a detached repair completed at minute twenty merges the original job", () 
     saveStatus: "cached",
   });
   assert.equal(decision.action, "merge");
+});
+
+test("detached repair observation remains active at minute twenty and stops after the final deadline", () => {
+  const detachedAt = 1_000;
+  assert.equal(shouldContinueDetachedRepairObservation({ detachedAt, now: detachedAt + 12 * 60_000 }), true);
+  assert.equal(shouldContinueDetachedRepairObservation({ detachedAt, now: detachedAt + 20 * 60_000 }), true);
+  assert.equal(shouldContinueDetachedRepairObservation({ detachedAt, now: detachedAt + 31 * 60_000 }), false);
+});
+
+test("invocation ledger restores without adding model calls", () => {
+  const original = createBatchInvocationLedger();
+  original.record("renderPackCalls", { count: 5 });
+  original.record("judgeCalls", { count: 1 });
+  const restored = createBatchInvocationLedger(original.summary().events);
+  assert.equal(restored.summary().renderPackCalls, 5);
+  assert.equal(restored.summary().judgeCalls, 1);
+  assert.equal(restored.summary().singleRegenerationCalls, 0);
+  assert.equal(restored.summary().pathPatchJobCreated, 0);
 });
 

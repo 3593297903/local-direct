@@ -238,21 +238,51 @@ export function classifyPromptSafetyPath(path: string): PromptSafetyPathClass {
   const normalized = String(path || "").replace(/^result\./, "").replace(/\.value$/, "");
   if (/(^|\.)(fullNegativePrompt|negativePrompt)$/.test(normalized)) return "NEGATIVE_CONSTRAINT";
   if (/^storyboard\[\d+\]\.(sound|dialogue)$/.test(normalized)) return "EXECUTABLE_AUDIO_TEXT";
-  if (/^storyboard\[\d+\]\.(scene|visual|shotType|composition|cameraMovement|lighting|emotion|transition|shotPurpose|firstFramePrompt|videoPrompt|lastFramePrompt)$/.test(normalized)) {
+  if (/^storyboard\[\d+\]\.(scene|visual|shotType|composition|cameraMovement|lighting|emotion|transition|firstFramePrompt|videoPrompt|lastFramePrompt)$/.test(normalized)) {
     return "EXECUTABLE_VISUAL";
   }
-  if (/^workflow\.(fullVideoPrompt|concisePrompt)$/.test(normalized)) return "CANONICAL_EXECUTABLE";
-  if (/^workflow\.(screenplay|filmScript)$/.test(normalized)) return "ARCHIVE_DERIVED";
+  if (/^workflow\.fullVideoPrompt$/.test(normalized)) return "CANONICAL_EXECUTABLE";
+  if (/^workflow\.(screenplay|filmScript|concisePrompt)$/.test(normalized)) return "ARCHIVE_DERIVED";
   return "NARRATIVE_METADATA";
 }
 
-function clauseAroundMatch(text: string, index: number) {
-  const boundaries = /[\n\r。！？；]/;
-  let start = index;
-  let end = index;
-  while (start > 0 && !boundaries.test(text[start - 1])) start -= 1;
-  while (end < text.length && !boundaries.test(text[end])) end += 1;
-  return text.slice(start, end).trim();
+type PromptSafetyClause = {
+  start: number;
+  end: number;
+  text: string;
+  prefix: string;
+};
+
+const PROMPT_SAFETY_SCOPE_BOUNDARY = /[\n\r。！？；]|但是|然而|不过|随后|却|但/gu;
+const PROMPT_SAFETY_AFFIRMATIVE_ACTION = /(?:镜头|画面)(?:展示|呈现|聚焦|推近|特写|清晰呈现)|(?:展示|聚焦|拍摄|刻画|清晰呈现)/u;
+
+function clauseAroundMatch(text: string, index: number): PromptSafetyClause {
+  let start = 0;
+  let end = text.length;
+  PROMPT_SAFETY_SCOPE_BOUNDARY.lastIndex = 0;
+  for (const boundary of text.matchAll(PROMPT_SAFETY_SCOPE_BOUNDARY)) {
+    const boundaryStart = boundary.index || 0;
+    const boundaryEnd = boundaryStart + boundary[0].length;
+    if (boundaryEnd <= index) {
+      start = boundaryEnd;
+      continue;
+    }
+    if (boundaryStart > index) {
+      end = boundaryStart;
+      break;
+    }
+  }
+  const raw = text.slice(start, end);
+  const leadingWhitespace = raw.length - raw.trimStart().length;
+  const trailingWhitespace = raw.length - raw.trimEnd().length;
+  const normalizedStart = start + leadingWhitespace;
+  const normalizedEnd = Math.max(normalizedStart, end - trailingWhitespace);
+  return {
+    start: normalizedStart,
+    end: normalizedEnd,
+    text: text.slice(normalizedStart, normalizedEnd),
+    prefix: text.slice(normalizedStart, Math.max(normalizedStart, index)),
+  };
 }
 
 function classifyPromptSafetyPolarity(
@@ -260,12 +290,13 @@ function classifyPromptSafetyPolarity(
   index: number,
   pathClass: PromptSafetyPathClass,
 ): PromptSafetyPolarity {
-  if (pathClass === "NEGATIVE_CONSTRAINT") return "negative_constraint";
   const clause = clauseAroundMatch(text, index);
-  const localPrefix = clause.slice(0, Math.max(0, index - Math.max(0, text.lastIndexOf(clause))));
-  const nearby = `${localPrefix}${clause}`.slice(-32);
-  if (NEGATIVE_CONSTRAINT_PATTERN.test(nearby)) return "negative_constraint";
-  if (NEGATED_FACT_PATTERN.test(nearby)) return "negated_fact";
+  const prefix = clause.prefix;
+  if (NEGATED_FACT_PATTERN.test(prefix)) return "negated_fact";
+  if (NEGATIVE_CONSTRAINT_PATTERN.test(prefix)) return "negative_constraint";
+  if (pathClass === "NEGATIVE_CONSTRAINT") {
+    return PROMPT_SAFETY_AFFIRMATIVE_ACTION.test(prefix) ? "affirmative" : "negative_constraint";
+  }
   return "affirmative";
 }
 
@@ -334,7 +365,9 @@ function analyzeStringSafety(
         : effective.replacement;
       const severity = decisionSeverityForMatch(rule, pathClass, polarity, replacement);
       const clause = clauseAroundMatch(text, matchIndex);
-      const normalizedClause = normalizeSemanticClause(clause, match[0], polarity);
+      const pathCanBePatched = pathClass !== "NARRATIVE_METADATA" && pathClass !== "ARCHIVE_DERIVED";
+      const patchReplacement = pathCanBePatched ? replacement : undefined;
+      const normalizedClause = normalizeSemanticClause(clause.text, match[0], polarity);
       const semanticGroup = `${rule.id}:${polarity === "affirmative" ? "affirmative" : "negative"}`;
       const fingerprint = stableSafetyHash([
         context.segmentIndex || 0,
@@ -348,7 +381,7 @@ function analyzeStringSafety(
         severity,
         policySeverity: rule.severity,
         match: match[0],
-        replacement,
+        replacement: patchReplacement,
         reason: effective.reason,
         normalizedClause,
         semanticGroup,
@@ -358,13 +391,13 @@ function analyzeStringSafety(
         path,
         requiresCodexRepair: severity === "blocking",
       });
-      if (replacement) {
+      if (patchReplacement) {
         diffs.push({
           path,
           ruleId: rule.id,
           severity: rule.severity,
           before: text,
-          after: text.replace(rule.pattern, replacement),
+          after: text.replace(rule.pattern, patchReplacement),
           phase: context.phase,
           reason: effective.reason,
         });
@@ -373,6 +406,8 @@ function analyzeStringSafety(
     if (matches.some((match) => {
       const polarity = classifyPromptSafetyPolarity(text, match.index || 0, classifyPromptSafetyPath(path));
       const effective = effectivePolicyForMatch(rule, text, match.index || 0, { ...context, path });
+      const pathClass = classifyPromptSafetyPath(path);
+      if (pathClass === "NARRATIVE_METADATA" || pathClass === "ARCHIVE_DERIVED") return false;
       return Boolean(polarity === "negative_constraint" ? rule.negativePromptReplacement || effective.replacement : effective.replacement);
     })) {
       rule.pattern.lastIndex = 0;
@@ -445,19 +480,15 @@ export function analyzePromptSafetyTree<T>(
   return { value: nextValue, findings, diffs, highestRisk };
 }
 
-function hasNegativeInstructionContext(text: string, index: number) {
-  const before = text.slice(Math.max(0, index - 12), index);
-  const after = text.slice(index, Math.min(text.length, index + 20));
-  return /\u4e0d\u8981|\u907f\u514d|\u7981\u6b62|\u4e0d\u5c55\u793a|\u4e0d\u51fa\u73b0|\u53bb\u9664|\u65e0|\u675c\u7edd/.test(`${before}${after}`);
-}
-
 function effectivePolicyForMatch(
   rule: PromptSafetyRule,
   text: string,
   index: number,
   context: PromptSafetyContext,
 ) {
-  if (isNegativePromptContext(context) && rule.negativePromptReplacement && hasNegativeInstructionContext(text, index)) {
+  const pathClass = classifyPromptSafetyPath(context.path || context.field || "");
+  const polarity = classifyPromptSafetyPolarity(text, index, pathClass);
+  if (isNegativePromptContext(context) && rule.negativePromptReplacement && polarity === "negative_constraint") {
     return {
       severity: "medium" as PromptSafetyPolicySeverity,
       replacement: rule.negativePromptReplacement,

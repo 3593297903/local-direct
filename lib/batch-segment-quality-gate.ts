@@ -786,6 +786,12 @@ function shotIndexFromPath(path: string) {
   return { index: Number(match[1]), field: match[2] };
 }
 
+function isImmutableNarrativeOrArchivePath(path: string) {
+  return path === "optimizedScript"
+    || /^storyboard\[\d+\]\.shotPurpose$/.test(path)
+    || /^workflow\.(sourceAnalysis|diagnosis|editingNotes|filmScript|screenplay|concisePrompt)$/.test(path);
+}
+
 function buildWorkflowPromptFallback(result: AnalysisResult) {
   const workflow = (result.workflow || {}) as NonNullable<AnalysisResult["workflow"]>;
   const storyboard = Array.isArray(result.storyboard) ? result.storyboard : [];
@@ -857,6 +863,7 @@ export function applyDeterministicQualityPatchWithDiff<T extends AnalysisResult>
     for (const candidatePath of candidatePaths) {
       const path = normalizePatchPath(candidatePath);
       if (!path || seenPaths.has(path)) continue;
+      if (isImmutableNarrativeOrArchivePath(path)) continue;
       seenPaths.add(path);
 
       const before = getValueAtPath(patched, path);

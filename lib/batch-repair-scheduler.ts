@@ -173,8 +173,8 @@ export type BatchInvocationLedgerEvent = {
   fingerprint?: string;
 };
 
-export function createBatchInvocationLedger() {
-  const events: BatchInvocationLedgerEvent[] = [];
+export function createBatchInvocationLedger(initialEvents: readonly BatchInvocationLedgerEvent[] = []) {
+  const events: BatchInvocationLedgerEvent[] = initialEvents.map((event) => ({ ...event }));
   function record(
     name: BatchInvocationMetricName,
     input: Omit<BatchInvocationLedgerEvent, "name" | "at" | "count"> & { at?: number; count?: number } = {},
@@ -193,5 +193,22 @@ export function createBatchInvocationLedger() {
     for (const event of events) counts[event.name] += event.count;
     return { ...counts, events: events.map((event) => ({ ...event })) };
   }
-  return { record, summary };
+  function restore(restoredEvents: readonly BatchInvocationLedgerEvent[]) {
+    events.splice(0, events.length, ...restoredEvents.map((event) => ({ ...event })));
+  }
+  return { record, summary, restore };
+}
+
+export const REPAIR_FINAL_OBSERVATION_TIMEOUT_MS = 30 * 60_000;
+
+export function shouldContinueDetachedRepairObservation(input: {
+  detachedAt: number;
+  now: number;
+  finalObservationTimeoutMs?: number;
+}) {
+  const timeoutMs = Math.max(
+    REPAIR_FRONTEND_WAIT_TIMEOUT_MS,
+    input.finalObservationTimeoutMs || REPAIR_FINAL_OBSERVATION_TIMEOUT_MS,
+  );
+  return input.now - input.detachedAt < timeoutMs;
 }

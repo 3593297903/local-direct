@@ -1,6 +1,7 @@
 import type { BatchSegmentQualityGate, QualityPatchDiff } from "./batch-segment-quality-gate";
 import type { CoverageDecision } from "./batch-event-coverage";
 import { detectPromptSafetyRisk } from "./prompt-safety-policy";
+import type { SegmentStateRecord } from "./batch-segment-progress";
 
 export type SegmentQualityStatus = "rendered" | "repaired" | "cached" | "saved" | "needs_review" | "failed";
 
@@ -228,6 +229,17 @@ export function updateSegmentQualityReportStatus(
     status,
     ...patch,
   };
+}
+
+export function segmentQualityReportStatusFromState(
+  state: SegmentStateRecord,
+  fallback: SegmentQualityStatus = "rendered",
+): SegmentQualityStatus {
+  if (state.qualityStatus === "needs_review" || state.saveStatus === "review_saved") return "needs_review";
+  if (state.qualityStatus === "blocked" && state.generationStatus === "settled") return "failed";
+  if (state.saveStatus === "saved") return "saved";
+  if (["cached", "saving", "save_failed"].includes(state.saveStatus)) return "cached";
+  return fallback;
 }
 
 function formatGateFindingForReport(finding: BatchSegmentQualityGate["findings"][number]) {

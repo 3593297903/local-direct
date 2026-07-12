@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +18,7 @@ const {
 } = require("../lib/batch-segment-progress.ts");
 const {
   migrateSegmentBatchCacheDocument,
+  readSegmentBatchCache,
   writeSegmentBatchCache,
   buildStableBatchContractHash,
   buildSegmentBatchRecoveryKey,
@@ -147,6 +149,36 @@ test("cache v2 rejects a lower revision and preserves the newer document", async
   }
 });
 
+test("cache v2 preserves the invocation ledger without adding calls", async () => {
+  const rootDir = path.join(os.tmpdir(), `task-one-cache-ledger-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const document = {
+    schemaVersion: 2,
+    revision: 1,
+    batchId: "task-one-ledger",
+    durableBatchId: "task-one-ledger",
+    sourceHash: "src",
+    contractHash: "contract",
+    resolvedSegmentCount: 1,
+    updatedAt: new Date().toISOString(),
+    segmentStates: [createInitialSegmentState(1, { updatedAt: 1 })],
+    activeJobIds: [],
+    qualityReports: [],
+    needsReviewSegments: [],
+    segments: [{ episodeIndex: 1, promptText: "完整结果", result: { title: "one" } }],
+    invocationEvents: [
+      { name: "renderPackCalls", at: 10, count: 2 },
+      { name: "judgeCalls", at: 20, count: 1, segmentIndex: 1 },
+    ],
+  };
+  try {
+    await writeSegmentBatchCache(document, { rootDir });
+    const restored = await readSegmentBatchCache(document.batchId, { rootDir });
+    assert.deepEqual(restored.invocationEvents, document.invocationEvents);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("stable batch identity excludes transient season job ids", () => {
   const contracts = [
     { segmentIndex: 2, contractHash: "contract-b" },
@@ -156,20 +188,16 @@ test("stable batch identity excludes transient season job ids", () => {
     buildStableBatchContractHash(contracts),
     buildStableBatchContractHash([...contracts].reverse()),
   );
+  const recoveryIdentity = {
+    projectId: null,
+    sourceHash: "source",
+    mode: "fixed",
+    requestedCount: 20,
+    duration: "auto",
+  };
+  const legacyDigest = createHash("sha256").update(JSON.stringify(recoveryIdentity)).digest("hex");
   assert.equal(
-    buildSegmentBatchRecoveryKey({
-      projectId: null,
-      sourceHash: "source",
-      mode: "fixed",
-      requestedCount: 20,
-      duration: "auto",
-    }),
-    buildSegmentBatchRecoveryKey({
-      projectId: null,
-      sourceHash: "source",
-      mode: "fixed",
-      requestedCount: 20,
-      duration: "auto",
-    }),
+    buildSegmentBatchRecoveryKey(recoveryIdentity),
+    `localdirector:segment-batch-recovery:${legacyDigest}`,
   );
 });

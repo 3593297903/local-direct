@@ -2,6 +2,17 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SegmentStateRecord } from "./batch-segment-progress";
+import type { BatchInvocationLedgerEvent } from "./batch-repair-scheduler";
+export {
+  buildSegmentBatchLeaseOwnerKey,
+  buildSegmentBatchRecoveryKey,
+  buildSegmentBatchRecoveryKeys,
+  buildStableBatchContractHash,
+} from "./segment-batch-cache-identity";
+export type {
+  SegmentBatchRecoveryIdentity,
+  StableBatchContractIdentity,
+} from "./segment-batch-cache-identity";
 
 export type SegmentBatchCacheDocumentV1 = {
   schemaVersion: 1;
@@ -44,6 +55,10 @@ export type SegmentBatchCacheDocumentV2 = {
   repairAttempts?: Array<[string, number]>;
   leaseOwnerId?: string;
   leaseExpiresAt?: string;
+  mode?: "fixed" | "auto";
+  requestedCount?: number | null;
+  duration?: string;
+  invocationEvents?: BatchInvocationLedgerEvent[];
 };
 
 export type SegmentBatchCacheDocument = SegmentBatchCacheDocumentV1 | SegmentBatchCacheDocumentV2;
@@ -116,6 +131,9 @@ function validateCacheDocument(value: SegmentBatchCacheDocument) {
     if (!value.durableBatchId || !Array.isArray(value.activeJobIds) || !Array.isArray(value.segmentStates)) {
       throw new Error("Segment batch cache v2 state is incomplete");
     }
+    if (value.invocationEvents && !Array.isArray(value.invocationEvents)) {
+      throw new Error("Segment batch cache invocation ledger is invalid");
+    }
   }
   return { ...value, batchId };
 }
@@ -161,6 +179,7 @@ export function migrateSegmentBatchCacheDocument(
     durableBatchId: validated.batchId,
     segmentStates,
     activeJobIds: [],
+    invocationEvents: [],
   };
 }
 

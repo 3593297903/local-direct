@@ -7,6 +7,21 @@ const require = createRequire(import.meta.url);
 require("ts-node/register/transpile-only");
 
 const { createResumableBatchSaveController } = require("../lib/batch-segment-progress.ts");
+const { buildSegmentBatchRecoveryKeys } = require("../lib/segment-batch-cache.ts");
+
+test("recovery lookup keeps a project-specific key and a safe new-project fallback", () => {
+  const input = {
+    projectId: "project-1",
+    sourceHash: "source-hash",
+    mode: "fixed",
+    requestedCount: 20,
+    duration: "15s",
+  };
+  const keys = buildSegmentBatchRecoveryKeys(input);
+  assert.equal(keys.length, 2);
+  assert.notEqual(keys[0], keys[1]);
+  assert.deepEqual(buildSegmentBatchRecoveryKeys({ ...input, projectId: null }), [keys[1]]);
+});
 
 test("retryable save failure uses 1/3/8 second schedule and never poisons resume", async () => {
   const attempts = new Map();
@@ -60,13 +75,14 @@ test("non-retryable failure makes one attempt and leaves later segments cached",
 
 test("new segment arrivals cannot reset exhausted save retry budgets", async () => {
   const attempts = new Map();
+  const failingSegments = new Set([1, 10, 20]);
   const controller = createResumableBatchSaveController({
     durableBatchId: "batch-budget",
     segmentCount: 20,
     sleep: async () => {},
     saveSegment: async ({ segmentIndex }) => {
       attempts.set(segmentIndex, (attempts.get(segmentIndex) || 0) + 1);
-      if ([1, 10, 20].includes(segmentIndex)) {
+      if (failingSegments.has(segmentIndex)) {
         return { saved: false, retryable: true, errorCode: "PROJECT_API_UNAVAILABLE", message: "down" };
       }
       return { saved: true, projectId: "p", versionId: `v${segmentIndex}`, versionNumber: segmentIndex };
@@ -86,5 +102,19 @@ test("new segment arrivals cannot reset exhausted save retry budgets", async () 
   assert.equal(controller.snapshot().segments[0].status, "save_failed");
   assert.equal(attempts.has(10), false, "ordered saves remain blocked until explicit resume");
   assert.equal(attempts.has(20), false, "later arrivals do not bypass the failed segment");
+
+  failingSegments.delete(1);
+  await controller.resume();
+  assert.equal(attempts.get(10), 4);
+  controller.cache(10, { revision: 2 });
+  await controller.drain();
+  assert.equal(attempts.get(10), 4, "segment 10 keeps its exhausted budget until explicit resume");
+
+  failingSegments.delete(10);
+  await controller.resume();
+  assert.equal(attempts.get(20), 4);
+  controller.cache(20, { revision: 2 });
+  await controller.drain();
+  assert.equal(attempts.get(20), 4, "segment 20 keeps its exhausted budget until explicit resume");
 });
 

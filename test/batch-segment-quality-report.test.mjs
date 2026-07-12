@@ -13,12 +13,30 @@ require("ts-node/register/transpile-only");
 const {
   createSegmentQualityReport,
   detectSegmentSafetyRisk,
+  segmentQualityReportStatusFromState,
   summarizeSegmentQualityReports,
   updateSegmentQualityReportStatus,
 } = require("../lib/batch-segment-quality-report.ts");
 const {
   evaluateBatchSegmentQuality,
 } = require("../lib/batch-segment-quality-gate.ts");
+
+test("quality report keeps needs_review while saving and after review save", () => {
+  const baseState = {
+    index: 1,
+    generationStatus: "settled",
+    qualityStatus: "needs_review",
+    saveStatus: "saving",
+    revision: 4,
+    saveRetryCount: 0,
+    updatedAt: 1,
+  };
+  assert.equal(segmentQualityReportStatusFromState(baseState, "needs_review"), "needs_review");
+  assert.equal(
+    segmentQualityReportStatusFromState({ ...baseState, saveStatus: "review_saved" }, "needs_review"),
+    "needs_review",
+  );
+});
 
 function makeResult(overrides = {}) {
   const storyboard = overrides.storyboard || [

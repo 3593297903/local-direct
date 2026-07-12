@@ -156,15 +156,17 @@ test("dashboard keeps batch memory source text segment-scoped and avoids single-
 test("dashboard caches rendered segments before ordered project saves", async () => {
   const dashboardSource = await readFile(join(process.cwd(), "components", "DashboardClient.tsx"), "utf8");
 
-  assert.match(dashboardSource, /BATCH_SEGMENT_CACHE_PREFIX/);
+  assert.match(dashboardSource, /buildSegmentBatchRecoveryKey/);
+  assert.match(dashboardSource, /schemaVersion:\s*2/);
   assert.match(dashboardSource, /writeBatchSegmentCache/);
   assert.match(dashboardSource, /\/api\/segment-batch-cache\//);
   assert.match(dashboardSource, /method: "PUT"/);
   assert.match(dashboardSource, /window\.localStorage\.setItem/);
   assert.match(dashboardSource, /cachedCount/);
   assert.match(dashboardSource, /batchCachePersistChain/);
-  assert.match(dashboardSource, /savedSegmentIndexes/);
-  assert.match(dashboardSource, /savedSegmentIndexes\.has\(item\.episodeIndex\)/);
+  assert.match(dashboardSource, /segmentStateRecords/);
+  assert.match(dashboardSource, /saveStatus === "saved"/);
+  assert.doesNotMatch(dashboardSource, /savedSegmentIndexes/);
   assert.match(dashboardSource, /savedCount/);
   assert.match(dashboardSource, /"cached"/);
   assert.match(dashboardSource, /已生成并缓存，等待前序保存/);
