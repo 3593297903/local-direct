@@ -1061,10 +1061,15 @@ function normalizePatchAndEvaluateBatchSegment(
     normalizedResult,
     deterministicPatchFindings,
   );
-  const patchedResult = canonicalizeBatchSegmentResult(patched.result);
-  const finalGate = evaluateBatchSegmentQuality(patchedResult, {
-    ...buildQualityOptions(patchedResult),
-  });
+  const hasDeterministicChanges = patched.patchDiffs.length > 0;
+  const patchedResult = hasDeterministicChanges
+    ? canonicalizeBatchSegmentResult(patched.result)
+    : normalizedResult;
+  const finalGate = hasDeterministicChanges
+    ? evaluateBatchSegmentQuality(patchedResult, {
+        ...buildQualityOptions(patchedResult),
+      })
+    : firstGate;
 
   return {
     result: patchedResult,

@@ -489,7 +489,6 @@ export function evaluateBatchSegmentQuality(
   const fullPromptText = options.fullPromptText !== undefined
     ? cleanText(options.fullPromptText)
     : cleanText(result.workflow?.fullVideoPrompt);
-  const serialized = JSON.stringify(result);
   const safetyAnalysis = analyzePromptSafetyTree(result, {
     phase: "quality",
     segmentIndex: options.segmentIndex || options.contract?.segmentIndex || 0,

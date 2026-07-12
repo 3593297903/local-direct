@@ -182,3 +182,12 @@ test("safety rollback cannot disable ordinary deterministic quality patches", ()
   assert.doesNotMatch(body, /TASK_ONE_SAFETY_ENABLED\s*\?\s*applyDeterministicQualityPatchWithDiff/);
 });
 
+test("clean deterministic results reuse the first quality gate instead of rescanning", () => {
+  const start = source.indexOf("function normalizePatchAndEvaluateBatchSegment");
+  const end = source.indexOf("function normalizePatchAndValidateBatchSegment", start);
+  const body = source.slice(start, end);
+  assert.match(body, /patched\.patchDiffs\.length\s*>\s*0/);
+  assert.match(body, /hasDeterministicChanges\s*\?\s*evaluateBatchSegmentQuality/);
+  assert.match(body, /:\s*firstGate/);
+});
+
