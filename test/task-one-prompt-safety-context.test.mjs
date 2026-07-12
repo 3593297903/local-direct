@@ -177,6 +177,50 @@ test("mixed affirmative and negative clauses keep the concrete corpse blocking",
   assert.equal(bloodPool?.polarity, "negative_constraint");
 });
 
+test("a negated fact before a comma cannot hide a later affirmative corpse shot", () => {
+  const result = analyzePromptSafetyTree({
+    storyboard: [{
+      videoPrompt: "未发现性侵迹象，镜头展示尸体面部细节。",
+    }],
+  }, { phase: "quality", segmentIndex: 1 });
+
+  const sexualViolence = result.findings.find((item) => item.ruleId === "sexual_violence");
+  const corpse = result.findings.find((item) => item.ruleId === "corpse");
+
+  assert.equal(sexualViolence?.polarity, "negated_fact");
+  assert.equal(sexualViolence?.requiresCodexRepair, false);
+  assert.equal(corpse?.polarity, "affirmative");
+  assert.equal(corpse?.severity, "blocking");
+  assert.equal(corpse?.requiresCodexRepair, true);
+});
+
+test("a negative constraint before a comma cannot hide a later affirmative corpse shot", () => {
+  const result = analyzePromptSafetyTree({
+    storyboard: [{
+      videoPrompt: "不要出现血泊，镜头展示尸体面部细节。",
+    }],
+  }, { phase: "quality", segmentIndex: 2 });
+
+  const blood = result.findings.find((item) => item.ruleId === "blood_pool");
+  const corpse = result.findings.find((item) => item.ruleId === "corpse");
+
+  assert.equal(blood?.polarity, "negative_constraint");
+  assert.notEqual(blood?.severity, "blocking");
+  assert.equal(corpse?.polarity, "affirmative");
+  assert.equal(corpse?.severity, "blocking");
+});
+
+test("comma-separated items remain negative inside a negativePrompt field", () => {
+  const result = analyzePromptSafetyTree({
+    storyboard: [{
+      negativePrompt: "不要出现血泊，避免尸体特写。",
+    }],
+  }, { phase: "quality", segmentIndex: 3 });
+
+  assert.equal(result.findings.some((item) => item.severity === "blocking"), false);
+  assert.equal(result.findings.every((item) => item.requiresCodexRepair === false), true);
+});
+
 test("negation after a matched concept never changes the earlier affirmative polarity", () => {
   const result = analyzePromptSafetyTree({
     storyboard: [{ videoPrompt: "尸体面部细节清晰呈现，随后说明不要采用这种构图。" }],

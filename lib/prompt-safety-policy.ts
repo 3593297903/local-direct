@@ -253,7 +253,7 @@ type PromptSafetyClause = {
   prefix: string;
 };
 
-const PROMPT_SAFETY_SCOPE_BOUNDARY = /[\n\r。！？；]|但是|然而|不过|随后|却|但/gu;
+const PROMPT_SAFETY_SCOPE_BOUNDARY = /[\n\r。！？；，,]|但是|然而|不过|随后|却|但/gu;
 const PROMPT_SAFETY_AFFIRMATIVE_ACTION = /(?:镜头|画面)(?:展示|呈现|聚焦|推近|特写|清晰呈现)|(?:展示|聚焦|拍摄|刻画|清晰呈现)/u;
 
 function clauseAroundMatch(text: string, index: number): PromptSafetyClause {
