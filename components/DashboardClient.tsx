@@ -37,10 +37,15 @@ import {
   REPAIR_FRONTEND_WAIT_TIMEOUT_MS,
 } from "@/lib/batch-repair-scheduler";
 import {
+  SEGMENT_BATCH_RECOVERY_REGISTRY_KEY,
   buildSegmentBatchLeaseOwnerKey,
   buildSegmentBatchRecoveryKey,
   buildSegmentBatchRecoveryKeys,
   buildStableBatchContractHash,
+  parseSegmentBatchRecoveryRegistry,
+  removeSegmentBatchRecoveryPointer,
+  upsertSegmentBatchRecoveryPointer,
+  type SegmentBatchRecoveryPointer,
 } from "@/lib/segment-batch-cache-identity";
 import type { SegmentBatchCacheDocumentV2 } from "@/lib/segment-batch-cache";
 import {
@@ -112,7 +117,36 @@ type BatchSaveRecoveryDescriptor = {
   recoveryKey: string;
   durableBatchId: string;
   sourceHash: string;
+  projectId?: string | null;
+  fromRegistry?: boolean;
 };
+
+function readBatchRecoveryRegistry() {
+  if (typeof window === "undefined") return [];
+  return parseSegmentBatchRecoveryRegistry(
+    window.localStorage.getItem(SEGMENT_BATCH_RECOVERY_REGISTRY_KEY),
+  );
+}
+
+function writeBatchRecoveryRegistry(registry: readonly SegmentBatchRecoveryPointer[]) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(
+    SEGMENT_BATCH_RECOVERY_REGISTRY_KEY,
+    JSON.stringify(registry),
+  );
+}
+
+function rememberBatchRecoveryPointer(pointer: SegmentBatchRecoveryPointer) {
+  writeBatchRecoveryRegistry(
+    upsertSegmentBatchRecoveryPointer(readBatchRecoveryRegistry(), pointer),
+  );
+}
+
+function forgetBatchRecoveryPointer(durableBatchId: string) {
+  writeBatchRecoveryRegistry(
+    removeSegmentBatchRecoveryPointer(readBatchRecoveryRegistry(), durableBatchId),
+  );
+}
 
 type CachedRenderedEpisode = {
   episodeIndex?: number;
@@ -1194,60 +1228,112 @@ export function DashboardClient() {
   }, []);
 
   useEffect(() => {
-    if (!TASK_ONE_CACHE_RECOVERY_ENABLED || batchGenerating || !script.trim()) {
+    if (!TASK_ONE_CACHE_RECOVERY_ENABLED || batchGenerating) {
       if (!batchGenerating) setBatchSaveRecovery(null);
       return;
     }
     let active = true;
-    const sourceHash = buildBatchSegmentResultHash({
-      mode: segmentCountMode,
-      episodeCount,
-      duration: selectedDurationValue(),
-      sourceText: script,
-    });
-    const recoveryKeys = buildSegmentBatchRecoveryKeys({
-      projectId: resumeProjectId || null,
-      sourceHash,
-      mode: segmentCountMode,
-      requestedCount: segmentCountMode === "auto" ? null : episodeCount,
-      duration: selectedDurationValue(),
-    });
+    const registryCandidates = readBatchRecoveryRegistry().map((pointer) => ({
+      recoveryKey: pointer.recoveryKey,
+      durableBatchId: pointer.durableBatchId,
+      sourceHash: pointer.sourceHash,
+      projectId: pointer.projectId,
+      fromRegistry: true as const,
+    }));
+    const legacySourceHash = script.trim()
+      ? buildBatchSegmentResultHash({
+          mode: segmentCountMode,
+          episodeCount,
+          duration: selectedDurationValue(),
+          sourceText: script,
+        })
+      : "";
+    const legacyCandidates = script.trim()
+      ? buildSegmentBatchRecoveryKeys({
+          projectId: resumeProjectId || null,
+          sourceHash: legacySourceHash,
+          mode: segmentCountMode,
+          requestedCount: segmentCountMode === "auto" ? null : episodeCount,
+          duration: selectedDurationValue(),
+        }).map((recoveryKey) => ({
+          recoveryKey,
+          sourceHash: legacySourceHash,
+          projectId: resumeProjectId || null,
+          fromRegistry: false as const,
+        }))
+      : [];
     void (async () => {
       try {
-        for (const recoveryKey of recoveryKeys) {
-          const raw = window.localStorage.getItem(recoveryKey);
-          const index = raw ? JSON.parse(raw) as Record<string, unknown> : null;
-          const durableBatchId = typeof index?.durableBatchId === "string"
-            ? index.durableBatchId
-            : typeof index?.batchId === "string" ? index.batchId : "";
-          if (!durableBatchId || index?.sourceHash !== sourceHash) continue;
-          const response = await fetch(`/api/segment-batch-cache/${encodeURIComponent(durableBatchId)}`, {
-            method: "GET",
-            cache: "no-store",
-          });
+        for (const candidate of [...registryCandidates, ...legacyCandidates]) {
+          let durableBatchId = "durableBatchId" in candidate ? candidate.durableBatchId : "";
+          if (!candidate.fromRegistry) {
+            try {
+              const raw = window.localStorage.getItem(candidate.recoveryKey);
+              const index = raw ? JSON.parse(raw) as Record<string, unknown> : null;
+              durableBatchId = typeof index?.durableBatchId === "string"
+                ? index.durableBatchId
+                : typeof index?.batchId === "string" ? index.batchId : "";
+              if (!durableBatchId || index?.sourceHash !== candidate.sourceHash) continue;
+            } catch (legacyIndexError) {
+              console.warn("Failed to read legacy batch recovery index", legacyIndexError);
+              window.localStorage.removeItem(candidate.recoveryKey);
+              continue;
+            }
+          }
+          let response: Response;
+          try {
+            response = await fetch(`/api/segment-batch-cache/${encodeURIComponent(durableBatchId)}`, {
+              method: "GET",
+              cache: "no-store",
+            });
+          } catch (cacheReadError) {
+            console.warn("Failed to read batch recovery cache", cacheReadError);
+            continue;
+          }
           const data = await response.json().catch(() => null);
-          if (!response.ok || !data?.ok || !data.cache) continue;
+          if (!response.ok) {
+            if ([400, 404, 410].includes(response.status)) {
+              window.localStorage.removeItem(candidate.recoveryKey);
+              forgetBatchRecoveryPointer(durableBatchId);
+            }
+            continue;
+          }
+          if (!data?.ok || !data.cache) {
+            window.localStorage.removeItem(candidate.recoveryKey);
+            forgetBatchRecoveryPointer(durableBatchId);
+            continue;
+          }
           const cache = data.cache as SegmentBatchCacheDocumentV2;
-          const projectMatches = !resumeProjectId || !cache.projectId || cache.projectId === resumeProjectId;
-          const hasUnsavedSegments = cache.schemaVersion === 2
-            && cache.sourceHash === sourceHash
-            && projectMatches
+          const pointerProjectMatches = !candidate.projectId || !cache.projectId || cache.projectId === candidate.projectId;
+          const activeProjectMatches = !resumeProjectId || !cache.projectId || cache.projectId === resumeProjectId;
+          const cacheIdentityMatches = cache.schemaVersion === 2
+            && cache.durableBatchId === durableBatchId
+            && cache.sourceHash === candidate.sourceHash
+            && pointerProjectMatches
+            && activeProjectMatches
+            && Array.isArray(cache.segments);
+          const hasUnsavedSegments = cacheIdentityMatches
             && cache.segmentStates.some((state) => state.saveStatus !== "saved" && state.saveStatus !== "review_saved")
-            && Array.isArray(cache.segments)
             && cache.segments.length > 0;
           if (!active) return;
           if (hasUnsavedSegments) {
-            setBatchSaveRecovery({ recoveryKey, durableBatchId, sourceHash });
+            setBatchSaveRecovery({
+              recoveryKey: candidate.recoveryKey,
+              durableBatchId,
+              sourceHash: candidate.sourceHash,
+              projectId: cache.projectId || candidate.projectId,
+              fromRegistry: candidate.fromRegistry,
+            });
             return;
           }
-          if (cache.schemaVersion === 2 && cache.sourceHash === sourceHash && projectMatches) {
-            window.localStorage.removeItem(recoveryKey);
+          if (cacheIdentityMatches) {
+            window.localStorage.removeItem(candidate.recoveryKey);
+            forgetBatchRecoveryPointer(durableBatchId);
           }
         }
         if (active) setBatchSaveRecovery(null);
       } catch (recoveryIndexError) {
         console.warn("Failed to read batch recovery index", recoveryIndexError);
-        if (active) setBatchSaveRecovery(null);
       }
     })();
     return () => {
@@ -1977,9 +2063,13 @@ export function DashboardClient() {
       });
       const data = await response.json().catch(() => null);
       if (!response.ok || !data?.ok || !data.cache) {
-        window.localStorage.removeItem(descriptor.recoveryKey);
-        setBatchSaveRecovery(null);
-        return false;
+        if ((response.ok && !data?.cache) || [400, 404, 410].includes(response.status)) {
+          window.localStorage.removeItem(descriptor.recoveryKey);
+          forgetBatchRecoveryPointer(descriptor.durableBatchId);
+          setBatchSaveRecovery(null);
+          return false;
+        }
+        throw new Error(data?.error || "分段缓存服务暂时不可用，稍后仍可继续保存。");
       }
       const cache = data.cache as SegmentBatchCacheDocumentV2;
       if (
@@ -1990,6 +2080,7 @@ export function DashboardClient() {
         || !Array.isArray(cache.segments)
       ) {
         window.localStorage.removeItem(descriptor.recoveryKey);
+        forgetBatchRecoveryPointer(descriptor.durableBatchId);
         setBatchSaveRecovery(null);
         return false;
       }
@@ -2003,6 +2094,7 @@ export function DashboardClient() {
       });
       if (!unsaved.length) {
         window.localStorage.removeItem(descriptor.recoveryKey);
+        forgetBatchRecoveryPointer(descriptor.durableBatchId);
         setBatchSaveRecovery(null);
         return false;
       }
@@ -2073,6 +2165,14 @@ export function DashboardClient() {
         for (const recoveryKey of recoveryIndexKeys) {
           window.localStorage.setItem(recoveryKey, recoveryIndex);
         }
+        rememberBatchRecoveryPointer({
+          schemaVersion: 1,
+          durableBatchId: descriptor.durableBatchId,
+          recoveryKey: activeRecoveryKey,
+          sourceHash: descriptor.sourceHash,
+          projectId: activeProjectId || null,
+          updatedAt: cache.updatedAt,
+        });
       };
 
       const publishSaveOnlyProgress = (message: string) => {
@@ -2216,6 +2316,7 @@ export function DashboardClient() {
         if (latestSave.versionId) setResumeVersionId(latestSave.versionId);
       }
       for (const recoveryKey of recoveryIndexKeys) window.localStorage.removeItem(recoveryKey);
+      forgetBatchRecoveryPointer(descriptor.durableBatchId);
       window.sessionStorage.removeItem(leaseStorageKey);
       setBatchSaveRecovery(null);
       publishSaveOnlyProgress(`已仅继续保存 ${completed.length} / ${cache.resolvedSegmentCount} 段，模型调用增量为 0。`);
@@ -2503,6 +2604,7 @@ export function DashboardClient() {
     function clearBatchRecoveryState() {
       if (typeof window === "undefined") return;
       for (const recoveryKey of batchRecoveryIndexKeys) window.localStorage.removeItem(recoveryKey);
+      forgetBatchRecoveryPointer(durableBatchId);
       window.sessionStorage.removeItem(leaseStorageKey);
       setBatchSaveRecovery(null);
     }
@@ -2679,6 +2781,14 @@ export function DashboardClient() {
         for (const recoveryKey of batchRecoveryIndexKeys) {
           window.localStorage.setItem(recoveryKey, recoveryIndex);
         }
+        rememberBatchRecoveryPointer({
+          schemaVersion: 1,
+          durableBatchId,
+          recoveryKey: activeRecoveryKey,
+          sourceHash: batchSourceHash,
+          projectId: batchProjectId,
+          updatedAt,
+        });
       } catch (cacheError) {
         console.warn("Failed to write lightweight batch cache index", cacheError);
       }

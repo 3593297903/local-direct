@@ -8,6 +8,67 @@ require("ts-node/register/transpile-only");
 
 const { createResumableBatchSaveController } = require("../lib/batch-segment-progress.ts");
 const { buildSegmentBatchRecoveryKeys } = require("../lib/segment-batch-cache.ts");
+const {
+  SEGMENT_BATCH_RECOVERY_REGISTRY_KEY,
+  parseSegmentBatchRecoveryRegistry,
+  removeSegmentBatchRecoveryPointer,
+  upsertSegmentBatchRecoveryPointer,
+} = require("../lib/segment-batch-cache-identity.ts");
+
+test("active recovery registry survives refresh without requiring the source script", () => {
+  const pointer = {
+    schemaVersion: 1,
+    durableBatchId: "batch-refresh-20",
+    recoveryKey: "localdirector:segment-batch-recovery:source-specific",
+    sourceHash: "source-hash-20",
+    projectId: null,
+    updatedAt: "2026-07-12T08:00:00.000Z",
+  };
+
+  const stored = JSON.stringify(upsertSegmentBatchRecoveryPointer([], pointer));
+  const restored = parseSegmentBatchRecoveryRegistry(stored);
+
+  assert.equal(SEGMENT_BATCH_RECOVERY_REGISTRY_KEY, "localdirector:segment-batch-recovery-registry:v1");
+  assert.deepEqual(restored, [pointer]);
+});
+
+test("recovery registry deduplicates batches, orders newest first, and caps at ten", () => {
+  let registry = [];
+  for (let index = 0; index < 12; index += 1) {
+    registry = upsertSegmentBatchRecoveryPointer(registry, {
+      schemaVersion: 1,
+      durableBatchId: `batch-${index}`,
+      recoveryKey: `localdirector:segment-batch-recovery:key-${index}`,
+      sourceHash: `source-${index}`,
+      projectId: null,
+      updatedAt: new Date(Date.UTC(2026, 6, 12, 8, index)).toISOString(),
+    });
+  }
+  registry = upsertSegmentBatchRecoveryPointer(registry, {
+    ...registry[5],
+    updatedAt: "2026-07-12T10:00:00.000Z",
+  });
+
+  assert.equal(registry.length, 10);
+  assert.equal(registry[0].updatedAt, "2026-07-12T10:00:00.000Z");
+  assert.equal(new Set(registry.map((item) => item.durableBatchId)).size, 10);
+});
+
+test("terminal cleanup removes only the completed recovery pointer", () => {
+  const registry = ["a", "b"].map((durableBatchId) => ({
+    schemaVersion: 1,
+    durableBatchId,
+    recoveryKey: `localdirector:segment-batch-recovery:${durableBatchId}`,
+    sourceHash: `source-${durableBatchId}`,
+    projectId: null,
+    updatedAt: "2026-07-12T08:00:00.000Z",
+  }));
+
+  assert.deepEqual(
+    removeSegmentBatchRecoveryPointer(registry, "a").map((item) => item.durableBatchId),
+    ["b"],
+  );
+});
 
 test("recovery lookup keeps a project-specific key and a safe new-project fallback", () => {
   const input = {

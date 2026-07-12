@@ -135,3 +135,15 @@ test("automatic planning progress never reads episodes before the season result 
   assert.match(publishBody, /resolvedSegmentCount:\s*resolvedSegmentCount\b|\bresolvedSegmentCount,\s*\n/);
 });
 
+test("refresh recovery discovers active batches before source-dependent fallback", () => {
+  const marker = source.indexOf("Failed to read batch recovery index");
+  const start = source.lastIndexOf("useEffect(() =>", marker);
+  const end = source.indexOf("useEffect(() =>", marker);
+  const body = source.slice(start, end);
+
+  assert.ok(marker >= 0 && start >= 0 && end > marker);
+  assert.match(body, /SEGMENT_BATCH_RECOVERY_REGISTRY_KEY|readBatchRecoveryRegistry/);
+  assert.doesNotMatch(body.slice(0, 500), /!script\.trim\(\)/);
+  assert.match(body, /pointer\.sourceHash|sourceHash:\s*pointer\.sourceHash/);
+});
+

@@ -11,6 +11,68 @@ export type SegmentBatchRecoveryIdentity = {
   duration: string;
 };
 
+export const SEGMENT_BATCH_RECOVERY_REGISTRY_KEY = "localdirector:segment-batch-recovery-registry:v1";
+
+export type SegmentBatchRecoveryPointer = {
+  schemaVersion: 1;
+  durableBatchId: string;
+  recoveryKey: string;
+  sourceHash: string;
+  projectId: string | null;
+  updatedAt: string;
+};
+
+function isSegmentBatchRecoveryPointer(value: unknown): value is SegmentBatchRecoveryPointer {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<SegmentBatchRecoveryPointer>;
+  return item.schemaVersion === 1
+    && typeof item.durableBatchId === "string"
+    && item.durableBatchId.length > 0
+    && item.durableBatchId.length <= 240
+    && /^[A-Za-z0-9._:-]+$/.test(item.durableBatchId)
+    && typeof item.recoveryKey === "string"
+    && item.recoveryKey.startsWith("localdirector:segment-batch-recovery:")
+    && typeof item.sourceHash === "string"
+    && item.sourceHash.length > 0
+    && (item.projectId === null || typeof item.projectId === "string")
+    && typeof item.updatedAt === "string"
+    && Number.isFinite(Date.parse(item.updatedAt));
+}
+
+export function parseSegmentBatchRecoveryRegistry(raw: string | null | undefined) {
+  if (!raw) return [] as SegmentBatchRecoveryPointer[];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [] as SegmentBatchRecoveryPointer[];
+    return parsed
+      .filter(isSegmentBatchRecoveryPointer)
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+      .slice(0, 10);
+  } catch {
+    return [] as SegmentBatchRecoveryPointer[];
+  }
+}
+
+export function upsertSegmentBatchRecoveryPointer(
+  registry: readonly SegmentBatchRecoveryPointer[],
+  pointer: SegmentBatchRecoveryPointer,
+) {
+  if (!isSegmentBatchRecoveryPointer(pointer)) {
+    throw new Error("Segment batch recovery pointer is invalid");
+  }
+  return [pointer, ...registry.filter((item) => item.durableBatchId !== pointer.durableBatchId)]
+    .filter(isSegmentBatchRecoveryPointer)
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+    .slice(0, 10);
+}
+
+export function removeSegmentBatchRecoveryPointer(
+  registry: readonly SegmentBatchRecoveryPointer[],
+  durableBatchId: string,
+) {
+  return registry.filter((item) => item.durableBatchId !== durableBatchId);
+}
+
 const SHA256_CONSTANTS = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
