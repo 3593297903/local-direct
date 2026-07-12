@@ -19,6 +19,21 @@ test("render pack completion signals repair scheduler without awaiting a per-pac
   assert.match(body, /repairScheduler\.enqueue|signalRepairScheduler/);
 });
 
+test("transient render-pack polling failures keep the original job and never fan out into segment regeneration", () => {
+  const pollStart = source.indexOf("async function pollVideoPromptPackCodexJob");
+  const pollEnd = source.indexOf("async function pollVideoPromptCodexJob", pollStart);
+  const pollBody = source.slice(pollStart, pollEnd);
+  assert.match(pollBody, /consecutiveTransportFailures/);
+  assert.match(pollBody, /continue/);
+  assert.match(pollBody, /RenderPackPollingInfrastructureError/);
+
+  const renderStart = source.indexOf("async function renderPackedSegmentsWithQualityRepair");
+  const renderEnd = source.indexOf("await restoreCachedRenderedSegments", renderStart);
+  const renderBody = source.slice(renderStart, renderEnd);
+  assert.match(renderBody, /isRenderPackPollingInfrastructureError\(error\)/);
+  assert.match(renderBody, /throw error/);
+});
+
 test("repair polling detaches at the frontend timeout instead of failing the generation", () => {
   assert.match(source, /REPAIR_DETACHED/);
   assert.match(source, /late_patch_available|latePatchAvailable/);
@@ -89,5 +104,34 @@ test("first successful save migrates the recovery index to the persisted project
   assert.match(source, /batchRecoveryIndexKeys\.add\(activeRecoveryKey\)/);
   assert.match(source, /function clearBatchRecoveryState/);
   assert.match(source, /publishBatchProgress\("completed"[\s\S]{0,220}clearBatchRecoveryState\(\)/);
+});
+
+test("needs-review results become cache-ready and are not reported complete before review-save succeeds", () => {
+  const storeStart = source.indexOf("function storeRenderedEpisode");
+  const storeEnd = source.indexOf("async function renderSingleEpisodeWithQualityRepair", storeStart);
+  const storeBody = source.slice(storeStart, storeEnd);
+  assert.match(storeBody, /renderedEpisodes\[episodeIndex - 1\][\s\S]{0,500}type:\s*"CACHE_READY"/);
+
+  const reviewStart = source.indexOf("if (finalNeedsReviewCount)");
+  const reviewEnd = source.indexOf("for (const rendered of renderedEpisodes)", reviewStart);
+  const reviewBody = source.slice(reviewStart, reviewEnd);
+  assert.match(reviewBody, /unsavedReviewSegmentStates/);
+  assert.match(reviewBody, /return/);
+  assert.match(reviewBody, /clearBatchRecoveryState\(\)/);
+});
+
+test("automatic planning progress never reads episodes before the season result exists", () => {
+  const publishStart = source.indexOf("function publishBatchProgress");
+  const publishEnd = source.indexOf("function rebuildSegmentProgressFromState", publishStart);
+  const publishBody = source.slice(publishStart, publishEnd);
+  const firstPlanningCall = source.search(/publishBatchProgress\(\s*["']planning["']/);
+  const episodesDeclaration = source.indexOf(
+    "const episodes = [...(seasonPackJob.result?.episodes || [])]",
+  );
+
+  assert.ok(publishStart >= 0 && publishEnd > publishStart);
+  assert.ok(firstPlanningCall >= 0 && episodesDeclaration > firstPlanningCall);
+  assert.doesNotMatch(publishBody, /\bepisodes\b/);
+  assert.match(publishBody, /resolvedSegmentCount:\s*resolvedSegmentCount\b|\bresolvedSegmentCount,\s*\n/);
 });
 

@@ -272,6 +272,20 @@ class CodexVideoPromptJobFailedError extends Error {
   }
 }
 
+class RenderPackPollingInfrastructureError extends Error {
+  readonly jobId: string;
+
+  constructor(jobId: string, message: string) {
+    super(message);
+    this.name = "RenderPackPollingInfrastructureError";
+    this.jobId = jobId;
+  }
+}
+
+function isRenderPackPollingInfrastructureError(error: unknown): error is RenderPackPollingInfrastructureError {
+  return error instanceof RenderPackPollingInfrastructureError;
+}
+
 type BatchPromptSection = {
   segment: {
     index: number;
@@ -1654,31 +1668,55 @@ export function DashboardClient() {
     const startedAt = Date.now();
     const timeoutMs = Math.max(30 * 60_000, segmentCount * 600_000);
     let lastStatus = "";
+    let consecutiveTransportFailures = 0;
 
     while (Date.now() - startedAt < timeoutMs) {
-      const res = await fetch(`/api/video-prompt-packs/jobs/${jobId}`, { cache: "no-store" });
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || "Codex render pack job read failed");
-      }
+      try {
+        const res = await fetch(`/api/video-prompt-packs/jobs/${jobId}`, { cache: "no-store" });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) {
+          const message = data?.error || `Codex render pack job read failed (${res.status})`;
+          if (res.status < 500 && ![408, 425, 429].includes(res.status)) {
+            throw new RenderPackPollingInfrastructureError(jobId, message);
+          }
+          throw new TypeError(message);
+        }
 
-      const currentJob = data.job as VideoPromptPackCodexJob;
-      if (currentJob.status !== lastStatus) {
-        lastStatus = currentJob.status;
-        setGenerationProgress(
-          currentJob.status === "running"
-            ? `Codex 正在本地生成 ${segmentCount} 段 Render Pack...`
-            : `Codex Render Pack 任务状态：${currentJob.status}`,
-        );
-      }
-      if (currentJob.status === "completed") return currentJob;
-      if (currentJob.status === "failed") {
-        throw new CodexVideoPromptJobFailedError(currentJob.error || "Codex render pack job failed");
+        consecutiveTransportFailures = 0;
+        const currentJob = data.job as VideoPromptPackCodexJob;
+        if (currentJob.status !== lastStatus) {
+          lastStatus = currentJob.status;
+          setGenerationProgress(
+            currentJob.status === "running"
+              ? `Codex 正在本地生成 ${segmentCount} 段 Render Pack...`
+              : `Codex Render Pack 任务状态：${currentJob.status}`,
+          );
+        }
+        if (currentJob.status === "completed") return currentJob;
+        if (currentJob.status === "failed") {
+          throw new CodexVideoPromptJobFailedError(currentJob.error || "Codex render pack job failed");
+        }
+      } catch (error) {
+        if (error instanceof CodexVideoPromptJobFailedError || isRenderPackPollingInfrastructureError(error)) {
+          throw error;
+        }
+        consecutiveTransportFailures += 1;
+        const retryDelayMs = Math.min(10_000, 1_000 * (2 ** Math.min(consecutiveTransportFailures - 1, 3)));
+        if (consecutiveTransportFailures === 1 || consecutiveTransportFailures % 5 === 0) {
+          setGenerationProgress(
+            `Render Pack 状态读取短暂中断，正在继续等待原任务（第 ${consecutiveTransportFailures} 次重试）...`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+        continue;
       }
       await new Promise((resolve) => setTimeout(resolve, 2500));
     }
 
-    throw new Error("Codex Render Pack 任务等待超时，请确认 video-prompt-pack:codex-worker 正在运行。");
+    throw new RenderPackPollingInfrastructureError(
+      jobId,
+      "Codex Render Pack 状态等待超时；原任务仍保留，不会降级为逐段重新生成。",
+    );
   }
 
   async function pollVideoPromptCodexJob(jobId: string) {
@@ -2274,7 +2312,7 @@ export function DashboardClient() {
         mode,
         phase: normalizedPhase,
         requestedCount,
-        resolvedSegmentCount: resolvedSegmentCount || episodes.length,
+        resolvedSegmentCount,
         startedAtMs: batchStartedAtMs,
         updatedAtMs: nowMs,
         finishedAtMs: batchFinishedAtMs,
@@ -3469,6 +3507,7 @@ export function DashboardClient() {
         promptText: fullVideoPrompt,
         sourceText: episodeScript,
       };
+      dispatchSegmentStateEvent(episodeIndex, { type: "CACHE_READY" });
       segmentRepairReasons.delete(episodeIndex);
       queuedRepairIndexes.delete(episodeIndex);
       setBatchResults(
@@ -4266,6 +4305,13 @@ export function DashboardClient() {
         await runCoverageJudgeWave(pendingJudgeSegments, renderRound);
         signalRepairScheduler();
       } catch (error) {
+        if (isRenderPackPollingInfrastructureError(error)) {
+          publishBatchProgress(
+            "rendering",
+            `Render Pack 第 ${packLabel} 段状态暂不可读，原任务 ${error.jobId} 已保留，不会创建逐段补生成任务。`,
+          );
+          throw error;
+        }
         const reason = error instanceof Error ? error.message : "Render Pack 生成失败";
         if (CODEX_QUOTA_ERROR_PATTERN.test(String(reason))) {
           pauseBatchForCodexQuota(packEpisodes.map((episode) => episode.episodeIndex), error);
@@ -4328,6 +4374,19 @@ export function DashboardClient() {
       const reviewSaveError = saveError as Error | null;
       if (reviewSaveError) {
         publishBatchProgress("saving", `${reviewSaveError.message} 已保留全部缓存；下次恢复只会继续保存。`);
+        setBatchGenerating(false);
+        return;
+      }
+      const unsavedReviewSegmentStates = segmentStateRecords.filter((state) => (
+        state.saveStatus !== "saved" && state.saveStatus !== "review_saved"
+      ));
+      if (unsavedReviewSegmentStates.length > 0) {
+        writeBatchSegmentCache();
+        await batchCachePersistChain;
+        publishBatchProgress(
+          "saving",
+          `仍有 ${unsavedReviewSegmentStates.length} 段待检查结果尚未落库，已保留缓存；不会重新生成。`,
+        );
         setBatchGenerating(false);
         return;
       }
