@@ -147,3 +147,29 @@ test("refresh recovery discovers active batches before source-dependent fallback
   assert.match(body, /pointer\.sourceHash|sourceHash:\s*pointer\.sourceHash/);
 });
 
+test("dashboard never stamps an omitted event with the latest revision at dispatch time", () => {
+  const start = source.indexOf("function dispatchSegmentStateEvent");
+  const end = source.indexOf("function updateSegmentProgress", start);
+  const body = source.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.doesNotMatch(body, /baseRevision:\s*effectiveEvent\.baseRevision\s*\?\?\s*item\.revision/);
+});
+
+test("detached repair polling captures a revision before querying the job", () => {
+  const start = source.indexOf("async function watchDetachedRepair");
+  const end = source.indexOf("async function repairExistingBatchSegment", start);
+  const body = source.slice(start, end);
+  const capture = body.search(/captureSegmentStateGuard|captureSegmentRevision/);
+  const query = body.indexOf("await queryBatchSegmentRepairCodexJob");
+  assert.ok(capture >= 0 && query > capture);
+  assert.match(body, /baseRevision|dispatchGuardedSegmentStateEvent/);
+});
+
+test("display progress cannot synthesize domain state transitions", () => {
+  const start = source.indexOf("function updateSegmentProgress");
+  const end = source.indexOf("publishBatchProgress(", start);
+  const body = source.slice(start, end);
+  assert.doesNotMatch(body, /RENDER_STARTED|REPAIR_QUEUED|QUALITY_PASSED|QUALITY_BLOCKED|CACHE_READY|SAVE_STARTED|SAVE_SUCCEEDED/);
+  assert.match(body, /PROGRESS_UPDATED/);
+});
+

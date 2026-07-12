@@ -201,3 +201,28 @@ test("stable batch identity excludes transient season job ids", () => {
     `localdirector:segment-batch-recovery:${legacyDigest}`,
   );
 });
+
+test("a delayed repair completion cannot overwrite a newer repair lifecycle", () => {
+  let state = createInitialSegmentState(1);
+  state = reduceSegmentState(state, { type: "RENDER_STARTED" });
+  state = reduceSegmentState(state, { type: "RENDER_SUCCEEDED", resultHash: "original" });
+  state = reduceSegmentState(state, { type: "QUALITY_BLOCKED", message: "missing" });
+  state = reduceSegmentState(state, { type: "REPAIR_QUEUED", fingerprint: "first" });
+  state = reduceSegmentState(state, { type: "REPAIR_STARTED", jobId: "job-old" });
+  const oldRevision = state.revision;
+
+  state = reduceSegmentState(state, { type: "REPAIR_FAILED", jobId: "job-old" });
+  state = reduceSegmentState(state, { type: "REPAIR_QUEUED", fingerprint: "second" });
+  state = reduceSegmentState(state, { type: "REPAIR_STARTED", jobId: "job-new" });
+
+  const afterLateCompletion = reduceSegmentState(state, {
+    type: "REPAIR_COMPLETED",
+    jobId: "job-old",
+    resultHash: "stale-result",
+    baseRevision: oldRevision,
+  });
+
+  assert.deepEqual(afterLateCompletion, state);
+  assert.equal(afterLateCompletion.activeRepairJobId, "job-new");
+  assert.notEqual(afterLateCompletion.resultHash, "stale-result");
+});
