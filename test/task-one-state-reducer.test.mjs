@@ -18,7 +18,29 @@ const {
 const {
   migrateSegmentBatchCacheDocument,
   writeSegmentBatchCache,
+  buildStableBatchContractHash,
+  buildSegmentBatchRecoveryKey,
 } = require("../lib/segment-batch-cache.ts");
+
+test("illegal SAVE_SUCCEEDED and unrelated REPAIR_COMPLETED events are ignored", () => {
+  const initial = createInitialSegmentState(1, { updatedAt: 1 });
+  const impossibleSave = reduceSegmentState(initial, {
+    type: "SAVE_SUCCEEDED",
+    baseRevision: 0,
+    review: false,
+    at: 2,
+  });
+  assert.deepEqual(impossibleSave, initial);
+
+  const unrelatedRepair = reduceSegmentState(initial, {
+    type: "REPAIR_COMPLETED",
+    baseRevision: 0,
+    jobId: "unrelated-job",
+    resultHash: "result-new",
+    at: 3,
+  });
+  assert.deepEqual(unrelatedRepair, initial);
+});
 
 test("orthogonal reducer preserves quality while save fails and resumes", () => {
   let state = createInitialSegmentState(1, { contractHash: "contract-a" });
@@ -123,4 +145,31 @@ test("cache v2 rejects a lower revision and preserves the newer document", async
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
+});
+
+test("stable batch identity excludes transient season job ids", () => {
+  const contracts = [
+    { segmentIndex: 2, contractHash: "contract-b" },
+    { segmentIndex: 1, contractHash: "contract-a" },
+  ];
+  assert.equal(
+    buildStableBatchContractHash(contracts),
+    buildStableBatchContractHash([...contracts].reverse()),
+  );
+  assert.equal(
+    buildSegmentBatchRecoveryKey({
+      projectId: null,
+      sourceHash: "source",
+      mode: "fixed",
+      requestedCount: 20,
+      duration: "auto",
+    }),
+    buildSegmentBatchRecoveryKey({
+      projectId: null,
+      sourceHash: "source",
+      mode: "fixed",
+      requestedCount: 20,
+      duration: "auto",
+    }),
+  );
 });

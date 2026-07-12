@@ -30,3 +30,10 @@ test("save queue consumes task-two retryability and keeps a stable idempotency k
   assert.match(source, /durableBatchId/);
 });
 
+test("refresh recovery uses session ownership and offers save-only continuation before season creation", () => {
+  assert.match(source, /sessionStorage/);
+  assert.match(source, /继续保存已缓存段/);
+  assert.match(source, /resumeCachedBatchSavesOnly|resumeCachedSavesOnly/);
+  assert.doesNotMatch(source, /batchId:\s*seasonPackJob\.id[\s\S]{0,180}contractHash/);
+});
+

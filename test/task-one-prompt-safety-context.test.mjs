@@ -20,12 +20,13 @@ const pathCases = [
   ["storyboard[0].firstFramePrompt", "EXECUTABLE_VISUAL"],
   ["storyboard[0].videoPrompt", "EXECUTABLE_VISUAL"],
   ["storyboard[0].lastFramePrompt", "EXECUTABLE_VISUAL"],
+  ["storyboard[0].shotPurpose", "NARRATIVE_METADATA"],
   ["storyboard[0].sound", "EXECUTABLE_AUDIO_TEXT"],
   ["storyboard[0].dialogue", "EXECUTABLE_AUDIO_TEXT"],
   ["storyboard[0].negativePrompt", "NEGATIVE_CONSTRAINT"],
   ["workflow.fullNegativePrompt", "NEGATIVE_CONSTRAINT"],
   ["workflow.fullVideoPrompt", "CANONICAL_EXECUTABLE"],
-  ["workflow.concisePrompt", "CANONICAL_EXECUTABLE"],
+  ["workflow.concisePrompt", "ARCHIVE_DERIVED"],
   ["optimizedScript", "NARRATIVE_METADATA"],
   ["workflow.sourceAnalysis", "NARRATIVE_METADATA"],
   ["workflow.screenplay", "ARCHIVE_DERIVED"],
@@ -159,6 +160,65 @@ test("one semantic risk copied across canonical and negative fields becomes one 
   assert.equal(woundFindings[0].affectedPaths.length, 3);
   assert.equal(woundFindings[0].affectedPathCount, 3);
   assert.match(woundFindings[0].fingerprint, /^ps_/);
+});
+
+test("mixed affirmative and negative clauses keep the concrete corpse blocking", () => {
+  const result = analyzePromptSafetyTree({
+    storyboard: [{ videoPrompt: "镜头展示尸体面部细节，但不要出现血泊。" }],
+  }, { phase: "quality", segmentIndex: 4 });
+
+  const corpse = result.findings.find((finding) => finding.ruleId === "corpse");
+  const bloodPool = result.findings.find((finding) => finding.ruleId === "blood_pool");
+  assert.equal(corpse?.polarity, "affirmative");
+  assert.equal(corpse?.severity, "blocking");
+  assert.equal(bloodPool?.polarity, "negative_constraint");
+});
+
+test("negation after a matched concept never changes the earlier affirmative polarity", () => {
+  const result = analyzePromptSafetyTree({
+    storyboard: [{ videoPrompt: "尸体面部细节清晰呈现，随后说明不要采用这种构图。" }],
+  }, { phase: "quality", segmentIndex: 5 });
+
+  const corpse = result.findings.find((finding) => finding.ruleId === "corpse");
+  assert.equal(corpse?.polarity, "affirmative");
+  assert.equal(corpse?.severity, "blocking");
+});
+
+test("contrast words terminate a negative scope before later affirmative content", () => {
+  for (const connector of ["但是", "然而", "却", "不过", "随后"]) {
+    const result = analyzePromptSafetyTree({
+      storyboard: [{ videoPrompt: `不要出现血泊，${connector}镜头展示尸体面部细节。` }],
+    }, { phase: "quality", segmentIndex: 6 });
+    const corpse = result.findings.find((finding) => finding.ruleId === "corpse");
+    assert.equal(corpse?.polarity, "affirmative", connector);
+    assert.equal(corpse?.severity, "blocking", connector);
+  }
+});
+
+test("a long metadata sentence still recognizes 未发现性侵迹象 as a negated fact", () => {
+  const result = analyzePromptSafetyTree({
+    optimizedScript: "调查人员结合现场记录、访谈内容、时间线和多项检验结果进行复核，最终未发现性侵迹象。",
+  }, { phase: "quality", segmentIndex: 7 });
+  const finding = result.findings.find((item) => item.ruleId === "sexual_violence");
+  assert.equal(finding?.polarity, "negated_fact");
+  assert.equal(finding?.requiresCodexRepair, false);
+});
+
+test("metadata and archive fields stay byte-for-byte unchanged after local safety analysis", () => {
+  const input = {
+    optimizedScript: "旧档案明确记录现场出现血泊。",
+    storyboard: [{ shotPurpose: "交代尸体线索与调查方向。" }],
+    workflow: {
+      concisePrompt: "资料摘要写有警徽与伤口特写。",
+      filmScript: "旧稿记载真实警服和国徽。",
+    },
+  };
+  const result = analyzePromptSafetyTree(input, { phase: "quality", segmentIndex: 8 });
+
+  assert.deepEqual(result.value.optimizedScript, input.optimizedScript);
+  assert.deepEqual(result.value.storyboard[0].shotPurpose, input.storyboard[0].shotPurpose);
+  assert.deepEqual(result.value.workflow.concisePrompt, input.workflow.concisePrompt);
+  assert.deepEqual(result.value.workflow.filmScript, input.workflow.filmScript);
 });
 
 test("twenty-segment redacted replay keeps negated facts and negative lists out of Codex repair", () => {

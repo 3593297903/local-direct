@@ -63,3 +63,18 @@ test("stale hashes and duplicate jobs are archived without overwrite or regenera
   }).action, "ignore_duplicate");
 });
 
+test("a detached repair completed at minute twenty merges the original job", () => {
+  const decision = decideLateRepairMerge({
+    jobId: "job-detached-12m",
+    activeRepairJobId: "job-detached-12m",
+    jobStatus: "completed",
+    expectedContractHash: "contract-a",
+    currentContractHash: "contract-a",
+    expectedResultHash: "result-a",
+    currentResultHash: "result-a",
+    mergedJobIds: new Set(),
+    saveStatus: "cached",
+  });
+  assert.equal(decision.action, "merge");
+});
+
