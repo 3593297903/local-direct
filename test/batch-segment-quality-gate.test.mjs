@@ -13,6 +13,7 @@ const {
   applyDeterministicQualityPatch,
   applyDeterministicQualityPatchWithDiff,
   evaluateBatchSegmentQuality,
+  selectDeterministicQualityPatchFindings,
   shouldRepairWithCodex,
 } = require("../lib/batch-segment-quality-gate.ts");
 
@@ -472,4 +473,37 @@ test("weak required event slots are warnings, not repair blockers", () => {
   assert.equal(gate.warningFindings.some((finding) => finding.code === "weak_required_event_slot"), true);
   assert.equal(gate.blockingFindings.some((finding) => finding.code === "missing_required_event_slot"), false);
   assert.equal(shouldRepairWithCodex(gate), false);
+});
+
+test("disabling safety automation keeps all non-safety deterministic patches", () => {
+  const findings = [
+    {
+      code: "field_below_hard_minimum",
+      severity: "patchable",
+      path: "storyboard[0].videoPrompt",
+      message: "short",
+    },
+    {
+      code: "sensitive_term",
+      severity: "blocking",
+      path: "storyboard[0].visual",
+      message: "safety",
+    },
+    {
+      code: "missing_required_field",
+      severity: "patchable",
+      path: "storyboard[0].dialogue",
+      field: "dialogue",
+      message: "empty",
+    },
+  ];
+
+  assert.deepEqual(
+    selectDeterministicQualityPatchFindings(findings, { safetyEnabled: false }).map((item) => item.code),
+    ["field_below_hard_minimum", "missing_required_field"],
+  );
+  assert.deepEqual(
+    selectDeterministicQualityPatchFindings(findings, { safetyEnabled: true }).map((item) => item.code),
+    ["field_below_hard_minimum", "sensitive_term", "missing_required_field"],
+  );
 });

@@ -66,6 +66,7 @@ import {
   applyDeterministicQualityPatchWithDiff,
   buildTargetedRepairReason,
   evaluateBatchSegmentQuality,
+  selectDeterministicQualityPatchFindings,
   shouldRepairWithCodex,
   summarizeQualityFindings,
   type BatchSegmentQualityGate,
@@ -1052,9 +1053,14 @@ function normalizePatchAndEvaluateBatchSegment(
   const firstGate = evaluateBatchSegmentQuality(normalizedResult, {
     ...buildQualityOptions(normalizedResult),
   });
-  const patched = TASK_ONE_SAFETY_ENABLED
-    ? applyDeterministicQualityPatchWithDiff(normalizedResult, firstGate.findings)
-    : { result: normalizedResult, patchDiffs: [] as QualityPatchDiff[] };
+  const deterministicPatchFindings = selectDeterministicQualityPatchFindings(
+    firstGate.findings,
+    { safetyEnabled: TASK_ONE_SAFETY_ENABLED },
+  );
+  const patched = applyDeterministicQualityPatchWithDiff(
+    normalizedResult,
+    deterministicPatchFindings,
+  );
   const patchedResult = canonicalizeBatchSegmentResult(patched.result);
   const finalGate = evaluateBatchSegmentQuality(patchedResult, {
     ...buildQualityOptions(patchedResult),

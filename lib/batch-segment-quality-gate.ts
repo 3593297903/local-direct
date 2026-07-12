@@ -78,6 +78,15 @@ export type DeterministicQualityPatchResult<T extends AnalysisResult> = {
   patchDiffs: QualityPatchDiff[];
 };
 
+export function selectDeterministicQualityPatchFindings(
+  findings: readonly BatchSegmentQualityFinding[],
+  options: { safetyEnabled: boolean },
+) {
+  return options.safetyEnabled
+    ? [...findings]
+    : findings.filter((finding) => finding.code !== "sensitive_term");
+}
+
 export type BatchSegmentQualityGate = {
   score: number;
   promptQualityScore: number;

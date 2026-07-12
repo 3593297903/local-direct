@@ -173,3 +173,12 @@ test("display progress cannot synthesize domain state transitions", () => {
   assert.match(body, /PROGRESS_UPDATED/);
 });
 
+test("safety rollback cannot disable ordinary deterministic quality patches", () => {
+  const start = source.indexOf("const firstGate = evaluateBatchSegmentQuality");
+  const end = source.indexOf("const finalGate = evaluateBatchSegmentQuality", start);
+  const body = source.slice(start, end);
+  assert.match(body, /selectDeterministicQualityPatchFindings/);
+  assert.match(body, /applyDeterministicQualityPatchWithDiff/);
+  assert.doesNotMatch(body, /TASK_ONE_SAFETY_ENABLED\s*\?\s*applyDeterministicQualityPatchWithDiff/);
+});
+
