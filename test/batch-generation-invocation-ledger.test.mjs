@@ -102,12 +102,25 @@ test("benchmark report follows the frozen schema and rejects model calls or qual
       missingRequiredFields: 0,
       changedUnmatchedPaths: 0,
     },
+    extensions: {
+      adapterVersion: "frozen-dashboard-local-v1",
+      productionSourceFingerprint: "b".repeat(64),
+      canonicalPromptHashes: Array.from({ length: 20 }, (_, index) => String(index).padStart(64, "0")),
+      modelPromptLengths: { min: 4100, p50: 4200, p95: 4300, max: 4400 },
+      localPatchOperations: 0,
+      localPatchSegments: 0,
+      uniquePatchPaths: [],
+      routeDecisionCounts: { accept: 20 },
+      findingCounts: { blocking: 0, patchable: 0, warning: 0, risk: 0 },
+    },
     generatedAt: "2026-07-13T00:00:00.000Z",
   });
 
   assert.equal(report.schemaVersion, 1);
   assert.equal(report.order, "alternating-baseline-task");
   assert.equal(report.quality.promptLengths.min, 4200);
+  assert.equal(report.extensions.adapterVersion, "frozen-dashboard-local-v1");
+  assert.equal(report.extensions.canonicalPromptHashes.length, 20);
   assert.doesNotThrow(() => assertBatchBenchmarkInvariants(report));
 
   const regressed = structuredClone(report);

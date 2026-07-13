@@ -31,6 +31,18 @@ const {
 const { createSegmentQualityReport } = require("../lib/batch-segment-quality-report.ts");
 const { routeBatchSegmentOutcome } = require("../lib/batch-segment-outcome-router.ts");
 const { compileSegmentContractRenderBlock } = require("../lib/codex-prompt-input-compiler.ts");
+const {
+  installBatchInvocationObserver,
+  summarizeBatchInvocations,
+} = require("../lib/batch-generation-invocation-ledger.ts");
+const {
+  FROZEN_DASHBOARD_ADAPTER_VERSION,
+  UnexpectedBenchmarkModelInvocation,
+  createFrozenDashboardLocalAdapter,
+  createThrowingBenchmarkModelAdapters,
+  extractDashboardProductionSourceFingerprint,
+  runTimedBatchFixtureReplay,
+} = require("../lib/batch-generation-metrics.ts");
 
 const MODEL_KINDS = [
   "season_pack",
@@ -44,102 +56,21 @@ const MODEL_KINDS = [
 
 function replayFixture(inputFixture) {
   const fixture = cloneFixture(inputFixture);
-  const acceptedSegmentIndexes = [];
-  const needsReviewSegmentIndexes = [];
-  const blockingFindingFingerprints = [];
-  const uniquePatchPaths = new Set();
-  const qualityScores = [];
-  const promptLengths = [];
-  const shotCounts = {};
-  const invocationCounters = Object.fromEntries(MODEL_KINDS.map((kind) => [kind, 0]));
-  let localPatchCount = 0;
-  let fullRegenerationCount = 0;
-  let pathRepairCount = 0;
-  let missingRequiredFields = 0;
-
-  fixture.renderedResults.forEach((rawResult, offset) => {
-    const contract = fixture.contracts[offset];
-    const context = fixture.qualityContext[offset];
-    const firstGate = evaluateBatchSegmentQuality(rawResult, {
-      ...context,
-      segmentIndex: context.episodeIndex,
-      contract,
-      fullPromptText: rawResult.workflow.fullVideoPrompt,
-      coverageMode: "shadow",
-    });
-    const patchable = selectDeterministicQualityPatchFindings(firstGate.findings, {
-      safetyEnabled: true,
-    });
-    const patched = applyDeterministicQualityPatchWithDiff(rawResult, patchable);
-    const finalGate = patched.patchDiffs.length
-      ? evaluateBatchSegmentQuality(patched.result, {
-          ...context,
-          segmentIndex: context.episodeIndex,
-          contract,
-          fullPromptText: patched.result.workflow.fullVideoPrompt,
-          coverageMode: "shadow",
-        })
-      : firstGate;
-    const route = routeBatchSegmentOutcome({
-      gate: finalGate,
-      hasUsableResult: Array.isArray(patched.result.storyboard) && patched.result.storyboard.length > 0,
-      coverageStage: "shadow",
-    });
-    const report = createSegmentQualityReport({
-      batchId: `fixture:${fixture.fixtureId}`,
-      segmentIndex: context.episodeIndex,
-      title: patched.result.title,
-      result: patched.result,
-      sourceText: contract.sourceText,
-      status: route.action === "accept" ? "cached" : "needs_review",
-      scheduleProfile: "PHASE_0_REPLAY",
-      qualityGate: finalGate,
-      patchDiffs: patched.patchDiffs,
-      contractHash: contract.contractHash,
-    });
-
-    if (route.action === "accept") acceptedSegmentIndexes.push(context.episodeIndex);
-    else needsReviewSegmentIndexes.push(context.episodeIndex);
-    if (route.action === "regenerate_segment") {
-      fullRegenerationCount += 1;
-      invocationCounters.single_generation += 1;
-    }
-    if (route.action === "request_quality_patch" || route.action === "request_event_patch") {
-      pathRepairCount += 1;
-      invocationCounters.path_repair += 1;
-    }
-    if (route.action === "enqueue_judge" || route.action === "enqueue_judge_shadow") {
-      invocationCounters.coverage_judge += 1;
-    }
-
-    localPatchCount += patched.patchDiffs.length;
-    patched.patchDiffs.forEach((diff) => uniquePatchPaths.add(diff.path));
-    finalGate.blockingFindings.forEach((finding) => {
-      blockingFindingFingerprints.push(
-        finding.fingerprint || `${context.episodeIndex}:${finding.code}:${finding.path || "segment"}`,
-      );
-    });
-    missingRequiredFields += finalGate.findings.filter((finding) => finding.code === "missing_required_field").length;
-    qualityScores.push(report.qualityScore);
-    promptLengths.push(patched.result.workflow.fullVideoPrompt.replace(/\s+/g, "").length);
-    const shotCount = String(patched.result.storyboard.length);
-    shotCounts[shotCount] = (shotCounts[shotCount] || 0) + 1;
-  });
-
+  const replay = runTimedBatchFixtureReplay(fixture, createFrozenDashboardLocalAdapter(process.cwd()));
   return {
-    acceptedSegmentIndexes,
-    needsReviewSegmentIndexes,
-    blockingFindingFingerprints: blockingFindingFingerprints.sort(),
-    uniquePatchPaths: [...uniquePatchPaths].sort(),
-    invocationCounters,
-    localPatchCount,
-    fullRegenerationCount,
-    pathRepairCount,
-    missingRequiredFields,
-    qualityScores,
-    promptLengths,
-    shotCounts,
-    canonicalPromptHashes: fixture.renderedResults.map((result) => result.workflow.canonicalHash),
+    acceptedSegmentIndexes: replay.quality.acceptedSegmentIndexes,
+    needsReviewSegmentIndexes: replay.quality.needsReviewSegmentIndexes,
+    blockingFindingFingerprints: replay.quality.blockingFindingFingerprints,
+    uniquePatchPaths: replay.quality.uniquePatchPaths,
+    invocationCounters: replay.invocationCounters,
+    localPatchCount: replay.quality.localPatchOperations,
+    fullRegenerationCount: replay.invocationCounters.single_generation.executing,
+    pathRepairCount: replay.invocationCounters.path_repair.executing,
+    missingRequiredFields: replay.quality.missingRequiredFields,
+    qualityScores: replay.quality.scores,
+    promptLengths: replay.quality.promptLengths,
+    shotCounts: replay.quality.shotCounts,
+    canonicalPromptHashes: replay.quality.canonicalPromptHashes,
   };
 }
 
@@ -233,10 +164,79 @@ test("100 deterministic replays keep findings, patches, scores and canonical has
 test("clean fixture replay invokes no model-backed adapter", () => {
   for (const fixture of [fixture20, fixture30]) {
     const replay = replayFixture(fixture);
-    assert.deepEqual(replay.invocationCounters, Object.fromEntries(MODEL_KINDS.map((kind) => [kind, 0])));
+    for (const kind of MODEL_KINDS) assert.equal(replay.invocationCounters[kind].executing, 0);
     assert.equal(replay.fullRegenerationCount, 0);
     assert.equal(replay.pathRepairCount, 0);
   }
+});
+
+test("frozen production adapter is bound to all four Dashboard pipeline functions", () => {
+  const source = extractDashboardProductionSourceFingerprint(process.cwd());
+  assert.match(source.fingerprint, /^[a-f0-9]{64}$/);
+  assert.deepEqual(source.functionNames, [
+    "buildVideoGenerationPromptText",
+    "normalizeBatchSegmentResultForQuality",
+    "canonicalizeBatchSegmentResult",
+    "normalizePatchAndEvaluateBatchSegment",
+  ]);
+  const adapter = createFrozenDashboardLocalAdapter(process.cwd());
+  assert.equal(adapter.adapterVersion, FROZEN_DASHBOARD_ADAPTER_VERSION);
+  assert.equal(adapter.productionSourceFingerprint, source.fingerprint);
+});
+
+test("Dashboard source fingerprint refuses an incomplete extraction", async () => {
+  const root = path.join(process.cwd(), ".tmp-batch-benchmark", `fingerprint-${process.pid}-${Date.now()}`);
+  try {
+    await mkdir(path.join(root, "components"), { recursive: true });
+    await writeFile(
+      path.join(root, "components", "DashboardClient.tsx"),
+      "function buildVideoGenerationPromptText() { return ''; }\n",
+      "utf8",
+    );
+    assert.throws(
+      () => extractDashboardProductionSourceFingerprint(root),
+      /Cannot fingerprint Dashboard pipeline functions/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("canonical prompt hashes are computed from live frozen output, not fixture archive hashes", () => {
+  const adapter = createFrozenDashboardLocalAdapter(process.cwd());
+  const originalFixture = cloneFixture(fixture20);
+  const originalStoredHash = originalFixture.renderedResults[0].workflow.canonicalHash;
+  const originalReplay = runTimedBatchFixtureReplay(originalFixture, adapter);
+  const mutatedFixture = cloneFixture(fixture20);
+  mutatedFixture.renderedResults[0].storyboard[0].visual += "合成变异必须改变现场 canonical 输出。";
+  assert.equal(mutatedFixture.renderedResults[0].workflow.canonicalHash, originalStoredHash);
+
+  const mutatedReplay = runTimedBatchFixtureReplay(mutatedFixture, adapter);
+  assert.notEqual(
+    mutatedReplay.quality.canonicalPromptHashes[0],
+    originalReplay.quality.canonicalPromptHashes[0],
+  );
+  assert.notEqual(originalReplay.quality.canonicalPromptHashes[0], originalStoredHash);
+});
+
+test("mutation route reaches explicit model adapter trap and records executing", () => {
+  const fixture = cloneFixture(fixture20);
+  fixture.renderedResults[2].storyboard = [];
+  const adapter = createFrozenDashboardLocalAdapter(process.cwd());
+  const observed = [];
+  const uninstall = installBatchInvocationObserver((event) => observed.push(event));
+  try {
+    assert.throws(
+      () => runTimedBatchFixtureReplay(fixture, adapter, {
+        modelAdapters: createThrowingBenchmarkModelAdapters({ batchId: "fixture:mutation" }),
+      }),
+      UnexpectedBenchmarkModelInvocation,
+    );
+  } finally {
+    uninstall();
+  }
+  const counters = summarizeBatchInvocations(observed);
+  assert.equal(counters.single_generation.executing, 1);
 });
 
 test("deterministic patch leaves unmatched result fields byte-identical", () => {

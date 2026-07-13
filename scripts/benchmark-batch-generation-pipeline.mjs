@@ -15,6 +15,7 @@ require("ts-node/register/transpile-only");
 const {
   aggregateTimedReplays,
   assertBatchBenchmarkInvariants,
+  createFrozenDashboardLocalAdapter,
   createBatchBenchmarkReport,
   runTimedBatchFixtureReplay,
   summarizeNumericSamples,
@@ -44,6 +45,11 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
 
   const baselineAdapter = loadPipelineAdapter(baselineRoot);
   const taskAdapter = loadPipelineAdapter(taskRoot);
+  if (baselineAdapter.productionSourceFingerprint !== taskAdapter.productionSourceFingerprint) {
+    throw new Error(
+      "Dashboard pipeline source fingerprint differs between baseline and task; review and upgrade Frozen Adapter first",
+    );
+  }
   for (let iteration = 0; iteration < warmups; iteration += 1) {
     if (iteration % 2 === 0) {
       runTimedBatchFixtureReplay(fixture, baselineAdapter);
@@ -89,6 +95,7 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
     payloadBytes: taskAggregate.payloadBytes,
     invocationCounters: taskRuns.at(-1).invocationCounters,
     quality,
+    extensions: createBenchmarkExtensions(taskAdapter, quality),
     generatedAt: new Date().toISOString(),
   });
   assertBatchBenchmarkInvariants(report);
@@ -108,6 +115,13 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
     comparison: compareAggregates(baselineAggregate, taskAggregate),
     environment: await collectEnvironment(taskRoot),
   };
+  const fullPipelineComparison = finalReport.comparison.full_local_pipeline_total;
+  if (fullPipelineComparison.p50Ratio > 1.05 || fullPipelineComparison.p95Ratio > 1.05) {
+    throw new Error(
+      `Frozen pipeline regression exceeds 105%: p50=${fullPipelineComparison.p50Ratio.toFixed(4)}, p95=${fullPipelineComparison.p95Ratio.toFixed(4)}`,
+    );
+  }
+  assertReplayQualityNotRegressed(baselineRuns.at(-1).quality, quality);
   await mkdir(path.dirname(outputPath), { recursive: true });
   await writeFile(outputPath, `${JSON.stringify(finalReport, null, 2)}\n`, "utf8");
   console.log(JSON.stringify({
@@ -119,21 +133,35 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
     coefficientOfVariation: pipelineVariation,
     invocationCounters: report.invocationCounters,
     quality: report.quality,
+    extensions: report.extensions,
   }, null, 2));
   return finalReport;
 }
 
 function loadPipelineAdapter(root) {
-  const rootRequire = createRequire(path.join(root, "package.json"));
-  const gate = rootRequire(path.join(root, "lib", "batch-segment-quality-gate.ts"));
-  const report = rootRequire(path.join(root, "lib", "batch-segment-quality-report.ts"));
-  const router = rootRequire(path.join(root, "lib", "batch-segment-outcome-router.ts"));
+  return createFrozenDashboardLocalAdapter(root);
+}
+
+function createBenchmarkExtensions(adapter, quality) {
+  const modelPromptLengths = [...quality.modelPromptLengths].sort((left, right) => left - right);
+  const at = (fraction) => modelPromptLengths[
+    Math.min(modelPromptLengths.length - 1, Math.max(0, Math.ceil(modelPromptLengths.length * fraction) - 1))
+  ] || 0;
   return {
-    evaluateBatchSegmentQuality: gate.evaluateBatchSegmentQuality,
-    selectDeterministicQualityPatchFindings: gate.selectDeterministicQualityPatchFindings,
-    applyDeterministicQualityPatchWithDiff: gate.applyDeterministicQualityPatchWithDiff,
-    createSegmentQualityReport: report.createSegmentQualityReport,
-    routeBatchSegmentOutcome: router.routeBatchSegmentOutcome,
+    adapterVersion: adapter.adapterVersion,
+    productionSourceFingerprint: adapter.productionSourceFingerprint,
+    canonicalPromptHashes: quality.canonicalPromptHashes,
+    modelPromptLengths: {
+      min: modelPromptLengths[0] || 0,
+      p50: at(0.5),
+      p95: at(0.95),
+      max: modelPromptLengths.at(-1) || 0,
+    },
+    localPatchOperations: quality.localPatchOperations,
+    localPatchSegments: quality.localPatchSegments,
+    uniquePatchPaths: quality.uniquePatchPaths,
+    routeDecisionCounts: quality.routeDecisionCounts,
+    findingCounts: quality.findingCounts,
   };
 }
 
@@ -264,6 +292,19 @@ function compareAggregates(baseline, task) {
       p95Ratio: baselineTiming?.p95 ? taskTiming.p95 / baselineTiming.p95 : 1,
     }];
   }));
+}
+
+function assertReplayQualityNotRegressed(baseline, task) {
+  const minimum = (values) => Math.min(...values);
+  if (task.accepted < baseline.accepted || task.blocked > baseline.blocked) {
+    throw new Error("Frozen task quality route counts regressed from baseline");
+  }
+  if (task.missingRequiredFields > baseline.missingRequiredFields) {
+    throw new Error("Frozen task introduced missing required fields");
+  }
+  if (minimum(task.promptLengths) < minimum(baseline.promptLengths)) {
+    throw new Error("Frozen task canonical prompt length regressed from baseline");
+  }
 }
 
 function parseArgs(argv) {

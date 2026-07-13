@@ -90,7 +90,7 @@ export function createBatchGenerationFixture({ fixtureId, segmentCount, shapePro
         "workflow.fullVideoPrompt",
       ],
       adapterVersion: "frozen-dashboard-local-v1",
-      productionSourceFingerprint: "pending-phase-0r-b",
+      productionSourceFingerprint: "1e2343056569182e97215a1e9bdf7a040aa3ffeeee3067d726753d242bf3239f",
     },
   });
 }

@@ -13,7 +13,7 @@ const fixture = createBatchGenerationFixture({
   shapeProfile: OBSERVED_SHAPE_PROFILE_20,
 });
 
-export const FIXTURE_SHA256 = "ebf6d74f528ecb9d587eb288570333312017244739119bdc65c74c26375192a1";
+export const FIXTURE_SHA256 = "bb422cc0398457da43398e2e7f29a48289e39a909b987389314124b80d463f69";
 export const FIXTURE_MANIFEST = createFixtureManifest(fixture, OBSERVED_SHAPE_PROFILE_20, {
   count: 20,
   min: 1444,
