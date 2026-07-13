@@ -13,6 +13,8 @@ import fixture20, {
 import fixture30, {
   FIXTURE_SHA256 as FIXTURE_30_SHA256,
 } from "./fixtures/batch-generation/batch-generation-30-segment.mjs";
+import * as fixture20Module from "./fixtures/batch-generation/batch-generation-20-segment.mjs";
+import * as fixture30Module from "./fixtures/batch-generation/batch-generation-30-segment.mjs";
 
 process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({
   module: "commonjs",
@@ -149,7 +151,11 @@ function assertFixtureIntegrity(fixture, expectedHash) {
   assert.equal(Buffer.from(canonicalizeFixture(fixture), "utf8").toString("utf8"), canonicalizeFixture(fixture));
   assert.doesNotMatch(canonicalizeFixture(fixture), /(?:undefined|null)/i);
   fixture.renderedResults.forEach((result, index) => {
-    assert.equal(result.storyboard.length, 4, `segment ${index + 1} should keep four shots`);
+    assert.equal(
+      result.storyboard.length,
+      fixture.qualityContext[index].expectedShotCount,
+      `segment ${index + 1} should keep its declared shot count`,
+    );
     assert.ok(
       result.workflow.fullVideoPrompt.replace(/\s+/g, "").length > 1400,
       `segment ${index + 1} should keep a prompt above 1400 characters`,
@@ -158,6 +164,53 @@ function assertFixtureIntegrity(fixture, expectedHash) {
   const nearLimit = compileSegmentContractRenderBlock(fixture.contracts.at(-1));
   assert.ok(nearLimit.byteLength >= 2_400 && nearLimit.byteLength <= 3_072);
 }
+
+test("representative fixtures publish diverse non-content shape manifests", () => {
+  for (const [fixture, manifest, minimumScenarios] of [
+    [fixture20, fixture20Module.FIXTURE_MANIFEST, 8],
+    [fixture30, fixture30Module.FIXTURE_MANIFEST, 12],
+  ]) {
+    assert.ok(manifest, `${fixture.fixtureId} must export a shape manifest`);
+    assert.equal(manifest.fixtureSchemaVersion, 1);
+    assert.equal(manifest.fixtureId, fixture.fixtureId);
+    assert.equal(manifest.segmentCount, fixture.segmentCount);
+    assert.match(manifest.sourceShapeHash, /^[a-f0-9]{64}$/);
+    assert.ok(manifest.scenarioCount >= minimumScenarios);
+    assert.deepEqual(manifest.shotCountHistogram, fixture.renderedResults.reduce((histogram, result) => {
+      const key = String(result.storyboard.length);
+      histogram[key] = (histogram[key] || 0) + 1;
+      return histogram;
+    }, {}));
+    assert.ok(manifest.promptLengthSummary.min >= 900);
+    assert.ok(manifest.contractByteSummary.max >= 2_400);
+    assert.ok(manifest.contractByteSummary.max <= 3_072);
+    assert.ok(manifest.safetyPolarityCounts.negatedFact >= 1);
+    assert.ok(manifest.safetyPolarityCounts.negativeConstraint >= 1);
+    assert.ok(manifest.eventSlotShapeSummary.totalSlots >= fixture.segmentCount);
+    assert.ok(Array.isArray(manifest.expectedUniquePatchPaths));
+
+    const scenarioCounts = fixture.renderedResults.reduce((counts, result) => {
+      const id = result.fixtureSentinel?.scenarioId;
+      assert.ok(id, "every synthetic segment must identify its scenario");
+      counts[id] = (counts[id] || 0) + 1;
+      return counts;
+    }, {});
+    assert.equal(Object.keys(scenarioCounts).length, manifest.scenarioCount);
+    assert.ok(Math.max(...Object.values(scenarioCounts)) <= fixture.segmentCount * 0.25);
+  }
+  assert.ok(fixture30.renderedResults.some((result) => result.storyboard.length === 5));
+});
+
+test("representative fixtures remain synthetic and privacy-safe", () => {
+  const serialized = canonicalizeFixture({ fixture20, fixture30 });
+  assert.doesNotMatch(serialized, /PRIVATE_/i);
+  assert.doesNotMatch(serialized, /[A-Z]:\\\\/);
+  assert.doesNotMatch(serialized, /(?:https?:\/\/|localhost:\d+)/i);
+  assert.doesNotMatch(serialized, /[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/);
+  assert.doesNotMatch(serialized, /(?<!\d)1[3-9]\d{9}(?!\d)/);
+  assert.doesNotMatch(serialized, /season-pack-job-|project_[a-z0-9-]{8,}/i);
+  assert.doesNotMatch(serialized, /(?:undefined|null|ï¿½|�)/i);
+});
 
 test("frozen 20- and 30-segment fixtures have stable hashes and complete prompt structure", () => {
   assertFixtureIntegrity(fixture20, FIXTURE_20_SHA256);

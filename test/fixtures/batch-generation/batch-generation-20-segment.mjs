@@ -3,13 +3,23 @@ import {
   cloneFixture,
   computeFixtureHash,
   createBatchGenerationFixture,
+  createFixtureManifest,
 } from "./shared.mjs";
+import { OBSERVED_SHAPE_PROFILE_20 } from "./shape-profiles.mjs";
 
 const fixture = createBatchGenerationFixture({
   fixtureId: "observed-20-segment",
   segmentCount: 20,
+  shapeProfile: OBSERVED_SHAPE_PROFILE_20,
 });
 
-export const FIXTURE_SHA256 = "a53d9512cb3939763de8cb174b88c5681a23cf460770292d7298d3935ea3b347";
+export const FIXTURE_SHA256 = "ebf6d74f528ecb9d587eb288570333312017244739119bdc65c74c26375192a1";
+export const FIXTURE_MANIFEST = createFixtureManifest(fixture, OBSERVED_SHAPE_PROFILE_20, {
+  count: 20,
+  min: 1444,
+  p50: 1447,
+  p95: 1455,
+  max: 2441,
+});
 export { canonicalizeFixture, cloneFixture, computeFixtureHash };
 export default fixture;
