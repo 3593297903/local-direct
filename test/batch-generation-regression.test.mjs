@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -277,7 +278,8 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
   const queueRoot = path.join(root, ".tmp-video-prompt-pack-codex");
   const resultRoot = path.join(queueRoot, "results");
   const cacheRoot = path.join(root, ".tmp-segment-batch-cache");
-  const outputPath = path.join(root, "analysis", "report.json");
+  const excludedEvidenceRoot = path.join(root, ".tmp-task-one-evidence");
+  const outputPath = path.join(excludedEvidenceRoot, "analysis", "report.json");
   const sourceFiles = [];
 
   async function writeJson(target, value) {
@@ -339,6 +341,17 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
       segmentIndexes: [4],
       createdAt: "2026-07-13T00:00:00.000Z",
     });
+    await writeJson(path.join(queueRoot, "completed", "job-worker-started.json"), {
+      id: "job-worker-started",
+      status: "completed",
+      taskClass: "render_pack",
+      sourceHash: "worker-started-source",
+      contractHash: "worker-started-contract",
+      segmentIndexes: [5],
+      createdAt: "2026-07-13T00:00:00.000Z",
+      startedAt: "2026-07-13T00:00:03.000Z",
+      completedAt: "2026-07-13T00:00:07.000Z",
+    });
     const completeResult = path.join(resultRoot, "job-complete", "episode-001.json");
     await writeJson(completeResult, {
       jobId: "job-complete",
@@ -350,39 +363,125 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
       title: "孤立合成结果",
       workflow: { fullVideoPrompt: "PRIVATE_ORPHAN_PROMPT_MARKER" },
     });
+    await writeJson(path.join(resultRoot, "job-result-without-job", "episode-004.json"), {
+      jobId: "job-result-without-job",
+      title: "无任务结果",
+      workflow: { fullVideoPrompt: "PRIVATE_RESULT_WITHOUT_JOB_MARKER" },
+    });
     await writeJson(path.join(cacheRoot, "batch-fixture.json"), {
       schemaVersion: 2,
+      revision: 3,
       batchId: "batch-fixture",
       durableBatchId: "batch-fixture",
       sourceHash: "synthetic-source",
       contractHash: "synthetic-contract",
       resolvedSegmentCount: 2,
       updatedAt: "2026-07-13T00:00:10.000Z",
-      segmentStates: [],
+      segmentStates: [{ index: 1, activeRepairJobId: "job-worker-started" }],
       activeJobIds: ["job-complete"],
       qualityReports: [],
       segments: [],
       needsReviewSegments: [],
-      invocationEvents: [{ jobId: "job-complete" }],
+      invocationEvents: [
+        { name: "renderPackCalls", at: 1, count: 2, jobId: "job-complete" },
+        { name: "singleRegenerationCalls", at: 2, count: 1 },
+        { name: "pathPatchJobCreated", at: 3, count: 3 },
+        { name: "judgeCalls", at: 4, count: 1 },
+        { name: "localPatchOperations", at: 5, count: 4 },
+      ],
+    });
+    await writeJson(path.join(cacheRoot, "old-analyzer-report.json"), {
+      schemaVersion: 1,
+      arbitrary: { jobId: "job-orphan" },
+      prompt: "PRIVATE_STALE_REPORT_MARKER",
+    });
+    await writeJson(path.join(excludedEvidenceRoot, "old-report.json"), {
+      status: "completed",
+      taskClass: "render_pack",
+      id: "excluded-fake-job",
+      jobId: "job-orphan",
+      prompt: "PRIVATE_EXCLUDED_EVIDENCE_MARKER",
     });
     await utimes(completeResult, new Date("2026-07-13T00:00:20.000Z"), new Date("2026-07-13T00:00:20.000Z"));
-    const mtimesBefore = new Map(await Promise.all(sourceFiles.map(async (file) => [file, (await stat(file)).mtimeMs])));
+    const sourceSnapshotsBefore = new Map(
+      await Promise.all(
+        sourceFiles.map(async (file) => {
+          const [fileStat, body] = await Promise.all([stat(file), readFile(file)]);
+          return [
+            file,
+            {
+              mtimeMs: fileStat.mtimeMs,
+              size: fileStat.size,
+              sha256: createHash("sha256").update(body).digest("hex"),
+            },
+          ];
+        }),
+      ),
+    );
 
-    const report = await analyzeBatchJobArtifacts({ root, outputPath });
-    const serialized = JSON.stringify(report);
+    const firstReport = await analyzeBatchJobArtifacts({ root, outputPath });
+    const secondReport = await analyzeBatchJobArtifacts({ root, outputPath });
+    const stableProjection = (report) => {
+      const value = structuredClone(report);
+      delete value.generatedAt;
+      return value;
+    };
+    const report = secondReport;
+    const serialized = JSON.stringify({ firstReport, secondReport });
 
-    assert.equal(report.statusCounts.completed, 3);
+    assert.deepEqual(stableProjection(firstReport), stableProjection(secondReport));
+    assert.deepEqual(report.scanRoots, [
+      ".tmp-batch-segment-repair-codex",
+      ".tmp-event-coverage-codex",
+      ".tmp-prompt-safety-codex",
+      ".tmp-season-pack-codex",
+      ".tmp-segment-batch-cache",
+      ".tmp-video-prompt-codex",
+      ".tmp-video-prompt-pack-codex",
+    ]);
+    assert.equal(report.statusCounts.completed, 4);
     assert.equal(report.statusCounts.failed, 2);
     assert.equal(report.statusCounts.running, 1);
     assert.equal(report.failures.CODEX_TIMEOUT, 1);
     assert.equal(Object.keys(report.failures).some((key) => key.startsWith("FIRST_LINE_SHA256:")), true);
     assert.equal(report.duplicates.length, 1);
     assert.equal(report.completedBeforeFinalOutput.some((item) => item.jobId === "job-complete"), true);
-    assert.equal(report.orphanCompletedResults.some((item) => item.jobId === "job-orphan"), true);
+    assert.equal(report.resultWithoutJob.some((item) => item.jobId === "job-result-without-job"), true);
+    assert.equal(
+      report.matchingCompletedResults.some(
+        (item) => item.jobId === "job-orphan" && item.referenceStatus === "unknown",
+      ),
+      true,
+    );
+    assert.equal(report.orphanCompletedResults.some((item) => item.jobId === "job-orphan"), false);
     assert.ok(report.timingsByTaskClass.render_pack.queueWaitMs.unknown >= 1);
-    assert.doesNotMatch(serialized, /PRIVATE_(?:ERROR|ORPHAN_)?PROMPT_MARKER/);
+    assert.ok(report.timingsByTaskClass.render_pack.claimWaitSupplementMs.count >= 1);
+    assert.ok(report.timingsByTaskClass.render_pack.workerWallSupplementMs.count >= 1);
+    assert.equal(report.modelInvocationCounts.render_pack, 5);
+    assert.equal(report.historicalInvocationCounts.renderPackCalls.known, 2);
+    assert.equal(report.historicalInvocationCounts.singleRegenerationCalls.known, 1);
+    assert.equal(report.historicalInvocationCounts.pathPatchJobCreated.known, 3);
+    assert.equal(report.historicalInvocationCounts.judgeCalls.known, 1);
+    assert.equal(report.historicalInvocationCounts.localPatchOperations.known, 4);
+    assert.equal(report.historicalInvocationCounts.pathPatchCompleted.known, 0);
+    assert.ok(report.historicalInvocationCounts.pathPatchCompleted.unknown >= 1);
+    assert.doesNotMatch(
+      serialized,
+      /PRIVATE_(?:ERROR|ORPHAN_|RESULT_WITHOUT_JOB_|STALE_REPORT_|EXCLUDED_EVIDENCE_)?(?:PROMPT_)?MARKER/,
+    );
+    assert.equal(serialized.includes("excluded-fake-job"), false);
     assert.equal(JSON.parse(await readFile(outputPath, "utf8")).schemaVersion, 1);
-    for (const [file, before] of mtimesBefore) assert.equal((await stat(file)).mtimeMs, before);
+    for (const [file, before] of sourceSnapshotsBefore) {
+      const [fileStat, body] = await Promise.all([stat(file), readFile(file)]);
+      assert.deepEqual(
+        {
+          mtimeMs: fileStat.mtimeMs,
+          size: fileStat.size,
+          sha256: createHash("sha256").update(body).digest("hex"),
+        },
+        before,
+      );
+    }
 
     assert.throws(
       () => validateArtifactRoot(path.parse(root).root, { allowExternalRead: false }),

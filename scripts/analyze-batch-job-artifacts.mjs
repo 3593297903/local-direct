@@ -5,12 +5,32 @@ import { fileURLToPath } from "node:url";
 
 const LOCAL_DIRECTOR_ROOT = path.resolve("E:\\localdirector");
 const JOB_STATUS_DIRECTORIES = new Set(["pending", "running", "completed", "failed"]);
+const ARTIFACT_SCAN_ROOTS = Object.freeze([
+  ".tmp-batch-segment-repair-codex",
+  ".tmp-event-coverage-codex",
+  ".tmp-prompt-safety-codex",
+  ".tmp-season-pack-codex",
+  ".tmp-segment-batch-cache",
+  ".tmp-video-prompt-codex",
+  ".tmp-video-prompt-pack-codex",
+]);
+const ARTIFACT_SCAN_ROOT_SET = new Set(ARTIFACT_SCAN_ROOTS);
+const INVOCATION_METRIC_NAMES = Object.freeze([
+  "renderPackCalls",
+  "singleRegenerationCalls",
+  "pathPatchJobCreated",
+  "pathPatchCompleted",
+  "judgeCalls",
+  "localPatchOperations",
+]);
 const TIMING_DEFINITIONS = Object.freeze({
   queueWaitMs: ["createdAt", "executingAt"],
   slotWaitMs: ["waitingSlotAt", "executingAt"],
   executionMs: ["executingAt", "codexExitedAt"],
   finalizationMs: ["codexExitedAt", "completedAt"],
   wallMs: ["createdAt", "completedAt"],
+  claimWaitSupplementMs: ["createdAt", "startedAt"],
+  workerWallSupplementMs: ["startedAt", "completedAt"],
 });
 
 function isRecord(value) {
@@ -44,7 +64,7 @@ export function validateArtifactRoot(root, { allowExternalRead = false } = {}) {
   return absoluteRoot;
 }
 
-async function listJsonFiles(root) {
+async function listJsonFiles(root, excludedFiles = new Set()) {
   const files = [];
 
   async function visit(directory) {
@@ -59,7 +79,13 @@ async function listJsonFiles(root) {
     for (const entry of entries) {
       const target = path.join(directory, entry.name);
       if (entry.isDirectory()) await visit(target);
-      else if (entry.isFile() && entry.name.toLowerCase().endsWith(".json")) files.push(target);
+      else if (
+        entry.isFile()
+        && entry.name.toLowerCase().endsWith(".json")
+        && !excludedFiles.has(path.resolve(target).toLowerCase())
+      ) {
+        files.push(target);
+      }
     }
   }
 
@@ -71,14 +97,14 @@ async function listJsonFiles(root) {
     throw error;
   }
 
-  const candidateDirectories = rootEntries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith(".tmp-"))
-    .map((entry) => path.join(root, entry.name))
-    .sort((left, right) => left.localeCompare(right));
-
-  if (path.basename(root).startsWith(".tmp-")) candidateDirectories.unshift(root);
+  const rootName = path.basename(root);
+  const candidateDirectories = ARTIFACT_SCAN_ROOT_SET.has(rootName)
+    ? [root]
+    : ARTIFACT_SCAN_ROOTS
+      .filter((name) => rootEntries.some((entry) => entry.isDirectory() && entry.name === name))
+      .map((name) => path.join(root, name));
   for (const directory of [...new Set(candidateDirectories)]) await visit(directory);
-  return files;
+  return files.sort((left, right) => left.localeCompare(right));
 }
 
 function percentile(sorted, fraction) {
@@ -145,24 +171,62 @@ function isResultFile(file) {
   return file.split(path.sep).some((part) => part.toLowerCase() === "results");
 }
 
-function collectReferencedJobIds(value, references = new Set(), key = "") {
-  if (Array.isArray(value)) {
-    for (const item of value) collectReferencedJobIds(item, references, key);
-    return references;
+function isDurableSegmentBatchCache(value) {
+  return isRecord(value)
+    && value.schemaVersion === 2
+    && Number.isInteger(value.revision)
+    && value.revision >= 0
+    && cleanString(value.batchId)
+    && cleanString(value.durableBatchId)
+    && cleanString(value.sourceHash)
+    && cleanString(value.contractHash)
+    && Number.isInteger(value.resolvedSegmentCount)
+    && value.resolvedSegmentCount > 0
+    && Array.isArray(value.segmentStates)
+    && Array.isArray(value.activeJobIds)
+    && Array.isArray(value.qualityReports)
+    && Array.isArray(value.segments)
+    && Array.isArray(value.needsReviewSegments);
+}
+
+function createHistoricalInvocationCounts() {
+  return Object.fromEntries(
+    INVOCATION_METRIC_NAMES.map((name) => [name, { known: 0, unknown: 0, samples: 0 }]),
+  );
+}
+
+function collectDurableCacheEvidence(value, references, historicalCounts) {
+  for (const candidate of value.activeJobIds) {
+    const id = cleanString(candidate);
+    if (id) references.add(id);
   }
-  if (!isRecord(value)) return references;
-  for (const [childKey, childValue] of Object.entries(value)) {
-    const normalizedKey = childKey.toLowerCase();
-    if (/jobids?$/.test(normalizedKey)) {
-      const values = Array.isArray(childValue) ? childValue : [childValue];
-      for (const candidate of values) {
-        const id = cleanString(candidate);
-        if (id) references.add(id);
-      }
+  for (const state of value.segmentStates) {
+    const id = cleanString(isRecord(state) ? state.activeRepairJobId : "");
+    if (id) references.add(id);
+  }
+
+  const events = Array.isArray(value.invocationEvents) ? value.invocationEvents : [];
+  for (const event of events) {
+    if (!isRecord(event)) continue;
+    const id = cleanString(event.jobId);
+    if (id) references.add(id);
+  }
+  for (const name of INVOCATION_METRIC_NAMES) {
+    const matching = events.filter((event) => isRecord(event) && event.name === name);
+    if (matching.length === 0) {
+      historicalCounts[name].unknown += 1;
+      continue;
     }
-    collectReferencedJobIds(childValue, references, normalizedKey || key);
+    for (const event of matching) {
+      const count = Number(event.count);
+      if (!Number.isFinite(count) || count < 0) {
+        historicalCounts[name].unknown += 1;
+        continue;
+      }
+      historicalCounts[name].known += count;
+      historicalCounts[name].samples += 1;
+    }
   }
-  return references;
 }
 
 function segmentIndexes(value) {
@@ -201,10 +265,14 @@ function emptyTaskTiming() {
 export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternalRead = false }) {
   const absoluteRoot = validateArtifactRoot(root, { allowExternalRead });
   const absoluteOutput = outputPath ? path.resolve(outputPath) : null;
-  const files = await listJsonFiles(absoluteRoot);
+  const excludedFiles = new Set(absoluteOutput ? [absoluteOutput.toLowerCase()] : []);
+  const files = await listJsonFiles(absoluteRoot, excludedFiles);
   const jobs = [];
   const results = [];
   const referencedJobIds = new Set();
+  const historicalInvocationCounts = createHistoricalInvocationCounts();
+  let durableCacheDocuments = 0;
+  let ignoredCacheDocuments = 0;
   const parseErrors = [];
 
   for (const file of files) {
@@ -244,7 +312,19 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
       });
       continue;
     }
-    collectReferencedJobIds(value, referencedJobIds);
+    const artifactRootName = relativeSafe(absoluteRoot, file).split("/", 1)[0];
+    if (artifactRootName === ".tmp-segment-batch-cache") {
+      if (isDurableSegmentBatchCache(value)) {
+        durableCacheDocuments += 1;
+        collectDurableCacheEvidence(value, referencedJobIds, historicalInvocationCounts);
+      } else {
+        ignoredCacheDocuments += 1;
+      }
+    }
+  }
+
+  if (durableCacheDocuments === 0) {
+    for (const name of INVOCATION_METRIC_NAMES) historicalInvocationCounts[name].unknown += 1;
   }
 
   const statusCounts = {};
@@ -298,7 +378,9 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
     .sort((left, right) => left.identityHash.localeCompare(right.identityHash));
 
   const completedBeforeFinalOutput = [];
-  const orphanCompletedResults = [];
+  const matchingCompletedResults = [];
+  const matchingNonCompletedResults = [];
+  const resultWithoutJob = [];
   for (const result of results) {
     const job = jobsById.get(result.jobId);
     if (job?.status === "completed") {
@@ -312,33 +394,55 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
           outputModifiedAfterCompletionMs: Math.round(result.mtimeMs - completedAt),
         });
       }
-      if (!referencedJobIds.has(result.jobId)) {
-        orphanCompletedResults.push({
-          jobId: result.jobId,
-          resultPath: result.path,
-          resultSha256: result.sha256,
-          resultBytes: result.bytes,
-        });
-      }
+      matchingCompletedResults.push({
+        jobId: result.jobId,
+        resultPath: result.path,
+        resultSha256: result.sha256,
+        resultBytes: result.bytes,
+        referenceStatus: referencedJobIds.has(result.jobId) ? "referenced" : "unknown",
+      });
+    } else if (job) {
+      matchingNonCompletedResults.push({
+        jobId: result.jobId,
+        jobStatus: job.status,
+        resultPath: result.path,
+        resultSha256: result.sha256,
+        resultBytes: result.bytes,
+        referenceStatus: referencedJobIds.has(result.jobId) ? "referenced" : "unknown",
+      });
+    } else {
+      resultWithoutJob.push({
+        jobId: result.jobId || null,
+        resultPath: result.path,
+        resultSha256: result.sha256,
+        resultBytes: result.bytes,
+      });
     }
   }
 
   const report = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
-    root: absoluteRoot,
+    root: ".",
+    scanRoots: [...ARTIFACT_SCAN_ROOTS],
     filesScanned: files.length,
     jobsScanned: jobs.length,
     resultsScanned: results.length,
+    durableCacheDocuments,
+    ignoredCacheDocuments,
     statusCounts: Object.fromEntries(Object.entries(statusCounts).sort(([left], [right]) => left.localeCompare(right))),
     timingsByTaskClass,
     failures: Object.fromEntries(Object.entries(failures).sort(([left], [right]) => left.localeCompare(right))),
     modelInvocationCounts: Object.fromEntries(
       Object.entries(invocationCounts).sort(([left], [right]) => left.localeCompare(right)),
     ),
+    historicalInvocationCounts,
     duplicates,
     completedBeforeFinalOutput: completedBeforeFinalOutput.sort((left, right) => left.jobId.localeCompare(right.jobId)),
-    orphanCompletedResults: orphanCompletedResults.sort((left, right) => left.jobId.localeCompare(right.jobId)),
+    matchingCompletedResults: matchingCompletedResults.sort((left, right) => left.jobId.localeCompare(right.jobId)),
+    matchingNonCompletedResults: matchingNonCompletedResults.sort((left, right) => left.jobId.localeCompare(right.jobId)),
+    resultWithoutJob: resultWithoutJob.sort((left, right) => String(left.jobId).localeCompare(String(right.jobId))),
+    orphanCompletedResults: [],
     parseErrors,
   };
 
