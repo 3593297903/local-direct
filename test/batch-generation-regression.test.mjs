@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import path from "node:path";
 import test from "node:test";
 
 import fixture20, {
@@ -212,4 +214,128 @@ test("deterministic patch leaves unmatched result fields byte-identical", () => 
   });
 
   assert.equal(after, before);
+});
+
+test("real-artifact analyzer is read-only, redacts prompt bodies and preserves unknown timings", async () => {
+  const { analyzeBatchJobArtifacts, validateArtifactRoot } = await import(
+    "../scripts/analyze-batch-job-artifacts.mjs"
+  );
+  const root = path.join(process.cwd(), ".tmp-batch-benchmark", `artifact-test-${process.pid}-${Date.now()}`);
+  const queueRoot = path.join(root, ".tmp-video-prompt-pack-codex");
+  const resultRoot = path.join(queueRoot, "results");
+  const cacheRoot = path.join(root, ".tmp-segment-batch-cache");
+  const outputPath = path.join(root, "analysis", "report.json");
+  const sourceFiles = [];
+
+  async function writeJson(target, value) {
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    sourceFiles.push(target);
+  }
+
+  const baseJob = {
+    status: "completed",
+    taskClass: "render_pack",
+    sourceHash: "synthetic-source",
+    contractHash: "synthetic-contract",
+    segmentIndexes: [1, 2],
+    createdAt: "2026-07-13T00:00:00.000Z",
+    waitingSlotAt: "2026-07-13T00:00:01.000Z",
+    executingAt: "2026-07-13T00:00:02.000Z",
+    codexExitedAt: "2026-07-13T00:00:05.000Z",
+    completedAt: "2026-07-13T00:00:06.000Z",
+  };
+  try {
+    await writeJson(path.join(queueRoot, "completed", "job-complete.json"), {
+      ...baseJob,
+      id: "job-complete",
+    });
+    await writeJson(path.join(queueRoot, "completed", "job-duplicate.json"), {
+      ...baseJob,
+      id: "job-duplicate",
+      completedAt: "2026-07-13T00:00:07.000Z",
+    });
+    await writeJson(path.join(queueRoot, "completed", "job-orphan.json"), {
+      ...baseJob,
+      id: "job-orphan",
+      sourceHash: "orphan-source",
+      contractHash: "orphan-contract",
+      segmentIndexes: [3],
+    });
+    await writeJson(path.join(queueRoot, "failed", "job-stable-error.json"), {
+      ...baseJob,
+      id: "job-stable-error",
+      status: "failed",
+      errorCode: "CODEX_TIMEOUT",
+      error: "timeout while waiting for synthetic worker",
+      completedAt: "2026-07-13T00:00:08.000Z",
+    });
+    await writeJson(path.join(queueRoot, "failed", "job-first-line.json"), {
+      ...baseJob,
+      id: "job-first-line",
+      status: "failed",
+      error: "PRIVATE_ERROR_PROMPT_MARKER must never appear in analyzer output\nsecond line",
+      completedAt: "2026-07-13T00:00:09.000Z",
+    });
+    await writeJson(path.join(queueRoot, "running", "job-unknown-time.json"), {
+      id: "job-unknown-time",
+      status: "running",
+      taskClass: "render_pack",
+      sourceHash: "running-source",
+      contractHash: "running-contract",
+      segmentIndexes: [4],
+      createdAt: "2026-07-13T00:00:00.000Z",
+    });
+    const completeResult = path.join(resultRoot, "job-complete", "episode-001.json");
+    await writeJson(completeResult, {
+      jobId: "job-complete",
+      title: "合成结果",
+      workflow: { fullVideoPrompt: "PRIVATE_PROMPT_MARKER" },
+    });
+    await writeJson(path.join(resultRoot, "job-orphan", "episode-003.json"), {
+      jobId: "job-orphan",
+      title: "孤立合成结果",
+      workflow: { fullVideoPrompt: "PRIVATE_ORPHAN_PROMPT_MARKER" },
+    });
+    await writeJson(path.join(cacheRoot, "batch-fixture.json"), {
+      schemaVersion: 2,
+      batchId: "batch-fixture",
+      durableBatchId: "batch-fixture",
+      sourceHash: "synthetic-source",
+      contractHash: "synthetic-contract",
+      resolvedSegmentCount: 2,
+      updatedAt: "2026-07-13T00:00:10.000Z",
+      segmentStates: [],
+      activeJobIds: ["job-complete"],
+      qualityReports: [],
+      segments: [],
+      needsReviewSegments: [],
+      invocationEvents: [{ jobId: "job-complete" }],
+    });
+    await utimes(completeResult, new Date("2026-07-13T00:00:20.000Z"), new Date("2026-07-13T00:00:20.000Z"));
+    const mtimesBefore = new Map(await Promise.all(sourceFiles.map(async (file) => [file, (await stat(file)).mtimeMs])));
+
+    const report = await analyzeBatchJobArtifacts({ root, outputPath });
+    const serialized = JSON.stringify(report);
+
+    assert.equal(report.statusCounts.completed, 3);
+    assert.equal(report.statusCounts.failed, 2);
+    assert.equal(report.statusCounts.running, 1);
+    assert.equal(report.failures.CODEX_TIMEOUT, 1);
+    assert.equal(Object.keys(report.failures).some((key) => key.startsWith("FIRST_LINE_SHA256:")), true);
+    assert.equal(report.duplicates.length, 1);
+    assert.equal(report.completedBeforeFinalOutput.some((item) => item.jobId === "job-complete"), true);
+    assert.equal(report.orphanCompletedResults.some((item) => item.jobId === "job-orphan"), true);
+    assert.ok(report.timingsByTaskClass.render_pack.queueWaitMs.unknown >= 1);
+    assert.doesNotMatch(serialized, /PRIVATE_(?:ERROR|ORPHAN_)?PROMPT_MARKER/);
+    assert.equal(JSON.parse(await readFile(outputPath, "utf8")).schemaVersion, 1);
+    for (const [file, before] of mtimesBefore) assert.equal((await stat(file)).mtimeMs, before);
+
+    assert.throws(
+      () => validateArtifactRoot(path.parse(root).root, { allowExternalRead: false }),
+      /outside E:\\localdirector/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
