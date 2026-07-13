@@ -151,7 +151,10 @@ export function decideLateRepairMerge(input: {
   ) {
     return { action: "archive_stale", reason: "repair hashes no longer match the current segment" };
   }
-  if (input.saveStatus === "saving" || input.saveStatus === "saved" || input.saveStatus === "review_saved") {
+  if (input.saveStatus === "saving") {
+    return { action: "continue_polling", reason: "segment save is still in flight" };
+  }
+  if (input.saveStatus === "saved" || input.saveStatus === "review_saved") {
     return { action: "late_patch_available", reason: "segment was already persisted" };
   }
   return { action: "merge", reason: "repair result matches the active segment revision" };

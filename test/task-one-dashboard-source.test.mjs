@@ -136,15 +136,26 @@ test("automatic planning progress never reads episodes before the season result 
 });
 
 test("refresh recovery discovers active batches before source-dependent fallback", () => {
-  const marker = source.indexOf("Failed to read batch recovery index");
-  const start = source.lastIndexOf("useEffect(() =>", marker);
-  const end = source.indexOf("useEffect(() =>", marker);
+  const start = source.indexOf("async function discoverBatchSaveRecovery");
+  const end = source.indexOf("function ensureBatchSaveRecoveryDiscovery", start);
   const body = source.slice(start, end);
 
-  assert.ok(marker >= 0 && start >= 0 && end > marker);
+  assert.ok(start >= 0 && end > start);
   assert.match(body, /SEGMENT_BATCH_RECOVERY_REGISTRY_KEY|readBatchRecoveryRegistry/);
-  assert.doesNotMatch(body.slice(0, 500), /!script\.trim\(\)/);
+  assert.doesNotMatch(body.slice(0, 700), /!script\.trim\(\)/);
   assert.match(body, /pointer\.sourceHash|sourceHash:\s*pointer\.sourceHash/);
+});
+
+test("recovery discovery is cache-only and cannot invoke any model API", () => {
+  const start = source.indexOf("async function discoverBatchSaveRecovery");
+  const end = source.indexOf("function ensureBatchSaveRecoveryDiscovery", start);
+  const body = source.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(body, /\/api\/segment-batch-cache\//);
+  assert.doesNotMatch(
+    body,
+    /createSeasonPackCodexJob|createVideoPromptPackCodexJob|createEventCoverageCodexJob|requestBatchSegmentRepairPatchWithContext|requestAnalysisWithContext|requestAnalysis\(/,
+  );
 });
 
 test("dashboard never stamps an omitted event with the latest revision at dispatch time", () => {
@@ -155,14 +166,17 @@ test("dashboard never stamps an omitted event with the latest revision at dispat
   assert.doesNotMatch(body, /baseRevision:\s*effectiveEvent\.baseRevision\s*\?\?\s*item\.revision/);
 });
 
-test("detached repair polling captures a revision before querying the job", () => {
+test("detached repair polling validates persisted repair identity around each query", () => {
   const start = source.indexOf("async function watchDetachedRepair");
   const end = source.indexOf("async function repairExistingBatchSegment", start);
   const body = source.slice(start, end);
-  const capture = body.search(/captureSegmentStateGuard|captureSegmentRevision/);
+  const capture = body.indexOf("captureRepairOperationIdentity");
   const query = body.indexOf("await queryBatchSegmentRepairCodexJob");
   assert.ok(capture >= 0 && query > capture);
-  assert.match(body, /baseRevision|dispatchGuardedSegmentStateEvent/);
+  assert.match(body, /queryIdentity\?\.jobId/);
+  assert.match(body, /isCurrentRepairOperation/);
+  assert.match(body, /dispatchCurrentRepairEvent/);
+  assert.doesNotMatch(body, /baseRevision|dispatchGuardedSegmentStateEvent/);
 });
 
 test("display progress cannot synthesize domain state transitions", () => {
@@ -189,5 +203,64 @@ test("clean deterministic results reuse the first quality gate instead of rescan
   assert.match(body, /patched\.patchDiffs\.length\s*>\s*0/);
   assert.match(body, /hasDeterministicChanges\s*\?\s*evaluateBatchSegmentQuality/);
   assert.match(body, /:\s*firstGate/);
+});
+
+test("save completion uses save identity instead of the global segment revision", () => {
+  const start = source.indexOf("const batchSaveController = createResumableBatchSaveController");
+  const end = source.indexOf("function queueReadySegmentSaves", start);
+  const body = source.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(body, /idempotencyKey|resultHash/);
+  assert.match(body, /isCurrentSaveOperation|isSaveOperationCurrent/);
+  assert.doesNotMatch(body, /dispatchGuardedSegmentStateEvent\(saveOperationGuards/);
+});
+
+test("render completion uses an operation token instead of a global revision snapshot", () => {
+  const start = source.indexOf("async function renderPackedSegmentsWithQualityRepair");
+  const end = source.indexOf("await restoreCachedRenderedSegments", start);
+  const body = source.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(body, /beginRenderOperation|createRenderOperation/);
+  assert.match(body, /isCurrentRenderOperation|isRenderOperationCurrent/);
+  assert.doesNotMatch(body, /Map<number, SegmentStateGuard>/);
+});
+
+test("repair completion validates persisted repair identity instead of display revision", () => {
+  const start = source.indexOf("async function watchDetachedRepair");
+  const end = source.indexOf("async function repairExistingBatchSegment", start);
+  const body = source.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(body, /jobId/);
+  assert.match(body, /resultHash/);
+  assert.doesNotMatch(body, /isSegmentStateGuardCurrent/);
+});
+
+test("batch generation awaits registry recovery discovery before season planning", () => {
+  const start = source.indexOf("async function runBatchEpisodeGeneration");
+  const season = source.indexOf("const seasonPackJob = await", start);
+  const body = source.slice(start, season);
+  assert.ok(start >= 0 && season > start);
+  assert.match(body, /await\s+(?:ensure|discover|resolve)[A-Za-z0-9_]*Batch[A-Za-z0-9_]*Recovery/);
+  assert.match(body, /resumeCachedBatchSavesOnly/);
+});
+
+test("unavailable recovery infrastructure blocks season planning instead of racing ahead", () => {
+  const start = source.indexOf("async function runBatchEpisodeGeneration");
+  const season = source.indexOf("const seasonPackJob = await", start);
+  const body = source.slice(start, season);
+  assert.ok(start >= 0 && season > start);
+  assert.match(body, /recoveryDiscovery\.status\s*===\s*["']unavailable["']/);
+  assert.match(body, /setError\(recoveryDiscovery\.message\)/);
+  assert.match(body, /setGenerationProgress\(recoveryDiscovery\.message\)/);
+  assert.match(body, /return;/);
+});
+
+test("canonical prompt fields are rebuilt even when no deterministic patch changed a leaf", () => {
+  const start = source.indexOf("function normalizePatchAndEvaluateBatchSegment");
+  const end = source.indexOf("function normalizePatchAndValidateBatchSegment", start);
+  const body = source.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(body, /const patchedResult = canonicalizeBatchSegmentResult\(patched\.result\)/);
+  assert.doesNotMatch(body, /hasDeterministicChanges\s*\?\s*canonicalizeBatchSegmentResult/);
 });
 

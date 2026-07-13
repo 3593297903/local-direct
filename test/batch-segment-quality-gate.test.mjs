@@ -60,6 +60,55 @@ function baseResult(overrides = {}) {
   };
 }
 
+test("rich storyboard can pass without leaf patches while canonical workflow fields start empty", () => {
+  const shots = Array.from({ length: 4 }, (_, offset) => {
+    const shotNumber = offset + 1;
+    return {
+      ...baseResult().storyboard[0],
+      shotNumber,
+      timeRange: `${offset * 3}s-${(offset + 1) * 3}s`,
+      scene: `调查室证据墙前第${shotNumber}处机位`,
+      visual: `调查员沿证据墙逐项核对第${shotNumber}组聊天记录，手指停在对应时间标记旁，旁侧人物保持克制反应。`,
+      composition: `证据墙占据画面右侧三分之二，调查员侧身位于左侧前景，线索标记形成清楚的视线方向。`,
+      cameraMovement: `摄影机从桌边稳定横移到第${shotNumber}组证据，再缓慢推进人物确认线索的手部动作。`,
+      lighting: `冷白屏幕光与室内顶灯共同勾勒人物轮廓，证据文字区域保持清晰但不过曝。`,
+      sound: `纸张翻动声、键盘轻响和压低的交谈声依次出现，环境底噪保持真实克制。`,
+      dialogue: "调查员低声确认：时间与记录能够对应。",
+      emotion: "克制而持续升高的调查压力",
+      transition: "以人物转身动作匹配切入下一组证据",
+      shotPurpose: `完成第${shotNumber}组线索核对并推动人物判断，为下一镜的证据反应建立明确因果。`,
+      firstFramePrompt: `调查室冷白灯下，证据墙与调查员侧影同时进入画面，桌面资料按时间顺序整齐铺开。`,
+      videoPrompt: `电影级写实近景，摄影机稳定横移并缓慢推进，调查员核对第${shotNumber}组聊天记录和时间标记，冷白屏幕光照亮克制表情，纸张与键盘声自然衔接。`,
+      lastFramePrompt: `调查员的手指停在关键时间标记上，证据墙保持清晰，人物侧脸在冷白光中形成下一镜承接。`,
+      negativePrompt: "避免低清、模糊、过曝、字幕水印、人物变形、无关道具和突兀镜头跳切。",
+    };
+  });
+  const raw = baseResult({
+    workflow: {
+      ...baseResult().workflow,
+      fullVideoPrompt: "",
+      filmScript: "",
+    },
+    storyboard: shots,
+  });
+  const canonicalText = shots
+    .map((shot) => `${shot.timeRange} ${shot.visual} ${shot.composition} ${shot.cameraMovement} ${shot.lighting} ${shot.sound}`)
+    .join("\n");
+  const gate = evaluateBatchSegmentQuality(raw, {
+    expectedShotCount: 4,
+    fullPromptText: canonicalText,
+    minFullPromptLength: 100,
+  });
+  const deterministicFindings = selectDeterministicQualityPatchFindings(gate.findings, { safetyEnabled: true });
+  const patched = applyDeterministicQualityPatchWithDiff(raw, deterministicFindings);
+
+  assert.equal(shouldRepairWithCodex(gate), false);
+  assert.ok(canonicalText.length > 100);
+  assert.equal(patched.patchDiffs.length, 0);
+  assert.equal(raw.workflow.fullVideoPrompt, "");
+  assert.equal(raw.workflow.filmScript, "");
+});
+
 test("patches short fields and negative prompt pollution without requiring Codex repair", () => {
   const raw = baseResult();
   const firstGate = evaluateBatchSegmentQuality(raw, { minFullPromptLength: 20 });

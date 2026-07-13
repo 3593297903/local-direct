@@ -231,22 +231,20 @@ export function reduceSegmentState(state: SegmentStateRecord, event: SegmentStat
       return {
         ...next,
         generationStatus: state.generationStatus === "repair_detached" ? "repair_detached" : "settled",
-        saveStatus: "cached",
-        lastErrorCode: undefined,
+        saveStatus: state.saveStatus === "save_failed" ? "save_failed" : "cached",
+        lastErrorCode: state.saveStatus === "save_failed" ? state.lastErrorCode : undefined,
       };
     case "SAVE_STARTED":
       return { ...next, saveStatus: "saving", lastErrorCode: undefined };
     case "SAVE_SUCCEEDED":
       return {
         ...next,
-        generationStatus: "settled",
         saveStatus: event.review ? "review_saved" : "saved",
         lastErrorCode: undefined,
       };
     case "SAVE_FAILED":
       return {
         ...next,
-        generationStatus: "settled",
         saveStatus: "save_failed",
         saveRetryCount: state.saveRetryCount + 1,
         lastErrorCode: event.errorCode,

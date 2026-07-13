@@ -226,3 +226,65 @@ test("a delayed repair completion cannot overwrite a newer repair lifecycle", ()
   assert.equal(afterLateCompletion.activeRepairJobId, "job-new");
   assert.notEqual(afterLateCompletion.resultHash, "stale-result");
 });
+
+test("save success remains legal after an unrelated repair message update", () => {
+  let state = createInitialSegmentState(1);
+  for (const event of [
+    { type: "RENDER_STARTED" },
+    { type: "RENDER_SUCCEEDED", resultHash: "result-v1" },
+    { type: "QUALITY_NEEDS_REVIEW", message: "repair detached" },
+    { type: "REPAIR_QUEUED", fingerprint: "repair-fp" },
+    { type: "REPAIR_STARTED", jobId: "repair-job" },
+    { type: "REPAIR_DETACHED", jobId: "repair-job" },
+    { type: "CACHE_READY" },
+    { type: "SAVE_STARTED" },
+    { type: "MESSAGE_UPDATED", message: "后台修复状态读取失败" },
+    { type: "SAVE_SUCCEEDED", review: true },
+  ]) {
+    state = reduceSegmentState(state, event);
+  }
+
+  assert.equal(state.saveStatus, "review_saved");
+  assert.equal(state.generationStatus, "repair_detached");
+  assert.equal(state.activeRepairJobId, "repair-job");
+});
+
+test("save failure preserves a detached repair lifecycle", () => {
+  let state = createInitialSegmentState(1);
+  for (const event of [
+    { type: "RENDER_STARTED" },
+    { type: "RENDER_SUCCEEDED", resultHash: "result-v1" },
+    { type: "QUALITY_NEEDS_REVIEW" },
+    { type: "REPAIR_QUEUED", fingerprint: "repair-fp" },
+    { type: "REPAIR_STARTED", jobId: "repair-job" },
+    { type: "REPAIR_DETACHED", jobId: "repair-job" },
+    { type: "CACHE_READY" },
+    { type: "SAVE_STARTED" },
+    { type: "SAVE_FAILED", errorCode: "PROJECT_API_UNAVAILABLE" },
+  ]) {
+    state = reduceSegmentState(state, event);
+  }
+
+  assert.equal(state.saveStatus, "save_failed");
+  assert.equal(state.generationStatus, "repair_detached");
+  assert.equal(state.activeRepairJobId, "repair-job");
+});
+
+test("recaching a repaired result cannot erase an exhausted save failure", () => {
+  let state = createInitialSegmentState(1);
+  for (const event of [
+    { type: "RENDER_STARTED" },
+    { type: "RENDER_SUCCEEDED", resultHash: "result-v1" },
+    { type: "QUALITY_PASSED" },
+    { type: "CACHE_READY" },
+    { type: "SAVE_STARTED" },
+    { type: "SAVE_FAILED", errorCode: "PROJECT_API_UNAVAILABLE" },
+    { type: "CACHE_READY" },
+  ]) {
+    state = reduceSegmentState(state, event);
+  }
+
+  assert.equal(state.saveStatus, "save_failed");
+  state = reduceSegmentState(state, { type: "SAVE_RESUMED" });
+  assert.equal(state.saveStatus, "cached");
+});

@@ -122,6 +122,11 @@ type BatchSaveRecoveryDescriptor = {
   fromRegistry?: boolean;
 };
 
+type BatchRecoveryDiscovery =
+  | { status: "none"; descriptor: null }
+  | { status: "recoverable"; descriptor: BatchSaveRecoveryDescriptor }
+  | { status: "unavailable"; descriptor: null; message: string };
+
 function readBatchRecoveryRegistry() {
   if (typeof window === "undefined") return [];
   return parseSegmentBatchRecoveryRegistry(
@@ -1062,9 +1067,7 @@ function normalizePatchAndEvaluateBatchSegment(
     deterministicPatchFindings,
   );
   const hasDeterministicChanges = patched.patchDiffs.length > 0;
-  const patchedResult = hasDeterministicChanges
-    ? canonicalizeBatchSegmentResult(patched.result)
-    : normalizedResult;
+  const patchedResult = canonicalizeBatchSegmentResult(patched.result);
   const finalGate = hasDeterministicChanges
     ? evaluateBatchSegmentQuality(patchedResult, {
         ...buildQualityOptions(patchedResult),
@@ -1215,6 +1218,9 @@ export function DashboardClient() {
   const [segmentCountMode, setSegmentCountMode] = useState<SegmentCountMode>("fixed");
   const [batchProgress, setBatchProgress] = useState<BatchGenerationProgress | null>(null);
   const [batchSaveRecovery, setBatchSaveRecovery] = useState<BatchSaveRecoveryDescriptor | null>(null);
+  const [batchRecoveryChecking, setBatchRecoveryChecking] = useState(false);
+  const batchRecoveryLookupRef = useRef<Promise<BatchRecoveryDiscovery> | null>(null);
+  const batchRecoveryLookupKeyRef = useRef("");
   const [batchProgressTick, setBatchProgressTick] = useState(0);
   const [episodeCountPickerOpen, setEpisodeCountPickerOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState("");
@@ -1250,12 +1256,17 @@ export function DashboardClient() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!TASK_ONE_CACHE_RECOVERY_ENABLED || batchGenerating) {
-      if (!batchGenerating) setBatchSaveRecovery(null);
-      return;
+  async function discoverBatchSaveRecovery(): Promise<BatchRecoveryDiscovery> {
+    if (!TASK_ONE_CACHE_RECOVERY_ENABLED || typeof window === "undefined") {
+      return { status: "none", descriptor: null };
     }
-    let active = true;
+    type RecoveryCandidate = {
+      recoveryKey: string;
+      durableBatchId?: string;
+      sourceHash: string;
+      projectId?: string | null;
+      fromRegistry: boolean;
+    };
     const registryCandidates = readBatchRecoveryRegistry().map((pointer) => ({
       recoveryKey: pointer.recoveryKey,
       durableBatchId: pointer.durableBatchId,
@@ -1285,80 +1296,154 @@ export function DashboardClient() {
           fromRegistry: false as const,
         }))
       : [];
-    void (async () => {
-      try {
-        for (const candidate of [...registryCandidates, ...legacyCandidates]) {
-          let durableBatchId = "durableBatchId" in candidate ? candidate.durableBatchId : "";
-          if (!candidate.fromRegistry) {
-            try {
-              const raw = window.localStorage.getItem(candidate.recoveryKey);
-              const index = raw ? JSON.parse(raw) as Record<string, unknown> : null;
-              durableBatchId = typeof index?.durableBatchId === "string"
-                ? index.durableBatchId
-                : typeof index?.batchId === "string" ? index.batchId : "";
-              if (!durableBatchId || index?.sourceHash !== candidate.sourceHash) continue;
-            } catch (legacyIndexError) {
-              console.warn("Failed to read legacy batch recovery index", legacyIndexError);
-              window.localStorage.removeItem(candidate.recoveryKey);
-              continue;
-            }
-          }
-          let response: Response;
+    const candidates = [...registryCandidates, ...legacyCandidates] as RecoveryCandidate[];
+    if (!candidates.length) return { status: "none", descriptor: null };
+
+    let infrastructureFailure = "";
+    const inspectedBatchIds = new Set<string>();
+    try {
+      for (const candidate of candidates) {
+        let durableBatchId = candidate.durableBatchId || "";
+        if (!candidate.fromRegistry) {
           try {
-            response = await fetch(`/api/segment-batch-cache/${encodeURIComponent(durableBatchId)}`, {
-              method: "GET",
-              cache: "no-store",
-            });
-          } catch (cacheReadError) {
-            console.warn("Failed to read batch recovery cache", cacheReadError);
+            const raw = window.localStorage.getItem(candidate.recoveryKey);
+            const index = raw ? JSON.parse(raw) as Record<string, unknown> : null;
+            durableBatchId = typeof index?.durableBatchId === "string"
+              ? index.durableBatchId
+              : typeof index?.batchId === "string" ? index.batchId : "";
+            if (!durableBatchId || index?.sourceHash !== candidate.sourceHash) continue;
+          } catch (legacyIndexError) {
+            console.warn("Failed to read legacy batch recovery index", legacyIndexError);
+            window.localStorage.removeItem(candidate.recoveryKey);
             continue;
           }
-          const data = await response.json().catch(() => null);
-          if (!response.ok) {
-            if ([400, 404, 410].includes(response.status)) {
-              window.localStorage.removeItem(candidate.recoveryKey);
-              forgetBatchRecoveryPointer(durableBatchId);
-            }
-            continue;
-          }
-          if (!data?.ok || !data.cache) {
+        }
+        if (inspectedBatchIds.has(durableBatchId)) continue;
+        inspectedBatchIds.add(durableBatchId);
+
+        let response: Response;
+        try {
+          response = await fetch(`/api/segment-batch-cache/${encodeURIComponent(durableBatchId)}`, {
+            method: "GET",
+            cache: "no-store",
+          });
+        } catch (cacheReadError) {
+          console.warn("Failed to read batch recovery cache", cacheReadError);
+          infrastructureFailure ||= formatUserFacingError(
+            cacheReadError,
+            "分段缓存服务暂时不可用，无法确认是否存在待保存结果。",
+          );
+          continue;
+        }
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          if ([400, 404, 410].includes(response.status)) {
             window.localStorage.removeItem(candidate.recoveryKey);
             forgetBatchRecoveryPointer(durableBatchId);
             continue;
           }
-          const cache = data.cache as SegmentBatchCacheDocumentV2;
-          const pointerProjectMatches = !candidate.projectId || !cache.projectId || cache.projectId === candidate.projectId;
-          const activeProjectMatches = !resumeProjectId || !cache.projectId || cache.projectId === resumeProjectId;
-          const cacheIdentityMatches = cache.schemaVersion === 2
-            && cache.durableBatchId === durableBatchId
-            && cache.sourceHash === candidate.sourceHash
-            && pointerProjectMatches
-            && activeProjectMatches
-            && Array.isArray(cache.segments);
-          const hasUnsavedSegments = cacheIdentityMatches
-            && cache.segmentStates.some((state) => state.saveStatus !== "saved" && state.saveStatus !== "review_saved")
-            && cache.segments.length > 0;
-          if (!active) return;
-          if (hasUnsavedSegments) {
-            setBatchSaveRecovery({
+          infrastructureFailure ||= formatUserFacingError(
+            data?.error || `分段缓存服务返回 ${response.status}`,
+            "分段缓存服务暂时不可用，无法确认是否存在待保存结果。",
+          );
+          continue;
+        }
+        if (!data?.ok || !data.cache) {
+          infrastructureFailure ||= "分段缓存服务返回了无效数据，无法确认是否存在待保存结果。";
+          continue;
+        }
+
+        const cache = data.cache as SegmentBatchCacheDocumentV2;
+        const activeProjectMatches = !resumeProjectId || !cache.projectId || cache.projectId === resumeProjectId;
+        if (!activeProjectMatches) continue;
+        const pointerProjectMatches = !candidate.projectId || !cache.projectId || cache.projectId === candidate.projectId;
+        const cacheIdentityMatches = cache.schemaVersion === 2
+          && cache.durableBatchId === durableBatchId
+          && cache.sourceHash === candidate.sourceHash
+          && pointerProjectMatches
+          && Array.isArray(cache.segments)
+          && Array.isArray(cache.segmentStates);
+        if (!cacheIdentityMatches) {
+          window.localStorage.removeItem(candidate.recoveryKey);
+          forgetBatchRecoveryPointer(durableBatchId);
+          continue;
+        }
+        const hasUnsavedSegments = cache.segmentStates.some(
+          (state) => state.saveStatus !== "saved" && state.saveStatus !== "review_saved",
+        ) && cache.segments.length > 0;
+        if (hasUnsavedSegments) {
+          return {
+            status: "recoverable",
+            descriptor: {
               recoveryKey: candidate.recoveryKey,
               durableBatchId,
               sourceHash: candidate.sourceHash,
               projectId: cache.projectId || candidate.projectId,
               fromRegistry: candidate.fromRegistry,
-            });
-            return;
-          }
-          if (cacheIdentityMatches) {
-            window.localStorage.removeItem(candidate.recoveryKey);
-            forgetBatchRecoveryPointer(durableBatchId);
-          }
+            },
+          };
         }
-        if (active) setBatchSaveRecovery(null);
-      } catch (recoveryIndexError) {
-        console.warn("Failed to read batch recovery index", recoveryIndexError);
+        window.localStorage.removeItem(candidate.recoveryKey);
+        forgetBatchRecoveryPointer(durableBatchId);
       }
-    })();
+    } catch (recoveryIndexError) {
+      console.warn("Failed to read batch recovery index", recoveryIndexError);
+      infrastructureFailure ||= formatUserFacingError(
+        recoveryIndexError,
+        "无法读取分段恢复索引，暂不能开始新的分段生成。",
+      );
+    }
+    if (infrastructureFailure) {
+      return { status: "unavailable", descriptor: null, message: infrastructureFailure };
+    }
+    return { status: "none", descriptor: null };
+  }
+
+  function ensureBatchSaveRecoveryDiscovery() {
+    if (!TASK_ONE_CACHE_RECOVERY_ENABLED) {
+      return Promise.resolve({ status: "none", descriptor: null } satisfies BatchRecoveryDiscovery);
+    }
+    const lookupKey = JSON.stringify({
+      duration: selectedDurationValue(),
+      episodeCount,
+      projectId: resumeProjectId || null,
+      script,
+      segmentCountMode,
+    });
+    if (batchRecoveryLookupRef.current && batchRecoveryLookupKeyRef.current === lookupKey) {
+      return batchRecoveryLookupRef.current;
+    }
+    const lookup = discoverBatchSaveRecovery();
+    batchRecoveryLookupKeyRef.current = lookupKey;
+    batchRecoveryLookupRef.current = lookup;
+    void lookup.finally(() => {
+      if (batchRecoveryLookupRef.current === lookup) {
+        batchRecoveryLookupRef.current = null;
+        batchRecoveryLookupKeyRef.current = "";
+      }
+    });
+    return lookup;
+  }
+
+  useEffect(() => {
+    if (!TASK_ONE_CACHE_RECOVERY_ENABLED || batchGenerating) {
+      if (!batchGenerating) setBatchSaveRecovery(null);
+      setBatchRecoveryChecking(false);
+      return;
+    }
+    let active = true;
+    setBatchRecoveryChecking(true);
+    void ensureBatchSaveRecoveryDiscovery()
+      .then((discovery) => {
+        if (!active) return;
+        setBatchSaveRecovery(discovery.descriptor);
+        if (discovery.status === "unavailable") {
+          setError(discovery.message);
+        }
+      })
+      .finally(() => {
+        if (active) setBatchRecoveryChecking(false);
+      });
     return () => {
       active = false;
     };
@@ -2040,40 +2125,8 @@ export function DashboardClient() {
     }
   }
 
-  function currentBatchRecoveryDescriptor() {
-    if (!TASK_ONE_CACHE_RECOVERY_ENABLED || typeof window === "undefined" || !script.trim()) return null;
-    const sourceHash = buildBatchSegmentResultHash({
-      mode: segmentCountMode,
-      episodeCount,
-      duration: selectedDurationValue(),
-      sourceText: script,
-    });
-    const recoveryKeys = buildSegmentBatchRecoveryKeys({
-      projectId: resumeProjectId || null,
-      sourceHash,
-      mode: segmentCountMode,
-      requestedCount: segmentCountMode === "auto" ? null : episodeCount,
-      duration: selectedDurationValue(),
-    });
-    try {
-      for (const recoveryKey of recoveryKeys) {
-        const raw = window.localStorage.getItem(recoveryKey);
-        const index = raw ? JSON.parse(raw) as Record<string, unknown> : null;
-        const durableBatchId = typeof index?.durableBatchId === "string"
-          ? index.durableBatchId
-          : typeof index?.batchId === "string" ? index.batchId : "";
-        if (!durableBatchId || index?.sourceHash !== sourceHash) continue;
-        return { recoveryKey, durableBatchId, sourceHash } satisfies BatchSaveRecoveryDescriptor;
-      }
-      return null;
-    } catch (recoveryIndexError) {
-      console.warn("Failed to read batch recovery index", recoveryIndexError);
-      return null;
-    }
-  }
-
   async function resumeCachedBatchSavesOnly(
-    descriptor: BatchSaveRecoveryDescriptor | null = batchSaveRecovery || currentBatchRecoveryDescriptor(),
+    descriptor: BatchSaveRecoveryDescriptor | null = batchSaveRecovery,
   ) {
     if (!descriptor || !TASK_ONE_CACHE_RECOVERY_ENABLED) return false;
     setBatchGenerating(true);
@@ -2355,8 +2408,18 @@ export function DashboardClient() {
   }
 
   async function runBatchEpisodeGeneration() {
-    const pendingSaveRecovery = batchSaveRecovery || currentBatchRecoveryDescriptor();
-    if (pendingSaveRecovery && await resumeCachedBatchSavesOnly(pendingSaveRecovery)) return;
+    const recoveryDiscovery = batchSaveRecovery
+      ? { status: "recoverable", descriptor: batchSaveRecovery } as const
+      : await ensureBatchSaveRecoveryDiscovery();
+    if (recoveryDiscovery.status === "unavailable") {
+      setError(recoveryDiscovery.message);
+      setGenerationProgress(recoveryDiscovery.message);
+      return;
+    }
+    if (
+      recoveryDiscovery.status === "recoverable"
+      && await resumeCachedBatchSavesOnly(recoveryDiscovery.descriptor)
+    ) return;
     const completed: BatchPromptSection[] = [];
     let activeProjectId = resumeProjectId || "";
     const latestSaveRef: { current: ProjectSaveState | null } = { current: null };
@@ -2510,44 +2573,75 @@ export function DashboardClient() {
       rebuildSegmentProgressFromState();
     }
 
-    type SegmentStateGuard = {
-      index: number;
-      revision: number;
-      resultHash?: string;
-      repairJobId?: string;
+    type RenderOperation = {
+      segmentIndex: number;
+      token: string;
     };
 
-    function captureSegmentStateGuard(index: number): SegmentStateGuard | null {
-      const state = segmentStateRecords.find((item) => item.index === index);
-      return state
-        ? {
-            index,
-            revision: state.revision,
-            resultHash: state.resultHash,
-            repairJobId: state.activeRepairJobId,
-          }
-        : null;
+    type RepairOperationIdentity = {
+      segmentIndex: number;
+      resultHash?: string;
+      repairFingerprint?: string;
+      jobId?: string;
+      contractHash?: string;
+    };
+
+    let segmentOperationSequence = 0;
+    const activeRenderOperations = new Map<number, RenderOperation>();
+
+    function beginRenderOperation(segmentIndex: number): RenderOperation {
+      const operation = {
+        segmentIndex,
+        token: `render:${segmentIndex}:${++segmentOperationSequence}`,
+      };
+      activeRenderOperations.set(segmentIndex, operation);
+      return operation;
     }
 
-    function isSegmentStateGuardCurrent(guard: SegmentStateGuard | null) {
-      if (!guard) return false;
-      const state = segmentStateRecords.find((item) => item.index === guard.index);
+    function isCurrentRenderOperation(operation: RenderOperation | null | undefined) {
+      if (!operation) return false;
+      return activeRenderOperations.get(operation.segmentIndex)?.token === operation.token;
+    }
+
+    function finishRenderOperation(operation: RenderOperation | null | undefined) {
+      if (operation && isCurrentRenderOperation(operation)) {
+        activeRenderOperations.delete(operation.segmentIndex);
+      }
+    }
+
+    function captureRepairOperationIdentity(segmentIndex: number): RepairOperationIdentity | null {
+      const state = segmentStateRecords.find((item) => item.index === segmentIndex);
+      if (!state) return null;
+      return {
+        segmentIndex,
+        resultHash: state.resultHash,
+        repairFingerprint: state.repairFingerprint,
+        jobId: state.activeRepairJobId,
+        contractHash: state.contractHash,
+      };
+    }
+
+    function isCurrentRepairOperation(identity: RepairOperationIdentity | null) {
+      if (!identity) return false;
+      const state = segmentStateRecords.find((item) => item.index === identity.segmentIndex);
       return Boolean(
         state
-        && state.revision === guard.revision
-        && state.resultHash === guard.resultHash
-        && state.activeRepairJobId === guard.repairJobId,
+        && state.resultHash === identity.resultHash
+        && state.repairFingerprint === identity.repairFingerprint
+        && state.contractHash === identity.contractHash
+        && (!identity.jobId || state.activeRepairJobId === identity.jobId),
       );
     }
 
-    function dispatchGuardedSegmentStateEvent(
-      guard: SegmentStateGuard | null,
+    function dispatchCurrentRepairEvent(
+      identity: RepairOperationIdentity | null,
       event: SegmentStateEvent,
     ) {
-      if (!guard || !isSegmentStateGuardCurrent(guard)) return false;
-      dispatchSegmentStateEvent(guard.index, { ...event, baseRevision: guard.revision });
-      const next = segmentStateRecords.find((item) => item.index === guard.index);
-      return Boolean(next && next.revision === guard.revision + 1);
+      if (!identity || !isCurrentRepairOperation(identity)) return false;
+      const before = segmentStateRecords.find((item) => item.index === identity.segmentIndex);
+      dispatchSegmentStateEvent(identity.segmentIndex, event);
+      const after = segmentStateRecords.find((item) => item.index === identity.segmentIndex);
+      return Boolean(before && after && after.revision === before.revision + 1);
     }
 
     function updateSegmentProgress(index: number, status: BatchSegmentStatus, message?: string) {
@@ -2860,12 +2954,12 @@ export function DashboardClient() {
     ) {
       try {
         while (shouldContinueDetachedRepairObservation({ detachedAt, now: Date.now() })) {
-          const queryGuard = captureSegmentStateGuard(episode.episodeIndex);
-          if (!queryGuard || queryGuard.repairJobId !== repairIdentity.jobId) return;
+          const queryIdentity = captureRepairOperationIdentity(episode.episodeIndex);
+          if (queryIdentity?.jobId !== repairIdentity.jobId) return;
           const repairJob = await queryBatchSegmentRepairCodexJob(repairIdentity.jobId);
-          if (!isSegmentStateGuardCurrent(queryGuard)) {
-            const latestState = segmentStateRecords.find((state) => state.index === episode.episodeIndex);
-            if (latestState?.activeRepairJobId !== repairIdentity.jobId) return;
+          if (!isCurrentRepairOperation(queryIdentity)) {
+            const current = captureRepairOperationIdentity(episode.episodeIndex);
+            if (current?.jobId !== repairIdentity.jobId) return;
             continue;
           }
           if (repairJob.status === "pending" || repairJob.status === "running") {
@@ -2873,7 +2967,7 @@ export function DashboardClient() {
             continue;
           }
           if (repairJob.status === "failed") {
-            dispatchGuardedSegmentStateEvent(queryGuard, {
+            dispatchCurrentRepairEvent(queryIdentity, {
               type: "REPAIR_FAILED",
               jobId: repairIdentity.jobId,
               errorCode: "REPAIR_JOB_FAILED",
@@ -2901,7 +2995,7 @@ export function DashboardClient() {
             continue;
           }
           if (decision.action === "late_patch_available") {
-            if (!dispatchGuardedSegmentStateEvent(queryGuard, {
+            if (!dispatchCurrentRepairEvent(queryIdentity, {
               type: "LATE_PATCH_AVAILABLE",
               jobId: repairIdentity.jobId,
             })) return;
@@ -2911,7 +3005,7 @@ export function DashboardClient() {
           }
           if (decision.action === "archive_stale" || decision.action === "ignore_duplicate") {
             if (decision.action === "archive_stale") {
-              dispatchGuardedSegmentStateEvent(queryGuard, {
+              dispatchCurrentRepairEvent(queryIdentity, {
                 type: "REPAIR_FAILED",
                 jobId: repairIdentity.jobId,
                 errorCode: "STALE_REPAIR_RESULT",
@@ -2922,7 +3016,7 @@ export function DashboardClient() {
             return;
           }
           if (!repairJob.result) {
-            dispatchGuardedSegmentStateEvent(queryGuard, {
+            dispatchCurrentRepairEvent(queryIdentity, {
               type: "REPAIR_FAILED",
               jobId: repairIdentity.jobId,
               errorCode: "EMPTY_REPAIR_PATCH",
@@ -2947,7 +3041,7 @@ export function DashboardClient() {
             undefined,
             batchCoverageMode,
           );
-          if (!dispatchGuardedSegmentStateEvent(queryGuard, {
+          if (!dispatchCurrentRepairEvent(queryIdentity, {
             type: "REPAIR_COMPLETED",
             jobId: repairIdentity.jobId,
             resultHash: buildBatchSegmentResultHash(validated.result),
@@ -2965,18 +3059,18 @@ export function DashboardClient() {
           });
           return;
         }
-        const timeoutGuard = captureSegmentStateGuard(episode.episodeIndex);
-        if (timeoutGuard?.repairJobId === repairIdentity.jobId) {
-          dispatchGuardedSegmentStateEvent(timeoutGuard, {
+        const timeoutIdentity = captureRepairOperationIdentity(episode.episodeIndex);
+        if (timeoutIdentity?.jobId === repairIdentity.jobId) {
+          dispatchCurrentRepairEvent(timeoutIdentity, {
             type: "MESSAGE_UPDATED",
             message: "后台修复超过最终观察期限，已停止自动查询；首次结果和原任务标识均已保留。",
           });
         }
         writeBatchSegmentCache();
       } catch (error) {
-        const errorGuard = captureSegmentStateGuard(episode.episodeIndex);
-        if (errorGuard?.repairJobId === repairIdentity.jobId) {
-          dispatchGuardedSegmentStateEvent(errorGuard, {
+        const errorIdentity = captureRepairOperationIdentity(episode.episodeIndex);
+        if (errorIdentity?.jobId === repairIdentity.jobId) {
+          dispatchCurrentRepairEvent(errorIdentity, {
             type: "MESSAGE_UPDATED",
             message: `${formatUserFacingError(error, "后台修复状态读取失败")}；首次结果与任务标识均已保留。`,
           });
@@ -3001,7 +3095,7 @@ export function DashboardClient() {
         registerSegmentRepairReason(episodeIndex, reason);
         updateSegmentProgress(episodeIndex, "repairing", `${repairLabel}: ${reason}`);
         publishBatchProgress("repairing", `第 ${episodeIndex} / ${episodeCount} 段正在自动修复：${reason}`);
-        let repairGuard = captureSegmentStateGuard(episodeIndex);
+        let repairIdentity = captureRepairOperationIdentity(episodeIndex);
         const repairRequest = await requestBatchSegmentRepairPatchWithContext({
           projectId: activeProjectId || undefined,
           batchId: seasonPackJob.id,
@@ -3011,29 +3105,32 @@ export function DashboardClient() {
           failedResult: episodeResult,
           findings: repairFindings,
           onJobCreated: ({ jobId }) => {
-            if (!dispatchGuardedSegmentStateEvent(repairGuard, { type: "REPAIR_STARTED", jobId })) return;
-            repairGuard = captureSegmentStateGuard(episodeIndex);
+            if (!dispatchCurrentRepairEvent(repairIdentity, { type: "REPAIR_STARTED", jobId })) return;
+            repairIdentity = captureRepairOperationIdentity(episodeIndex);
             invocationLedger.record("pathPatchJobCreated", { segmentIndex: episodeIndex });
             writeBatchSegmentCache();
           },
         });
-        if (!isSegmentStateGuardCurrent(repairGuard)) {
+        if (!isCurrentRepairOperation(repairIdentity)) {
           throw new StaleSegmentOperationError(episodeIndex, "repair");
         }
         const activeRepairState = segmentStateRecords.find((state) => state.index === episodeIndex);
         if (activeRepairState?.generationStatus === "repair_pending") {
-          if (!dispatchGuardedSegmentStateEvent(repairGuard, {
+          if (!dispatchCurrentRepairEvent(repairIdentity, {
             type: "REPAIR_STARTED",
             jobId: repairRequest.jobId,
           })) {
             throw new StaleSegmentOperationError(episodeIndex, "repair");
           }
-          repairGuard = captureSegmentStateGuard(episodeIndex);
+          repairIdentity = captureRepairOperationIdentity(episodeIndex);
           invocationLedger.record("pathPatchJobCreated", { segmentIndex: episodeIndex });
           writeBatchSegmentCache();
         }
+        if (repairIdentity?.jobId !== repairRequest.jobId || !isCurrentRepairOperation(repairIdentity)) {
+          throw new StaleSegmentOperationError(episodeIndex, "repair");
+        }
         if (repairRequest.detached) {
-          if (!dispatchGuardedSegmentStateEvent(repairGuard, {
+          if (!dispatchCurrentRepairEvent(repairIdentity, {
             type: "REPAIR_DETACHED",
             jobId: repairRequest.jobId,
             message: "路径级修复仍在后台运行，首次结果将保留并保存为待检查草稿",
@@ -3088,7 +3185,7 @@ export function DashboardClient() {
           undefined,
           batchCoverageMode,
         );
-        if (!dispatchGuardedSegmentStateEvent(repairGuard, {
+        if (!dispatchCurrentRepairEvent(repairIdentity, {
           type: "REPAIR_COMPLETED",
           jobId: repairRequest.jobId,
           resultHash: buildBatchSegmentResultHash(validatedRepair.result),
@@ -3113,15 +3210,15 @@ export function DashboardClient() {
       episodeIndex: number,
       episodeCount: number,
       segmentContract?: SegmentContract,
+      renderOperation?: RenderOperation,
     ) {
-      const renderGuard = captureSegmentStateGuard(episodeIndex);
       const rawResult = await requestAnalysisWithContext(
         renderScript,
         renderDuration,
         activeProjectId || undefined,
         undefined,
       );
-      if (!isSegmentStateGuardCurrent(renderGuard)) {
+      if (!isCurrentRenderOperation(renderOperation)) {
         throw new StaleSegmentOperationError(episodeIndex, "render");
       }
       const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, episodeCount, rawResult, renderDuration);
@@ -3176,7 +3273,44 @@ export function DashboardClient() {
       );
     }
 
-    const saveOperationGuards = new Map<number, SegmentStateGuard>();
+    type SaveOperation = {
+      segmentIndex: number;
+      token: string;
+      idempotencyKey: string;
+      resultHash: string;
+    };
+
+    const activeSaveOperations = new Map<number, SaveOperation>();
+
+    function beginSaveOperation(segmentIndex: number, resultHash: string): SaveOperation {
+      const operation = {
+        segmentIndex,
+        token: `save:${segmentIndex}:${++segmentOperationSequence}`,
+        idempotencyKey: `${durableBatchId}:${segmentIndex}`,
+        resultHash,
+      };
+      activeSaveOperations.set(segmentIndex, operation);
+      return operation;
+    }
+
+    function isCurrentSaveOperation(operation: SaveOperation | null | undefined) {
+      if (!operation) return false;
+      const active = activeSaveOperations.get(operation.segmentIndex);
+      const state = segmentStateRecords.find((item) => item.index === operation.segmentIndex);
+      return Boolean(
+        active?.token === operation.token
+        && active.idempotencyKey === operation.idempotencyKey
+        && state?.resultHash === operation.resultHash
+        && state.saveStatus === "saving",
+      );
+    }
+
+    function finishSaveOperation(operation: SaveOperation | null | undefined) {
+      if (operation && activeSaveOperations.get(operation.segmentIndex)?.token === operation.token) {
+        activeSaveOperations.delete(operation.segmentIndex);
+      }
+    }
+
     const batchSaveController = createResumableBatchSaveController<RenderedEpisode>({
       durableBatchId,
       segmentCount: resolvedSegmentCount,
@@ -3244,37 +3378,46 @@ export function DashboardClient() {
         if (entry.status === "saving") {
           dispatchSegmentStateEvent(episodeIndex, { type: "SAVE_STARTED" });
           updateSegmentProgress(episodeIndex, "saving", "正在保存到项目");
-          const guard = captureSegmentStateGuard(episodeIndex);
-          if (guard) saveOperationGuards.set(episodeIndex, guard);
+          const payloadResultHash = entry.payload
+            ? buildBatchSegmentResultHash(entry.payload.result)
+            : segmentStateRecords.find((item) => item.index === episodeIndex)?.resultHash || "";
+          beginSaveOperation(episodeIndex, payloadResultHash);
           publishBatchProgress("saving", `正在保存第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
           return;
         }
         if (entry.status === "save_failed") {
           const failure = entry.lastResult && !entry.lastResult.saved ? entry.lastResult : null;
-          const accepted = dispatchGuardedSegmentStateEvent(saveOperationGuards.get(episodeIndex) || null, {
+          const operation = activeSaveOperations.get(episodeIndex);
+          if (!isCurrentSaveOperation(operation)) return;
+          dispatchSegmentStateEvent(episodeIndex, {
             type: "SAVE_FAILED",
             errorCode: failure?.errorCode || "PROJECT_API_UNAVAILABLE",
             message: failure?.message || "项目保存失败",
           });
-          saveOperationGuards.delete(episodeIndex);
-          if (!accepted) return;
+          finishSaveOperation(operation);
+          updateSegmentProgress(episodeIndex, "failed", failure?.message || "项目保存失败");
           saveError = new Error(`第 ${episodeIndex} 段已生成，但项目保存失败：${failure?.message || "未返回保存结果"}`);
           writeBatchSegmentCache();
           publishBatchProgress("saving", `${saveError.message} 已缓存结果，可仅继续保存。`);
           return;
         }
         if (entry.status === "saved" || entry.status === "review_saved") {
+          const operation = activeSaveOperations.get(episodeIndex);
+          if (!isCurrentSaveOperation(operation)) return;
+          dispatchSegmentStateEvent(episodeIndex, {
+            type: "SAVE_SUCCEEDED",
+            review: entry.status === "review_saved",
+          });
+          finishSaveOperation(operation);
+          updateSegmentProgress(
+            episodeIndex,
+            entry.status,
+            entry.status === "review_saved" ? "已保存，待检查" : "已保存",
+          );
           const review = entry.status === "review_saved";
           saveError = null;
           segmentRepairReasons.delete(episodeIndex);
           queuedRepairIndexes.delete(episodeIndex);
-          const accepted = dispatchGuardedSegmentStateEvent(saveOperationGuards.get(episodeIndex) || null, {
-            type: "SAVE_SUCCEEDED",
-            review,
-          });
-          saveOperationGuards.delete(episodeIndex);
-          if (!accepted) return;
-          updateSegmentProgress(episodeIndex, review ? "review_saved" : "saved", review ? "已保存，待检查" : "已保存");
           if (!review) markSegmentQualityStatus(episodeIndex, "saved");
           writeBatchSegmentCache();
           publishBatchProgress("saving", review
@@ -3744,6 +3887,7 @@ export function DashboardClient() {
       const episodeInput = episode.input;
       const renderScript = buildBatchEpisodeRenderScript(episodeInput, resolvedSegmentCount || episodes.length);
       const renderDuration = episodeInput.duration || selectedDurationValue();
+      const renderOperation = beginRenderOperation(episodeIndex);
 
       updateSegmentProgress(episodeIndex, "repairing", "正在按单段质量生成修复");
       publishBatchProgress("repairing", `正在按单段质量生成第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
@@ -3755,6 +3899,7 @@ export function DashboardClient() {
           episodeIndex,
           resolvedSegmentCount || episodes.length,
           episodeInput.segmentContract,
+          renderOperation,
         );
         if (validatedEpisode.detached) {
           markCoverageNeedsReview({
@@ -3825,6 +3970,8 @@ export function DashboardClient() {
           return;
         }
         markCoverageNeedsReview(judgeItem, buildTargetedRepairReason(error.gate));
+      } finally {
+        finishRenderOperation(renderOperation);
       }
     }
 
@@ -4357,7 +4504,7 @@ export function DashboardClient() {
       );
       if (!packEpisodes.length) return;
       const pendingJudgeSegments: PendingCoverageJudgeSegment[] = [];
-      const renderGuards = new Map<number, SegmentStateGuard>();
+      const renderOperations = new Map<number, RenderOperation>();
       const packLabel = packEpisodes.map((episode) => episode.episodeIndex).join(", ");
       const packSegments = packEpisodes.map((episode) => {
         const episodeInput = episode.input;
@@ -4378,8 +4525,7 @@ export function DashboardClient() {
           dispatchSegmentStateEvent(episode.episodeIndex, { type: "RENDER_STARTED" });
         }
         updateSegmentProgress(episode.episodeIndex, "running", `Render Pack 生成中：${packLabel}`);
-        const guard = captureSegmentStateGuard(episode.episodeIndex);
-        if (guard) renderGuards.set(episode.episodeIndex, guard);
+        renderOperations.set(episode.episodeIndex, beginRenderOperation(episode.episodeIndex));
       }
       publishBatchProgress("rendering", `正在本地并发生成 Render Pack：第 ${packLabel} 段...`);
       const packStartedAt = Date.now();
@@ -4425,43 +4571,44 @@ export function DashboardClient() {
 
         for (const episode of packEpisodes) {
           const episodeIndex = episode.episodeIndex;
-          const renderGuard = renderGuards.get(episodeIndex) || null;
-          if (!isSegmentStateGuardCurrent(renderGuard)) continue;
-          const episodeInput = episode.input;
-          const renderDuration = episodeInput.duration || selectedDurationValue();
-          const rawSegment = packResults.get(episodeIndex);
-          if (!rawSegment?.result) {
-            queueSegmentRepair(episode, "Render Pack 缺少本段结果，转为单段修复");
-            continue;
-          }
-          const rawResult = rawSegment.result;
-          const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, resolvedSegmentCount || episodes.length, rawResult, renderDuration);
-          const evaluated = normalizePatchAndEvaluateBatchSegment(
-            script,
-            episodeIndex,
-            episodeResult,
-            renderDuration,
-            episodeInput.segmentContract,
-            rawSegment.coverageSidecar,
-            undefined,
-            batchCoverageMode,
-          );
-          const outcome = routeBatchSegmentOutcome({
-            gate: evaluated.gate,
-            hasUsableResult: true,
-            coverageStage: batchCoverageStage,
-          });
-          const judgeItem: PendingCoverageJudgeSegment = {
-            episode,
-            result: evaluated.result,
-            renderDuration,
-            renderStartedAt: packStartedAt,
-            renderCompletedAt: packCompletedAt,
-            packIndex,
-            packSize: packEpisodes.length,
-            sidecar: rawSegment.coverageSidecar,
-            localDecisions: evaluated.coverageDecisions,
-          };
+          const renderOperation = renderOperations.get(episodeIndex);
+          if (!isCurrentRenderOperation(renderOperation)) continue;
+          try {
+            const episodeInput = episode.input;
+            const renderDuration = episodeInput.duration || selectedDurationValue();
+            const rawSegment = packResults.get(episodeIndex);
+            if (!rawSegment?.result) {
+              queueSegmentRepair(episode, "Render Pack 缺少本段结果，转为单段修复");
+              continue;
+            }
+            const rawResult = rawSegment.result;
+            const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, resolvedSegmentCount || episodes.length, rawResult, renderDuration);
+            const evaluated = normalizePatchAndEvaluateBatchSegment(
+              script,
+              episodeIndex,
+              episodeResult,
+              renderDuration,
+              episodeInput.segmentContract,
+              rawSegment.coverageSidecar,
+              undefined,
+              batchCoverageMode,
+            );
+            const outcome = routeBatchSegmentOutcome({
+              gate: evaluated.gate,
+              hasUsableResult: true,
+              coverageStage: batchCoverageStage,
+            });
+            const judgeItem: PendingCoverageJudgeSegment = {
+              episode,
+              result: evaluated.result,
+              renderDuration,
+              renderStartedAt: packStartedAt,
+              renderCompletedAt: packCompletedAt,
+              packIndex,
+              packSize: packEpisodes.length,
+              sidecar: rawSegment.coverageSidecar,
+              localDecisions: evaluated.coverageDecisions,
+            };
 
           if (outcome.action === "accept") {
             legacyFatalCheck(episodeIndex, evaluated.result, evaluated.gate);
@@ -4499,21 +4646,24 @@ export function DashboardClient() {
             continue;
           }
 
-          const routeError = qualityErrorForRoute(
-            evaluated.gate,
-            outcome,
-            evaluated.result,
-            evaluated.coverageDecisions,
-          );
-          publishBatchProgress("repairing", `第 ${episodeIndex} / ${resolvedSegmentCount} 段只修未通过的授权字段：${routeError.message}`);
-          queueSegmentRepair(episode, routeError.message, {
+            const routeError = qualityErrorForRoute(
+              evaluated.gate,
+              outcome,
+              evaluated.result,
+              evaluated.coverageDecisions,
+            );
+            publishBatchProgress("repairing", `第 ${episodeIndex} / ${resolvedSegmentCount} 段只修未通过的授权字段：${routeError.message}`);
+            queueSegmentRepair(episode, routeError.message, {
               result: evaluated.result,
               validationError: routeError,
               renderDuration,
               renderStartedAt: packStartedAt,
               packIndex,
               packSize: packEpisodes.length,
-          });
+            });
+          } finally {
+            finishRenderOperation(renderOperation);
+          }
         }
         await runCoverageJudgeWave(pendingJudgeSegments, renderRound);
         signalRepairScheduler();
@@ -4532,8 +4682,13 @@ export function DashboardClient() {
         }
         publishBatchProgress("repairing", `Render Pack 第 ${packLabel} 段失败，正在逐段降级修复：${reason}`);
         for (const episode of packEpisodes) {
-          if (!isSegmentStateGuardCurrent(renderGuards.get(episode.episodeIndex) || null)) continue;
-          queueSegmentRepair(episode, reason);
+          const renderOperation = renderOperations.get(episode.episodeIndex);
+          if (!isCurrentRenderOperation(renderOperation)) continue;
+          try {
+            queueSegmentRepair(episode, reason);
+          } finally {
+            finishRenderOperation(renderOperation);
+          }
         }
         signalRepairScheduler();
       }
@@ -5148,12 +5303,12 @@ export function DashboardClient() {
               <span className="ml-auto text-xs text-slate-500">{script.length}/50000</span>
               <button
                 onClick={analyze}
-                disabled={loading || uploadingText || batchGenerating}
+                disabled={loading || uploadingText || batchGenerating || batchRecoveryChecking}
                 className="prompt-send-button"
-                aria-label={loading ? "正在生成" : "生成视频提示词"}
-                title={loading ? "正在生成" : "生成视频提示词"}
+                aria-label={batchRecoveryChecking ? "正在检查待保存结果" : loading ? "正在生成" : "生成视频提示词"}
+                title={batchRecoveryChecking ? "正在检查待保存结果" : loading ? "正在生成" : "生成视频提示词"}
               >
-                {loading || batchGenerating ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send className="h-5 w-5" />}
+                {loading || batchGenerating || batchRecoveryChecking ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send className="h-5 w-5" />}
               </button>
             </div>
           </div>

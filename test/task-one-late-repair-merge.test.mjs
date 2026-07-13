@@ -100,3 +100,21 @@ test("invocation ledger restores without adding model calls", () => {
   assert.equal(restored.summary().pathPatchJobCreated, 0);
 });
 
+test("a completed repair waits while the matching segment is still saving", () => {
+  const base = {
+    jobId: "repair-saving",
+    activeRepairJobId: "repair-saving",
+    jobStatus: "completed",
+    expectedContractHash: "contract",
+    currentContractHash: "contract",
+    expectedResultHash: "result",
+    currentResultHash: "result",
+    mergedJobIds: new Set(),
+  };
+
+  assert.equal(decideLateRepairMerge({ ...base, saveStatus: "saving" }).action, "continue_polling");
+  assert.equal(decideLateRepairMerge({ ...base, saveStatus: "saved" }).action, "late_patch_available");
+  assert.equal(decideLateRepairMerge({ ...base, saveStatus: "review_saved" }).action, "late_patch_available");
+  assert.equal(decideLateRepairMerge({ ...base, saveStatus: "save_failed" }).action, "merge");
+});
+
