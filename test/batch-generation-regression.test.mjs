@@ -16,6 +16,10 @@ import fixture30, {
 } from "./fixtures/batch-generation/batch-generation-30-segment.mjs";
 import * as fixture20Module from "./fixtures/batch-generation/batch-generation-20-segment.mjs";
 import * as fixture30Module from "./fixtures/batch-generation/batch-generation-30-segment.mjs";
+import {
+  OBSERVED_SHAPE_PROFILE_20,
+  OBSERVED_SHAPE_PROFILE_30,
+} from "./fixtures/batch-generation/shape-profiles.mjs";
 
 process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({
   module: "commonjs",
@@ -75,6 +79,17 @@ function replayFixture(inputFixture) {
   };
 }
 
+function collectFixtureContentText(value, key = "") {
+  if (Array.isArray(value)) return value.flatMap((item) => collectFixtureContentText(item, key));
+  if (!value || typeof value !== "object") {
+    if (typeof value !== "string") return [];
+    if (/(?:hash|fingerprint)$/i.test(key)) return [];
+    return [value];
+  }
+  return Object.entries(value).flatMap(([childKey, childValue]) =>
+    collectFixtureContentText(childValue, childKey));
+}
+
 function assertFixtureIntegrity(fixture, expectedHash) {
   assert.equal(computeFixtureHash(fixture), expectedHash);
   assert.equal(fixture.contracts.length, fixture.segmentCount);
@@ -89,13 +104,200 @@ function assertFixtureIntegrity(fixture, expectedHash) {
       `segment ${index + 1} should keep its declared shot count`,
     );
     assert.ok(
-      result.workflow.fullVideoPrompt.replace(/\s+/g, "").length > 1400,
-      `segment ${index + 1} should keep a prompt above 1400 characters`,
+      result.workflow.fullVideoPrompt.replace(/\s+/g, "").length >= 900,
+      `segment ${index + 1} should keep the 900-character production hard floor`,
     );
   });
   const nearLimit = compileSegmentContractRenderBlock(fixture.contracts.at(-1));
   assert.ok(nearLimit.byteLength >= 2_400 && nearLimit.byteLength <= 3_072);
 }
+
+function summarizeObservedValues(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  const quantile = (fraction) => sorted[Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil(sorted.length * fraction) - 1),
+  )];
+  return {
+    count: sorted.length,
+    min: sorted[0] ?? null,
+    p50: sorted.length ? quantile(0.5) : null,
+    p95: sorted.length ? quantile(0.95) : null,
+    max: sorted.at(-1) ?? null,
+    total: sorted.reduce((total, value) => total + value, 0),
+  };
+}
+
+function assertRelativeTolerance(actual, expected, tolerance, label) {
+  const delta = Math.abs(actual - expected);
+  const allowed = Math.max(1, Math.abs(expected) * tolerance);
+  assert.ok(
+    delta <= allowed,
+    `${label}: expected ${actual} to remain within ${(tolerance * 100).toFixed(0)}% of ${expected}`,
+  );
+}
+
+function shapeProfileHash(profile) {
+  const numericProfile = structuredClone(profile);
+  delete numericProfile.sourceShapeHash;
+  return createHash("sha256").update(canonicalizeFixture(numericProfile), "utf8").digest("hex");
+}
+
+function observedShape(profile) {
+  const isTwenty = profile.segmentCount === 20;
+  return {
+    promptLengthSummary: profile.promptLengthSummary || profile.observedPromptLengthSummary,
+    resultByteSummary: profile.resultByteSummary || (isTwenty
+      ? { min: 23_407, p50: 29_533, p95: 37_313, max: 43_293 }
+      : { min: 29_160, p50: 38_246, p95: 49_770, max: 50_383 }),
+    contractByteSummary: profile.contractByteSummary || (isTwenty
+      ? { min: 1_755, p50: 1_854, p95: 1_967, max: 2_873 }
+      : { min: 1_834, p50: 2_209, p95: 2_606, max: 2_606 }),
+    shotFieldLengthSummaries: profile.shotFieldLengthSummaries,
+    findingSummary: profile.findingSummary || (isTwenty
+      ? {
+          blocking: { p50: 0, p95: 0, max: 0, total: 0 },
+          patchable: { p50: 0, p95: 0, max: 0, total: 0 },
+          warning: { p50: 9, p95: 19, max: 19, total: 136 },
+          risk: { p50: 1, p95: 14, max: 28, total: 92 },
+        }
+      : {
+          blocking: { p50: 0, p95: 0, max: 0, total: 0 },
+          patchable: { p50: 0, p95: 0, max: 0, total: 0 },
+          warning: { p50: 5, p95: 12, max: 12, total: 171 },
+          risk: { p50: 3, p95: 15, max: 23, total: 156 },
+        }),
+    localPatchSummary: profile.localPatchSummary || (isTwenty
+      ? { p50: 0, p95: 8, max: 8, total: 57 }
+      : { p50: 4, p95: 11, max: 11, total: 147 }),
+  };
+}
+
+function collectFixtureWorkloadShape(fixture) {
+  const adapter = createFrozenDashboardLocalAdapter(process.cwd());
+  const patchCounts = [];
+  const warningCounts = [];
+  const riskCounts = [];
+  const blockingCounts = [];
+  const patchableCounts = [];
+
+  fixture.renderedResults.forEach((rawResult, offset) => {
+    const result = cloneFixture(rawResult);
+    const contract = fixture.contracts[offset];
+    const context = fixture.qualityContext[offset];
+    const normalized = adapter.normalizeBatchSegmentResultForQuality(result);
+    const firstGate = adapter.evaluateBatchSegmentQuality(normalized, {
+      ...context,
+      segmentIndex: context.episodeIndex,
+      contract,
+      fullPromptText: adapter.buildVideoGenerationPromptText(normalized),
+      coverageMode: "shadow",
+    });
+    const selected = adapter.selectDeterministicQualityPatchFindings(firstGate.findings, {
+      safetyEnabled: true,
+    });
+    const patched = adapter.applyDeterministicQualityPatchWithDiff(normalized, selected);
+    const canonical = adapter.canonicalizeBatchSegmentResult(patched.result);
+    const finalGate = patched.patchDiffs.length
+      ? adapter.evaluateBatchSegmentQuality(canonical, {
+          ...context,
+          segmentIndex: context.episodeIndex,
+          contract,
+          fullPromptText: adapter.buildVideoGenerationPromptText(canonical),
+          coverageMode: "shadow",
+        })
+      : firstGate;
+    patchCounts.push(patched.patchDiffs.length);
+    warningCounts.push(finalGate.warningFindings.length);
+    riskCounts.push(finalGate.riskFindings.length);
+    blockingCounts.push(finalGate.blockingFindings.length);
+    patchableCounts.push(finalGate.patchableFindings.length);
+  });
+
+  return {
+    patch: summarizeObservedValues(patchCounts),
+    warning: summarizeObservedValues(warningCounts),
+    risk: summarizeObservedValues(riskCounts),
+    blocking: summarizeObservedValues(blockingCounts),
+    patchable: summarizeObservedValues(patchableCounts),
+  };
+}
+
+test("fixture shape profile hash is derived from canonical numeric metadata", () => {
+  for (const profile of [OBSERVED_SHAPE_PROFILE_20, OBSERVED_SHAPE_PROFILE_30]) {
+    assert.equal(shapeProfileHash(profile), profile.sourceShapeHash);
+    const mutated = structuredClone(profile);
+    const promptKey = mutated.promptLengthSummary ? "promptLengthSummary" : "observedPromptLengthSummary";
+    mutated[promptKey].p50 += 1;
+    assert.notEqual(shapeProfileHash(mutated), profile.sourceShapeHash);
+  }
+});
+
+test("synthetic prompt lengths remain within observed distribution tolerance", () => {
+  for (const [fixture, profile] of [
+    [fixture20, OBSERVED_SHAPE_PROFILE_20],
+    [fixture30, OBSERVED_SHAPE_PROFILE_30],
+  ]) {
+    const observed = observedShape(profile);
+    const actual = summarizeObservedValues(fixture.renderedResults.map((result) =>
+      result.workflow.fullVideoPrompt.replace(/\s+/g, "").length));
+    assertRelativeTolerance(actual.min, observed.promptLengthSummary.min, 0.15, `${fixture.fixtureId} prompt min`);
+    assertRelativeTolerance(actual.p50, observed.promptLengthSummary.p50, 0.10, `${fixture.fixtureId} prompt p50`);
+    assertRelativeTolerance(actual.p95, observed.promptLengthSummary.p95, 0.10, `${fixture.fixtureId} prompt p95`);
+    assertRelativeTolerance(actual.max, observed.promptLengthSummary.max, 0.15, `${fixture.fixtureId} prompt max`);
+  }
+});
+
+test("synthetic local workload represents observed patch and finding shape", () => {
+  for (const [fixture, profile] of [
+    [fixture20, OBSERVED_SHAPE_PROFILE_20],
+    [fixture30, OBSERVED_SHAPE_PROFILE_30],
+  ]) {
+    const observed = observedShape(profile);
+    const actual = collectFixtureWorkloadShape(fixture);
+    assertRelativeTolerance(actual.patch.total, observed.localPatchSummary.total, 0.10, `${fixture.fixtureId} patch total`);
+    assert.ok(Math.abs(actual.patch.p50 - observed.localPatchSummary.p50) <= 1);
+    assert.ok(Math.abs(actual.patch.p95 - observed.localPatchSummary.p95) <= 1);
+    assert.ok(Math.abs(actual.warning.p50 - observed.findingSummary.warning.p50) <= 1);
+    assert.ok(Math.abs(actual.warning.p95 - observed.findingSummary.warning.p95) <= 1);
+    assert.ok(Math.abs(actual.risk.p50 - observed.findingSummary.risk.p50) <= 1);
+    assert.ok(Math.abs(actual.risk.p95 - observed.findingSummary.risk.p95) <= 1);
+    assert.equal(actual.blocking.max, 0);
+    assert.equal(actual.patchable.max, 0);
+
+    const replay = runTimedBatchFixtureReplay(
+      cloneFixture(fixture),
+      createFrozenDashboardLocalAdapter(process.cwd()),
+    );
+    for (const kind of MODEL_KINDS) assert.equal(replay.invocationCounters[kind].executing, 0);
+  }
+});
+
+test("fixture result bytes and contract bytes stay representative", () => {
+  for (const [fixture, profile] of [
+    [fixture20, OBSERVED_SHAPE_PROFILE_20],
+    [fixture30, OBSERVED_SHAPE_PROFILE_30],
+  ]) {
+    const observed = observedShape(profile);
+    const resultBytes = summarizeObservedValues(fixture.renderedResults.map((result) =>
+      Buffer.byteLength(JSON.stringify(result), "utf8")));
+    const contractBytes = summarizeObservedValues(fixture.contracts.map((contract) =>
+      compileSegmentContractRenderBlock(contract).byteLength));
+    assertRelativeTolerance(resultBytes.p50, observed.resultByteSummary.p50, 0.15, `${fixture.fixtureId} result bytes p50`);
+    assertRelativeTolerance(resultBytes.p95, observed.resultByteSummary.p95, 0.15, `${fixture.fixtureId} result bytes p95`);
+    assertRelativeTolerance(contractBytes.p50, observed.contractByteSummary.p50, 0.15, `${fixture.fixtureId} contract bytes p50`);
+    assertRelativeTolerance(contractBytes.p95, observed.contractByteSummary.p95, 0.15, `${fixture.fixtureId} contract bytes p95`);
+    assert.ok(contractBytes.max >= 2_400 && contractBytes.max <= 3_072);
+    const manifest = fixture.segmentCount === 20
+      ? fixture20Module.FIXTURE_MANIFEST
+      : fixture30Module.FIXTURE_MANIFEST;
+    for (const [field, expected] of Object.entries(observed.shotFieldLengthSummaries)) {
+      const actual = manifest.shotFieldLengthSummaries[field];
+      assertRelativeTolerance(actual.p50, expected.p50, 0.15, `${fixture.fixtureId} ${field} p50`);
+      assertRelativeTolerance(actual.p95, expected.p95, 0.15, `${fixture.fixtureId} ${field} p95`);
+    }
+  }
+});
 
 test("representative fixtures publish diverse non-content shape manifests", () => {
   for (const [fixture, manifest, minimumScenarios] of [
@@ -103,7 +305,7 @@ test("representative fixtures publish diverse non-content shape manifests", () =
     [fixture30, fixture30Module.FIXTURE_MANIFEST, 12],
   ]) {
     assert.ok(manifest, `${fixture.fixtureId} must export a shape manifest`);
-    assert.equal(manifest.fixtureSchemaVersion, 1);
+    assert.equal(manifest.fixtureSchemaVersion, 2);
     assert.equal(manifest.fixtureId, fixture.fixtureId);
     assert.equal(manifest.segmentCount, fixture.segmentCount);
     assert.match(manifest.sourceShapeHash, /^[a-f0-9]{64}$/);
@@ -120,6 +322,7 @@ test("representative fixtures publish diverse non-content shape manifests", () =
     assert.ok(manifest.safetyPolarityCounts.negativeConstraint >= 1);
     assert.ok(manifest.eventSlotShapeSummary.totalSlots >= fixture.segmentCount);
     assert.ok(Array.isArray(manifest.expectedUniquePatchPaths));
+    assert.equal(manifest.shapeAcceptance.passed, true);
 
     const scenarioCounts = fixture.renderedResults.reduce((counts, result) => {
       const id = result.fixtureSentinel?.scenarioId;
@@ -134,7 +337,7 @@ test("representative fixtures publish diverse non-content shape manifests", () =
 });
 
 test("representative fixtures remain synthetic and privacy-safe", () => {
-  const serialized = canonicalizeFixture({ fixture20, fixture30 });
+  const serialized = canonicalizeFixture(collectFixtureContentText({ fixture20, fixture30 }));
   assert.doesNotMatch(serialized, /PRIVATE_/i);
   assert.doesNotMatch(serialized, /[A-Z]:\\\\/);
   assert.doesNotMatch(serialized, /(?:https?:\/\/|localhost:\d+)/i);

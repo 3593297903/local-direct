@@ -13,13 +13,13 @@ const fixture = createBatchGenerationFixture({
   shapeProfile: OBSERVED_SHAPE_PROFILE_20,
 });
 
-export const FIXTURE_SHA256 = "bb422cc0398457da43398e2e7f29a48289e39a909b987389314124b80d463f69";
+export const FIXTURE_SHA256 = "885938e67b19c57e1b86c6d481ea6be28588f69c57f7d7719174c859154391cc";
 export const FIXTURE_MANIFEST = createFixtureManifest(fixture, OBSERVED_SHAPE_PROFILE_20, {
   count: 20,
-  min: 1444,
-  p50: 1447,
-  p95: 1455,
-  max: 2441,
+  min: 1740,
+  p50: 1745,
+  p95: 1754,
+  max: 2550,
 });
 export { canonicalizeFixture, cloneFixture, computeFixtureHash };
 export default fixture;
