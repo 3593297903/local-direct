@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -17,6 +17,25 @@ const MODEL_KINDS = Object.freeze([
   "safety_rewrite",
   "contract_correction",
 ]);
+export const PHASE_ZERO_REQUIRED_COMMAND_IDS = Object.freeze([
+  "focused-tests",
+  "benchmark-20",
+  "benchmark-30",
+  "artifact-analysis-1",
+  "artifact-analysis-2",
+  "typecheck",
+  "api-typecheck",
+  "full-tests",
+  "api-build",
+  "frontend-build",
+  "privacy-safe",
+  "git-diff-check",
+  "git-status-clean",
+  "git-ancestor",
+  "git-merge-tree",
+]);
+const ALLOWED_POSTGRES_SKIP =
+  "twenty concurrent PostgreSQL saves create one version and replay the same ids";
 const FIXTURE_EXPECTATIONS = Object.freeze({
   20: Object.freeze({
     fixtureId: "observed-20-segment",
@@ -78,13 +97,239 @@ export function buildBenchmarkIdentityChecks(report, expected, label) {
   ];
 }
 
+export async function validateExternalVerification({
+  evidenceRoot,
+  externalVerification,
+  expectedTaskCommit,
+  expectedBaselineCommit,
+  readError = null,
+}) {
+  const resolvedEvidenceRoot = path.resolve(evidenceRoot);
+  const document = externalVerification && typeof externalVerification === "object"
+    ? externalVerification
+    : {};
+  const commands = Array.isArray(document.commands) ? document.commands : [];
+  const commandIds = commands.map((command) => command?.commandId);
+  const checks = [
+    exactCheck("external.readable", null, readError),
+    exactCheck("external.document", true, Boolean(externalVerification && typeof externalVerification === "object")),
+    exactCheck("external.schemaVersion", 1, document.schemaVersion),
+    exactCheck("external.taskCommit", expectedTaskCommit, document.taskCommit),
+    exactCheck("external.baselineCommit", expectedBaselineCommit, document.baselineCommit),
+    exactCheck("external.commandsArray", true, Array.isArray(document.commands)),
+    exactCheck("external.commandIdsUnique", commandIds.length, new Set(commandIds).size),
+  ];
+  const commandSummaries = [];
+
+  for (const commandId of PHASE_ZERO_REQUIRED_COMMAND_IDS) {
+    const matches = commands.filter((command) => command?.commandId === commandId);
+    const command = matches[0] || {};
+    const prefix = `external.command.${commandId}`;
+    checks.push(
+      exactCheck(`${prefix}.count`, 1, matches.length),
+      exactCheck(`${prefix}.exitCode`, 0, command.exitCode),
+      exactCheck(`${prefix}.passed`, true, command.passed),
+      exactCheck(
+        `${prefix}.argv`,
+        true,
+        Array.isArray(command.argv) && command.argv.length > 0
+          && command.argv.every((entry) => typeof entry === "string" && entry.length > 0),
+      ),
+    );
+
+    const logValidation = await validateExternalLog({
+      evidenceRoot: resolvedEvidenceRoot,
+      commandId,
+      logPath: command.logPath,
+      expectedSha256: command.logSha256,
+    });
+    checks.push(...logValidation.checks);
+    const semanticChecks = buildExternalCommandSemanticChecks(commandId, command.summary);
+    checks.push(...semanticChecks);
+    const commandAcceptance = evaluateRequiredChecks([
+      exactCheck(`${prefix}.commandPresent`, 1, matches.length),
+      exactCheck(`${prefix}.commandExitCode`, 0, command.exitCode),
+      exactCheck(`${prefix}.commandPassed`, true, command.passed),
+      ...logValidation.checks,
+      ...semanticChecks,
+    ]);
+    commandSummaries.push({
+      commandId,
+      argv: Array.isArray(command.argv) ? command.argv : [],
+      exitCode: Number.isInteger(command.exitCode) ? command.exitCode : null,
+      reportedPassed: command.passed === true,
+      verifiedPassed: commandAcceptance.status === "accepted",
+      logPath: typeof command.logPath === "string" ? command.logPath : null,
+      logSha256: typeof command.logSha256 === "string" ? command.logSha256 : null,
+      summary: command.summary && typeof command.summary === "object" ? command.summary : {},
+    });
+  }
+
+  const acceptance = evaluateRequiredChecks(checks);
+  return {
+    checks,
+    summary: {
+      schemaVersion: document.schemaVersion ?? null,
+      taskCommit: document.taskCommit ?? null,
+      baselineCommit: document.baselineCommit ?? null,
+      requiredCommandCount: PHASE_ZERO_REQUIRED_COMMAND_IDS.length,
+      observedCommandCount: commands.length,
+      failedRequiredCheckIds: acceptance.failedRequiredCheckIds,
+      status: acceptance.status,
+      commands: commandSummaries,
+    },
+  };
+}
+
+async function validateExternalLog({ evidenceRoot, commandId, logPath, expectedSha256 }) {
+  const prefix = `external.command.${commandId}.log`;
+  const relativePathValid = typeof logPath === "string"
+    && logPath.length > 0
+    && !path.isAbsolute(logPath);
+  const resolvedLogPath = relativePathValid ? path.resolve(evidenceRoot, logPath) : null;
+  const lexicalRelative = resolvedLogPath ? path.relative(evidenceRoot, resolvedLogPath) : "";
+  const lexicalInside = Boolean(
+    resolvedLogPath
+      && lexicalRelative
+      && lexicalRelative !== ".."
+      && !lexicalRelative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(lexicalRelative),
+  );
+  let bytes = null;
+  let readError = null;
+  let realInside = false;
+  if (lexicalInside) {
+    try {
+      const [realRoot, realLog] = await Promise.all([
+        realpath(evidenceRoot),
+        realpath(resolvedLogPath),
+      ]);
+      const realRelative = path.relative(realRoot, realLog);
+      realInside = Boolean(
+        realRelative
+          && realRelative !== ".."
+          && !realRelative.startsWith(`..${path.sep}`)
+          && !path.isAbsolute(realRelative),
+      );
+      if (realInside) bytes = await readFile(realLog);
+    } catch (error) {
+      readError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  const actualSha256 = bytes
+    ? createHash("sha256").update(bytes).digest("hex")
+    : null;
+  const text = bytes ? bytes.toString("utf8") : "";
+  const utf8WithoutBom = Boolean(
+    bytes
+      && !(bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf)
+      && !text.includes("\uFFFD"),
+  );
+  const expectedHashValid = typeof expectedSha256 === "string" && /^[a-f0-9]{64}$/i.test(expectedSha256);
+  return {
+    checks: [
+      exactCheck(`${prefix}.relativePath`, true, relativePathValid),
+      exactCheck(`${prefix}.insideEvidenceRoot`, true, lexicalInside && realInside),
+      exactCheck(`${prefix}.readable`, null, readError),
+      exactCheck(`${prefix}.exists`, true, Boolean(bytes)),
+      exactCheck(`${prefix}.sha256Format`, true, expectedHashValid),
+      exactCheck(`${prefix}.sha256`, expectedHashValid ? expectedSha256.toLowerCase() : null, actualSha256),
+      exactCheck(`${prefix}.utf8WithoutBom`, true, utf8WithoutBom),
+      exactCheck(`${prefix}.privacySafe`, false, containsSensitiveLogMaterial(text)),
+    ],
+  };
+}
+
+function buildExternalCommandSemanticChecks(commandId, summaryValue) {
+  const summary = summaryValue && typeof summaryValue === "object" ? summaryValue : {};
+  const checks = [];
+  if (commandId === "focused-tests") {
+    checks.push(...buildTestSummaryChecks(commandId, summary.testSummary, { allowPostgresSkip: false }));
+  }
+  if (commandId === "full-tests") {
+    checks.push(...buildTestSummaryChecks(commandId, summary.testSummary, { allowPostgresSkip: true }));
+  }
+  if (commandId === "privacy-safe") {
+    const testSummary = summary.testSummary && typeof summary.testSummary === "object"
+      ? summary.testSummary
+      : {};
+    checks.push(
+      exactCheck("external.command.privacy-safe.result", true, summary.privacySafe),
+      exactCheck(
+        "external.command.privacy-safe.testsPresent",
+        true,
+        Number.isInteger(Number(testSummary.tests)) && Number(testSummary.tests) > 0,
+      ),
+      exactCheck("external.command.privacy-safe.failures", 0, Number(testSummary.fail)),
+      exactCheck(
+        "external.command.privacy-safe.passesPresent",
+        true,
+        Number.isInteger(Number(testSummary.pass)) && Number(testSummary.pass) > 0,
+      ),
+    );
+  }
+  if (commandId === "git-diff-check" || commandId === "git-status-clean") {
+    checks.push(exactCheck(`external.command.${commandId}.clean`, true, summary.clean));
+  }
+  if (commandId === "git-ancestor") {
+    checks.push(exactCheck("external.command.git-ancestor.result", true, summary.isAncestor));
+  }
+  if (commandId === "git-merge-tree") {
+    checks.push(exactCheck(
+      "external.command.git-merge-tree.treeHash",
+      true,
+      typeof summary.treeHash === "string" && /^[a-f0-9]{40}$/i.test(summary.treeHash),
+    ));
+  }
+  return checks;
+}
+
+function buildTestSummaryChecks(commandId, value, { allowPostgresSkip }) {
+  const summary = value && typeof value === "object" ? value : {};
+  const tests = Number(summary.tests);
+  const passed = Number(summary.pass);
+  const failed = Number(summary.fail);
+  const skipped = Number(summary.skipped);
+  const skippedTests = Array.isArray(summary.skippedTests) ? summary.skippedTests : [];
+  const allowedSkips = skipped === 0
+    ? skippedTests.length === 0
+    : allowPostgresSkip
+      && skipped === 1
+      && skippedTests.length === 1
+      && skippedTests[0] === ALLOWED_POSTGRES_SKIP;
+  return [
+    exactCheck(`external.command.${commandId}.testsPresent`, true, Number.isInteger(tests) && tests > 0),
+    exactCheck(`external.command.${commandId}.failures`, 0, failed),
+    exactCheck(`external.command.${commandId}.passesPresent`, true, Number.isInteger(passed) && passed > 0),
+    exactCheck(`external.command.${commandId}.skipsAllowed`, true, allowedSkips),
+    exactCheck(`external.command.${commandId}.testConservation`, tests, passed + failed + skipped),
+  ];
+}
+
+function containsSensitiveLogMaterial(text) {
+  return /(?:OPENAI_API_KEY|DATABASE_URL|REDIS_URL|ADMIN_PASSWORD|AUTH_SECRET|API_TOKEN)\s*[:=]\s*\S+/i.test(text)
+    || /["']?(?:fullVideoPrompt|sourceText|promptText|optimizedScript)["']?\s*:/i.test(text);
+}
+
 export async function finalizePhaseZeroEvidence({ evidenceRoot, baselineRoot, taskRoot = SCRIPT_ROOT }) {
   const resolvedEvidenceRoot = path.resolve(evidenceRoot);
   const resolvedBaselineRoot = path.resolve(baselineRoot);
   const taskCommit = gitValue(taskRoot, ["rev-parse", "HEAD"]);
   const actualBaselineCommit = gitValue(resolvedBaselineRoot, ["rev-parse", "HEAD"]);
+  const externalRead = await readJsonOrError(path.join(
+    resolvedEvidenceRoot,
+    "external-verification.json",
+  ));
+  const externalValidation = await validateExternalVerification({
+    evidenceRoot: resolvedEvidenceRoot,
+    externalVerification: externalRead.value,
+    expectedTaskCommit: taskCommit,
+    expectedBaselineCommit: EXPECTED_BASELINE_COMMIT,
+    readError: externalRead.error,
+  });
   const checks = [
     exactCheck("baseline.currentCommit", EXPECTED_BASELINE_COMMIT, actualBaselineCommit),
+    ...externalValidation.checks,
   ];
   const benchmarkReports = {};
   const manifests = {};
@@ -228,6 +473,7 @@ export async function finalizePhaseZeroEvidence({ evidenceRoot, baselineRoot, ta
     benchmarkSummary,
     manifestSummary,
     artifactAnalyzer: analyzerSummary,
+    externalVerificationSummary: externalValidation.summary,
     checks: acceptanceBase.checks,
   };
   const acceptance = {
@@ -241,6 +487,7 @@ export async function finalizePhaseZeroEvidence({ evidenceRoot, baselineRoot, ta
       Object.entries(manifests).map(([key, manifest]) => [key, manifest.shapeAcceptance.passed]),
     ),
     artifactAnalyzer: analyzerSummary,
+    externalVerificationSummary: externalValidation.summary,
   };
   await writeJsonEvidence(path.join(resolvedEvidenceRoot, "final-verification.json"), finalVerification);
   await writeJsonEvidence(path.join(resolvedEvidenceRoot, "acceptance.json"), acceptance);

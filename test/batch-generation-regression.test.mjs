@@ -59,6 +59,106 @@ const MODEL_KINDS = [
   "contract_correction",
 ];
 
+const REQUIRED_EXTERNAL_COMMAND_IDS = [
+  "focused-tests",
+  "benchmark-20",
+  "benchmark-30",
+  "artifact-analysis-1",
+  "artifact-analysis-2",
+  "typecheck",
+  "api-typecheck",
+  "full-tests",
+  "api-build",
+  "frontend-build",
+  "privacy-safe",
+  "git-diff-check",
+  "git-status-clean",
+  "git-ancestor",
+  "git-merge-tree",
+];
+
+const ALLOWED_POSTGRES_SKIP =
+  "twenty concurrent PostgreSQL saves create one version and replay the same ids";
+
+let externalVerificationFixtureSequence = 0;
+
+async function createExternalVerificationFixture() {
+  externalVerificationFixtureSequence += 1;
+  const root = path.join(
+    process.cwd(),
+    ".tmp-batch-benchmark",
+    `external-verification-${process.pid}-${externalVerificationFixtureSequence}`,
+  );
+  const logsRoot = path.join(root, "logs");
+  await mkdir(logsRoot, { recursive: true });
+  const commands = [];
+  for (const commandId of REQUIRED_EXTERNAL_COMMAND_IDS) {
+    const logPath = `logs/${commandId}.log`;
+    const logBody = `${commandId}: verified\n`;
+    await writeFile(path.join(root, logPath), logBody, "utf8");
+    const summary = {};
+    if (commandId === "focused-tests") {
+      summary.testSummary = { tests: 33, pass: 33, fail: 0, skipped: 0, skippedTests: [] };
+    }
+    if (commandId === "full-tests") {
+      summary.testSummary = {
+        tests: 509,
+        pass: 508,
+        fail: 0,
+        skipped: 1,
+        skippedTests: [ALLOWED_POSTGRES_SKIP],
+      };
+    }
+    if (commandId === "privacy-safe") {
+      summary.privacySafe = true;
+      summary.testSummary = { tests: 1, pass: 1, fail: 0, skipped: 0, skippedTests: [] };
+    }
+    if (commandId === "git-diff-check" || commandId === "git-status-clean") summary.clean = true;
+    if (commandId === "git-ancestor") summary.isAncestor = true;
+    if (commandId === "git-merge-tree") summary.treeHash = "a".repeat(40);
+    commands.push({
+      commandId,
+      argv: [commandId],
+      exitCode: 0,
+      passed: true,
+      logPath,
+      logSha256: createHash("sha256").update(logBody, "utf8").digest("hex"),
+      summary,
+    });
+  }
+  return {
+    root,
+    document: {
+      schemaVersion: 1,
+      taskCommit: "task-commit",
+      baselineCommit: "baseline-commit",
+      commands,
+    },
+  };
+}
+
+async function evaluateExternalVerificationFixture(root, externalVerification) {
+  const {
+    evaluateRequiredChecks,
+    validateExternalVerification,
+  } = await import("../scripts/finalize-task-one-phase-0r.mjs");
+  assert.equal(
+    typeof validateExternalVerification,
+    "function",
+    "phase-zero finalizer must expose strict external verification validation",
+  );
+  const validation = await validateExternalVerification({
+    evidenceRoot: root,
+    externalVerification,
+    expectedTaskCommit: "task-commit",
+    expectedBaselineCommit: "baseline-commit",
+  });
+  return {
+    validation,
+    acceptance: evaluateRequiredChecks(validation.checks),
+  };
+}
+
 const COMPLETE_DASHBOARD_PIPELINE_FUNCTIONS = [
   "buildVideoGenerationPromptText",
   "cleanPromptValue",
@@ -514,6 +614,127 @@ test("benchmark commit or production fingerprint mismatch forces rejected", asyn
     "fixture-20.gitCommit",
     "fixture-20.productionSourceFingerprint",
   ]);
+});
+
+test("missing external verification forces phase-zero acceptance to rejected", async () => {
+  const fixture = await createExternalVerificationFixture();
+  try {
+    const { acceptance } = await evaluateExternalVerificationFixture(fixture.root, null);
+    assert.equal(acceptance.status, "rejected");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("any focused test typecheck full test or build failure forces rejected", async () => {
+  for (const commandId of [
+    "focused-tests",
+    "typecheck",
+    "api-typecheck",
+    "full-tests",
+    "api-build",
+    "frontend-build",
+  ]) {
+    const fixture = await createExternalVerificationFixture();
+    try {
+      const command = fixture.document.commands.find((entry) => entry.commandId === commandId);
+      command.exitCode = 1;
+      command.passed = false;
+      const { acceptance } = await evaluateExternalVerificationFixture(fixture.root, fixture.document);
+      assert.equal(acceptance.status, "rejected", commandId);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("privacy and every Git hard gate failure force rejected", async () => {
+  for (const commandId of [
+    "privacy-safe",
+    "git-diff-check",
+    "git-status-clean",
+    "git-ancestor",
+    "git-merge-tree",
+  ]) {
+    const fixture = await createExternalVerificationFixture();
+    try {
+      const command = fixture.document.commands.find((entry) => entry.commandId === commandId);
+      if (commandId === "privacy-safe") command.summary.privacySafe = false;
+      if (commandId === "git-diff-check" || commandId === "git-status-clean") command.summary.clean = false;
+      if (commandId === "git-ancestor") command.summary.isAncestor = false;
+      if (commandId === "git-merge-tree") command.summary.treeHash = "not-a-tree";
+      const { acceptance } = await evaluateExternalVerificationFixture(fixture.root, fixture.document);
+      assert.equal(acceptance.status, "rejected", commandId);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("external verification task commit mismatch forces rejected", async () => {
+  const fixture = await createExternalVerificationFixture();
+  try {
+    fixture.document.taskCommit = "different-task-commit";
+    const { acceptance } = await evaluateExternalVerificationFixture(fixture.root, fixture.document);
+    assert.equal(acceptance.status, "rejected");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("missing escaped or hash-mismatched external logs force rejected", async () => {
+  for (const failure of ["missing", "escaped", "hash-mismatch"]) {
+    const fixture = await createExternalVerificationFixture();
+    try {
+      const command = fixture.document.commands[0];
+      if (failure === "missing") await rm(path.join(fixture.root, command.logPath), { force: true });
+      if (failure === "escaped") command.logPath = "../outside.log";
+      if (failure === "hash-mismatch") command.logSha256 = "0".repeat(64);
+      const { acceptance } = await evaluateExternalVerificationFixture(fixture.root, fixture.document);
+      assert.equal(acceptance.status, "rejected", failure);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("missing duplicate or forged external command evidence forces rejected", async () => {
+  for (const failure of ["missing", "duplicate", "forged-pass"]) {
+    const fixture = await createExternalVerificationFixture();
+    try {
+      if (failure === "missing") fixture.document.commands.pop();
+      if (failure === "duplicate") fixture.document.commands.push(structuredClone(fixture.document.commands[0]));
+      if (failure === "forged-pass") {
+        fixture.document.commands[0].exitCode = 1;
+        fixture.document.commands[0].passed = true;
+      }
+      const { acceptance } = await evaluateExternalVerificationFixture(fixture.root, fixture.document);
+      assert.equal(acceptance.status, "rejected", failure);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("valid external verification combines with the existing 94 checks before acceptance", async () => {
+  const fixture = await createExternalVerificationFixture();
+  try {
+    const {
+      evaluateRequiredChecks,
+    } = await import("../scripts/finalize-task-one-phase-0r.mjs");
+    const { validation } = await evaluateExternalVerificationFixture(fixture.root, fixture.document);
+    const existingChecks = Array.from({ length: 94 }, (_, index) => ({
+      id: `existing-${index + 1}`,
+      required: true,
+      passed: true,
+    }));
+    const acceptance = evaluateRequiredChecks([...existingChecks, ...validation.checks]);
+    assert.equal(acceptance.status, "accepted");
+    assert.equal(acceptance.failedRequiredCheckIds.length, 0);
+    assert.ok(acceptance.requiredCheckCount > 94);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
 });
 
 test("representative fixtures remain synthetic and privacy-safe", () => {
