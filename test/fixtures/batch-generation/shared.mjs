@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { SYNTHETIC_SCENARIOS } from "./synthetic-scenarios.mjs";
+
+const require = createRequire(import.meta.url);
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+let replayRuntime;
 
 const PATCH_RECIPE_FIELDS = Object.freeze([
   "scene",
@@ -54,6 +61,21 @@ export function freezeFixture(value) {
   Object.freeze(value);
   for (const item of Object.values(value)) freezeFixture(item);
   return value;
+}
+
+export function replayFixtureThroughProductionPipeline(fixture) {
+  if (!replayRuntime) {
+    process.env.TS_NODE_COMPILER_OPTIONS ||= JSON.stringify({
+      module: "commonjs",
+      moduleResolution: "node",
+    });
+    require("ts-node/register/transpile-only");
+    replayRuntime = require("../../../lib/batch-generation-metrics.ts");
+  }
+  return replayRuntime.runTimedBatchFixtureReplay(
+    cloneFixture(fixture),
+    replayRuntime.createFrozenDashboardLocalAdapter(PROJECT_ROOT),
+  );
 }
 
 export function createBatchGenerationFixture({ fixtureId, segmentCount, shapeProfile }) {
@@ -175,7 +197,13 @@ export function createBatchGenerationFixture({ fixtureId, segmentCount, shapePro
   });
 }
 
-export function createFixtureManifest(fixture, shapeProfile, contractByteSummary) {
+export function createFixtureManifest(fixture, shapeProfile, contractByteSummary, liveReplay) {
+  if (!liveReplay?.workloadSummary || !Array.isArray(liveReplay.segmentWorkloads)) {
+    throw new Error("Fixture manifest requires a complete live production replay");
+  }
+  if (liveReplay.segmentWorkloads.length !== fixture.segmentCount) {
+    throw new Error("Live replay workload does not match fixture segment count");
+  }
   const promptLengths = fixture.renderedResults.map((result) => compactLength(result.workflow.fullVideoPrompt));
   const canonicalPromptLengths = fixture.renderedResults.map((result) => compactLength(result.workflow.filmScript));
   const resultJsonBytes = fixture.renderedResults.map((result) => Buffer.byteLength(JSON.stringify(result), "utf8"));
@@ -194,22 +222,20 @@ export function createFixtureManifest(fixture, shapeProfile, contractByteSummary
     contract.requiredEventSlots.map((slot) => slot.conceptGroups.length));
   const repairTargetCounts = fixture.contracts.flatMap((contract) =>
     contract.requiredEventSlots.map((slot) => slot.repairTargets.length));
-  const generatedFindingSummary = {
+  const constructionFindingTargets = {
     blocking: { p50: 0, p95: 0, max: 0, total: 0 },
     patchable: { p50: 0, p95: 0, max: 0, total: 0 },
     warning: summarize(shapeProfile.segmentWorkloadShape.warningCounts),
     risk: summarize(shapeProfile.segmentWorkloadShape.riskCounts),
   };
-  const generatedLocalPatchSummary = summarize(shapeProfile.segmentWorkloadShape.localPatchCounts);
-  const generatedShapeProfile = {
+  const constructionLocalPatchTarget = summarize(shapeProfile.segmentWorkloadShape.localPatchCounts);
+  const generatedStaticShapeProfile = {
     segmentCount: fixture.segmentCount,
     shotCountHistogram,
     promptLengthSummary: summarize(promptLengths),
     canonicalPromptLengthSummary: summarize(canonicalPromptLengths),
     resultByteSummary: summarize(resultJsonBytes),
     shotFieldLengthSummaries,
-    findingSummary: generatedFindingSummary,
-    localPatchSummary: generatedLocalPatchSummary,
     contractByteSummary,
     eventSlotShapeSummary: {
       totalSlots,
@@ -218,19 +244,37 @@ export function createFixtureManifest(fixture, shapeProfile, contractByteSummary
       repairTargets: summarize(repairTargetCounts),
       characterLocks: summarize(fixture.contracts.map((contract) => contract.characterLocks.length)),
     },
+    workloadConstructionTargets: {
+      findingSummary: constructionFindingTargets,
+      localPatchSummary: constructionLocalPatchTarget,
+    },
   };
-  const shapeDeltas = buildShapeDeltas(shapeProfile, generatedShapeProfile);
+  const liveFullPipelineWorkload = structuredClone({
+    segments: liveReplay.segmentWorkloads,
+    ...liveReplay.workloadSummary,
+    acceptedSegments: liveReplay.quality.accepted,
+    blockedSegments: liveReplay.quality.blocked,
+    needsReviewSegments: liveReplay.quality.needsReview,
+  });
+  const staticShapeDeltas = buildStaticShapeDeltas(shapeProfile, generatedStaticShapeProfile);
+  const observedVsLiveDeltas = buildObservedVsLiveDeltas(shapeProfile, liveFullPipelineWorkload);
+  const livePipelineChecks = buildLivePipelineChecks(liveFullPipelineWorkload, fixture.segmentCount);
+  const acceptanceChecks = [
+    ...staticShapeDeltas.map((check) => ({ ...check, requiredForAcceptance: true })),
+    ...observedVsLiveDeltas,
+    ...livePipelineChecks,
+  ];
 
   return freezeFixture({
-    fixtureSchemaVersion: 2,
+    fixtureSchemaVersion: 3,
     fixtureId: fixture.fixtureId,
     sourceShapeHash: shapeProfile.sourceShapeHash,
     segmentCount: fixture.segmentCount,
     scenarioCount: scenarioIds.size,
     shotCountHistogram,
-    promptLengthSummary: generatedShapeProfile.promptLengthSummary,
-    canonicalPromptLengthSummary: generatedShapeProfile.canonicalPromptLengthSummary,
-    resultByteSummary: generatedShapeProfile.resultByteSummary,
+    promptLengthSummary: generatedStaticShapeProfile.promptLengthSummary,
+    canonicalPromptLengthSummary: generatedStaticShapeProfile.canonicalPromptLengthSummary,
+    resultByteSummary: generatedStaticShapeProfile.resultByteSummary,
     shotFieldLengthSummaries,
     contractByteSummary,
     safetyPolarityCounts: {
@@ -247,14 +291,18 @@ export function createFixtureManifest(fixture, shapeProfile, contractByteSummary
       characterLocks: summarize(fixture.contracts.map((contract) => contract.characterLocks.length)),
     },
     expectedRouteCounts: { accept: fixture.segmentCount },
-    expectedLocalPatchOperations: generatedLocalPatchSummary.total,
+    expectedLocalPatchOperations: liveFullPipelineWorkload.localPatchSummary.total,
     expectedUniquePatchPaths: fixture.expected.uniquePatchPaths,
     observedShapeProfile: shapeProfile,
-    generatedShapeProfile,
-    shapeDeltas,
+    generatedStaticShapeProfile,
+    liveFullPipelineWorkload,
+    observedVsLiveDeltas,
+    staticShapeDeltas,
     shapeAcceptance: {
-      passed: shapeDeltas.every((item) => item.accepted),
-      checks: shapeDeltas,
+      passed: acceptanceChecks
+        .filter((item) => item.requiredForAcceptance)
+        .every((item) => item.accepted),
+      checks: acceptanceChecks,
     },
   });
 }
@@ -650,7 +698,7 @@ function assignBudgetsByWeight(budgets, weights) {
   return assigned;
 }
 
-function buildShapeDeltas(observed, generated) {
+function buildStaticShapeDeltas(observed, generated) {
   const checks = [];
   const addCheck = (metric, observedValue, generatedValue, tolerance) => {
     const delta = generatedValue - observedValue;
@@ -679,20 +727,79 @@ function buildShapeDeltas(observed, generated) {
     addCheck(`resultByteSummary.${key}`, observed.resultByteSummary[key], generated.resultByteSummary[key], 0.15);
     addCheck(`contractByteSummary.${key}`, observed.contractByteSummary[key], generated.contractByteSummary[key], 0.15);
   }
+  return checks;
+}
+
+function buildObservedVsLiveDeltas(observed, liveWorkload) {
+  const checks = [];
+  const addCheck = ({ metric, observedValue, liveValue, tolerance, requiredForAcceptance }) => {
+    const delta = liveValue - observedValue;
+    checks.push({
+      metric,
+      observed: observedValue,
+      live: liveValue,
+      delta,
+      ratio: observedValue === 0 ? (liveValue === 0 ? 1 : null) : liveValue / observedValue,
+      tolerance,
+      requiredForAcceptance,
+      accepted: observedValue === 0
+        ? liveValue === 0
+        : Math.abs(delta) <= Math.max(1, Math.abs(observedValue) * tolerance),
+    });
+  };
+
   for (const key of ["p50", "p95", "max", "total"]) {
-    addCheck(`localPatchSummary.${key}`, observed.localPatchSummary[key], generated.localPatchSummary[key], key === "total" ? 0.10 : 0.125);
+    addCheck({
+      metric: `localPatchSummary.${key}`,
+      observedValue: observed.localPatchSummary[key],
+      liveValue: liveWorkload.localPatchSummary[key],
+      tolerance: key === "total" ? 0.10 : 0.125,
+      requiredForAcceptance: true,
+    });
   }
   for (const severity of ["blocking", "patchable", "warning", "risk"]) {
     for (const key of ["p50", "p95", "max", "total"]) {
-      addCheck(
-        `findingSummary.${severity}.${key}`,
-        observed.findingSummary[severity][key],
-        generated.findingSummary[severity][key],
-        severity === "blocking" || severity === "patchable" ? 0 : 0.10,
-      );
+      const hardZeroSeverity = severity === "blocking" || severity === "patchable";
+      addCheck({
+        metric: `findingSummary.${severity}.${key}`,
+        observedValue: observed.findingSummary[severity][key],
+        liveValue: liveWorkload.findingSummary[severity][key],
+        tolerance: hardZeroSeverity ? 0 : 0.10,
+        requiredForAcceptance: hardZeroSeverity || key === "p50" || key === "p95",
+      });
     }
   }
   return checks;
+}
+
+function buildLivePipelineChecks(liveWorkload, expectedSegmentCount) {
+  const checks = [
+    requiredExactCheck("live.segmentWorkloads", expectedSegmentCount, liveWorkload.segments.length),
+    requiredExactCheck("live.acceptedSegments", expectedSegmentCount, liveWorkload.acceptedSegments),
+    requiredExactCheck("live.blockedSegments", 0, liveWorkload.blockedSegments),
+    requiredExactCheck("live.needsReviewSegments", 0, liveWorkload.needsReviewSegments),
+    requiredExactCheck(
+      "live.routeDecisionCounts.accept",
+      expectedSegmentCount,
+      liveWorkload.routeDecisionCounts.accept || 0,
+    ),
+  ];
+  for (const [kind, executing] of Object.entries(liveWorkload.modelExecutingCounts)) {
+    checks.push(requiredExactCheck(`live.modelExecutingCounts.${kind}`, 0, executing));
+  }
+  return checks;
+}
+
+function requiredExactCheck(metric, expected, actual) {
+  return {
+    metric,
+    expected,
+    actual,
+    delta: actual - expected,
+    tolerance: 0,
+    requiredForAcceptance: true,
+    accepted: actual === expected,
+  };
 }
 
 function selectActions(actions, shotCount) {

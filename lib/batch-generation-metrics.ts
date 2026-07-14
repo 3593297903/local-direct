@@ -101,6 +101,34 @@ export type BatchBenchmarkExtensionsV1 = {
   findingCounts: Record<"blocking" | "patchable" | "warning" | "risk", number>;
 };
 
+export type BatchSegmentReplayWorkload = {
+  segmentIndex: number;
+  localPatchOperations: number;
+  blocking: number;
+  patchable: number;
+  warning: number;
+  risk: number;
+  routeAction: string;
+};
+
+export type BatchReplayCountSummary = {
+  min: number;
+  p50: number;
+  p95: number;
+  max: number;
+  total: number;
+};
+
+export type BatchReplayWorkloadSummary = {
+  findingSummary: Record<
+    "blocking" | "patchable" | "warning" | "risk",
+    BatchReplayCountSummary
+  >;
+  localPatchSummary: BatchReplayCountSummary;
+  routeDecisionCounts: Record<string, number>;
+  modelExecutingCounts: Record<keyof BatchInvocationCounters, number>;
+};
+
 export type BatchGenerationFixtureLike = {
   schemaVersion: 1;
   fixtureId: string;
@@ -179,10 +207,12 @@ export class UnexpectedBenchmarkModelInvocation extends Error {
   }
 }
 
-type TimedReplayResult = {
+export type TimedReplayResult = {
   timingsMs: Record<string, number>;
   payloadBytes: Record<string, number>;
   invocationCounters: BatchInvocationCounters;
+  segmentWorkloads: BatchSegmentReplayWorkload[];
+  workloadSummary: BatchReplayWorkloadSummary;
   quality: {
     accepted: number;
     acceptedSegmentIndexes: number[];
@@ -699,6 +729,7 @@ export function runTimedBatchFixtureReplay(
     } as Record<CoverageDecision["status"], number>,
   };
   const patchPaths = new Set<string>();
+  const segmentWorkloads: BatchSegmentReplayWorkload[] = [];
   const cachedSegments: Array<Record<string, unknown>> = [];
   const pipelineStartedAt = performance.now();
 
@@ -789,6 +820,18 @@ export function runTimedBatchFixtureReplay(
         contractHash: contract.contractHash,
       });
       replayQuality.routeDecisionCounts[route.action] = (replayQuality.routeDecisionCounts[route.action] || 0) + 1;
+      const segmentFindingCounts = {
+        blocking: finalGate.blockingFindings.length,
+        patchable: finalGate.patchableFindings.length,
+        warning: finalGate.warningFindings.length,
+        risk: finalGate.riskFindings.length,
+      };
+      segmentWorkloads.push({
+        segmentIndex: context.episodeIndex,
+        localPatchOperations: patched.patchDiffs.length,
+        ...segmentFindingCounts,
+        routeAction: route.action,
+      });
       dispatchReplayRoute(route, modelAdapters, {
         batchId: `fixture:${fixture.fixtureId}`,
         segmentIndexes: [context.episodeIndex],
@@ -872,6 +915,7 @@ export function runTimedBatchFixtureReplay(
     replayQuality.uniquePatchPaths = [...patchPaths].sort();
     replayQuality.blockingFindingFingerprints.sort();
     timers.full_local_pipeline_total = performance.now() - pipelineStartedAt;
+    const invocationCounters = summarizeBatchInvocations(invocationEvents);
     return {
       timingsMs: timers,
       payloadBytes: {
@@ -879,12 +923,62 @@ export function runTimedBatchFixtureReplay(
         statusDto: Buffer.byteLength(statusJson, "utf8"),
         fullJobPayload: Buffer.byteLength(fullJobJson, "utf8"),
       },
-      invocationCounters: summarizeBatchInvocations(invocationEvents),
+      invocationCounters,
+      segmentWorkloads,
+      workloadSummary: summarizeBatchReplayWorkload(segmentWorkloads, invocationCounters),
       quality: replayQuality,
     };
   } finally {
     uninstall();
   }
+}
+
+export function summarizeBatchReplayWorkload(
+  segmentWorkloads: readonly BatchSegmentReplayWorkload[],
+  invocationCounters: BatchInvocationCounters,
+): BatchReplayWorkloadSummary {
+  const findingSummary = Object.fromEntries(
+    (["blocking", "patchable", "warning", "risk"] as const).map((severity) => [
+      severity,
+      summarizeReplayCounts(segmentWorkloads.map((segment) => segment[severity])),
+    ]),
+  ) as BatchReplayWorkloadSummary["findingSummary"];
+  const routeDecisionCounts = Object.fromEntries(
+    [...new Set(segmentWorkloads.map((segment) => segment.routeAction))]
+      .sort((left, right) => left.localeCompare(right))
+      .map((action) => [
+        action,
+        segmentWorkloads.filter((segment) => segment.routeAction === action).length,
+      ]),
+  );
+  const modelExecutingCounts = Object.fromEntries(
+    (Object.keys(invocationCounters) as Array<keyof BatchInvocationCounters>)
+      .sort((left, right) => left.localeCompare(right))
+      .map((kind) => [kind, invocationCounters[kind].executing]),
+  ) as BatchReplayWorkloadSummary["modelExecutingCounts"];
+  return {
+    findingSummary,
+    localPatchSummary: summarizeReplayCounts(
+      segmentWorkloads.map((segment) => segment.localPatchOperations),
+    ),
+    routeDecisionCounts,
+    modelExecutingCounts,
+  };
+}
+
+function summarizeReplayCounts(values: readonly number[]): BatchReplayCountSummary {
+  if (!values.length) return { min: 0, p50: 0, p95: 0, max: 0, total: 0 };
+  const sorted = [...values].sort((left, right) => left - right);
+  const nearestRank = (fraction: number) => sorted[
+    Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * fraction) - 1))
+  ];
+  return {
+    min: sorted[0] || 0,
+    p50: nearestRank(0.5),
+    p95: nearestRank(0.95),
+    max: sorted.at(-1) || 0,
+    total: sorted.reduce((total, value) => total + value, 0),
+  };
 }
 
 export function aggregateTimedReplays(runs: readonly TimedReplayResult[]) {

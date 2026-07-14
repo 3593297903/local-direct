@@ -321,7 +321,7 @@ test("representative fixtures publish diverse non-content shape manifests", () =
     [fixture30, fixture30Module.FIXTURE_MANIFEST, 12],
   ]) {
     assert.ok(manifest, `${fixture.fixtureId} must export a shape manifest`);
-    assert.equal(manifest.fixtureSchemaVersion, 2);
+    assert.equal(manifest.fixtureSchemaVersion, 3);
     assert.equal(manifest.fixtureId, fixture.fixtureId);
     assert.equal(manifest.segmentCount, fixture.segmentCount);
     assert.match(manifest.sourceShapeHash, /^[a-f0-9]{64}$/);
@@ -350,6 +350,110 @@ test("representative fixtures publish diverse non-content shape manifests", () =
     assert.ok(Math.max(...Object.values(scenarioCounts)) <= fixture.segmentCount * 0.25);
   }
   assert.ok(fixture30.renderedResults.some((result) => result.storyboard.length === 5));
+});
+
+test("fixture manifest derives workload from live full-pipeline replay", () => {
+  for (const [fixture, manifest] of [
+    [fixture20, fixture20Module.FIXTURE_MANIFEST],
+    [fixture30, fixture30Module.FIXTURE_MANIFEST],
+  ]) {
+    const replay = runTimedBatchFixtureReplay(
+      cloneFixture(fixture),
+      createFrozenDashboardLocalAdapter(process.cwd()),
+    );
+    assert.ok(replay.workloadSummary, "full-pipeline replay must publish deterministic workload summary");
+    assert.ok(
+      manifest.liveFullPipelineWorkload,
+      "fixture manifest must source workload totals from the production replay",
+    );
+    assert.deepEqual(
+      manifest.liveFullPipelineWorkload.findingSummary,
+      replay.workloadSummary.findingSummary,
+    );
+    assert.deepEqual(
+      manifest.liveFullPipelineWorkload.localPatchSummary,
+      replay.workloadSummary.localPatchSummary,
+    );
+    assert.deepEqual(
+      manifest.liveFullPipelineWorkload.routeDecisionCounts,
+      replay.workloadSummary.routeDecisionCounts,
+    );
+    assert.deepEqual(
+      manifest.liveFullPipelineWorkload.modelExecutingCounts,
+      replay.workloadSummary.modelExecutingCounts,
+    );
+  }
+});
+
+test("manifest separates observed workload from live production workload", () => {
+  for (const [manifest, expectedObserved, expectedLive] of [
+    [fixture20Module.FIXTURE_MANIFEST, { warning: 136, risk: 92 }, { warning: 156, risk: 102 }],
+    [fixture30Module.FIXTURE_MANIFEST, { warning: 171, risk: 156 }, { warning: 201, risk: 184 }],
+  ]) {
+    assert.ok(
+      manifest.liveFullPipelineWorkload,
+      "fixture manifest must separate historical observations from live replay workload",
+    );
+    assert.equal(manifest.observedShapeProfile.findingSummary.warning.total, expectedObserved.warning);
+    assert.equal(manifest.observedShapeProfile.findingSummary.risk.total, expectedObserved.risk);
+    assert.equal(manifest.liveFullPipelineWorkload.findingSummary.warning.total, expectedLive.warning);
+    assert.equal(manifest.liveFullPipelineWorkload.findingSummary.risk.total, expectedLive.risk);
+    assert.notStrictEqual(manifest.observedShapeProfile, manifest.liveFullPipelineWorkload);
+  }
+});
+
+test("manifest warning risk and local-patch totals equal live replay totals", () => {
+  for (const [fixture, manifest, expected] of [
+    [fixture20, fixture20Module.FIXTURE_MANIFEST, { warning: 156, risk: 102, localPatch: 57 }],
+    [fixture30, fixture30Module.FIXTURE_MANIFEST, { warning: 201, risk: 184, localPatch: 147 }],
+  ]) {
+    const replay = runTimedBatchFixtureReplay(
+      cloneFixture(fixture),
+      createFrozenDashboardLocalAdapter(process.cwd()),
+    );
+    assert.ok(
+      manifest.liveFullPipelineWorkload,
+      "fixture manifest must source workload totals from the production replay",
+    );
+    assert.equal(manifest.liveFullPipelineWorkload.findingSummary.warning.total, expected.warning);
+    assert.equal(manifest.liveFullPipelineWorkload.findingSummary.risk.total, expected.risk);
+    assert.equal(manifest.liveFullPipelineWorkload.localPatchSummary.total, expected.localPatch);
+    assert.equal(manifest.liveFullPipelineWorkload.findingSummary.warning.total, replay.quality.findingCounts.warning);
+    assert.equal(manifest.liveFullPipelineWorkload.findingSummary.risk.total, replay.quality.findingCounts.risk);
+    assert.equal(manifest.liveFullPipelineWorkload.localPatchSummary.total, replay.quality.localPatchOperations);
+  }
+});
+
+test("manifest cannot pass when copied observed counts differ from live replay", () => {
+  for (const [fixture, manifest] of [
+    [fixture20, fixture20Module.FIXTURE_MANIFEST],
+    [fixture30, fixture30Module.FIXTURE_MANIFEST],
+  ]) {
+    const replay = runTimedBatchFixtureReplay(
+      cloneFixture(fixture),
+      createFrozenDashboardLocalAdapter(process.cwd()),
+    );
+    assert.notEqual(
+      manifest.observedShapeProfile.findingSummary.warning.total,
+      replay.quality.findingCounts.warning,
+    );
+    assert.notEqual(
+      manifest.observedShapeProfile.findingSummary.risk.total,
+      replay.quality.findingCounts.risk,
+    );
+    assert.ok(
+      Array.isArray(manifest.observedVsLiveDeltas),
+      "fixture manifest must disclose observed-versus-live workload deltas",
+    );
+    assert.ok(
+      manifest.observedVsLiveDeltas.some((check) =>
+        check.metric === "findingSummary.warning.total" && check.delta !== 0),
+    );
+    assert.ok(
+      manifest.observedVsLiveDeltas.some((check) =>
+        check.metric === "findingSummary.risk.total" && check.delta !== 0),
+    );
+  }
 });
 
 test("representative fixtures remain synthetic and privacy-safe", () => {
