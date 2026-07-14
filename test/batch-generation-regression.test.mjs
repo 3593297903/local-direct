@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import test from "node:test";
@@ -643,6 +643,119 @@ test("benchmark rejects baseline and task pipeline fingerprint drift", async () 
     () => benchmark.assertMatchingProductionSourceFingerprints("baseline", "task"),
     /fingerprint differs/i,
   );
+});
+
+test("queue candidate discovery reads JSON and selects by createdAt without mutating files", async () => {
+  const benchmark = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  assert.equal(typeof benchmark.scanQueueDirectoryReadOnly, "function");
+  const root = path.join(process.cwd(), ".tmp-batch-benchmark", `queue-read-test-${process.pid}-${Date.now()}`);
+  const directory = path.join(root, "legacy-flat");
+  const firstPath = path.join(directory, "aaa-late.json");
+  const secondPath = path.join(directory, "zzz-old.json");
+  const malformedPath = path.join(directory, "malformed.json");
+  try {
+    await mkdir(directory, { recursive: true });
+    await writeFile(firstPath, `${JSON.stringify({
+      id: "job-late",
+      status: "pending",
+      createdAt: "2026-07-14T10:00:00.000Z",
+      updatedAt: "2026-07-14T10:00:00.000Z",
+      sourceHash: "synthetic-source",
+      contractHash: "synthetic-contract",
+      segmentIndexes: [1],
+    })}\n`, "utf8");
+    await writeFile(secondPath, `${JSON.stringify({
+      id: "job-old",
+      status: "pending",
+      createdAt: "2026-07-14T09:00:00.000Z",
+      updatedAt: "2026-07-14T09:00:00.000Z",
+      sourceHash: "synthetic-source",
+      contractHash: "synthetic-contract",
+      segmentIndexes: [2],
+    })}\n`, "utf8");
+    await writeFile(malformedPath, "{not-json}\n", "utf8");
+    const before = new Map(
+      await Promise.all([firstPath, secondPath, malformedPath].map(async (file) => {
+        const fileStat = await stat(file);
+        return [file, { mtimeMs: fileStat.mtimeMs, size: fileStat.size }];
+      })),
+    );
+
+    const oldest = await benchmark.scanQueueDirectoryReadOnly(directory, {
+      layout: "legacy_flat_job_scan",
+      order: "oldest",
+    });
+    assert.equal(oldest.selectedJobId, "job-old");
+    assert.equal(oldest.selectedCreatedAt, "2026-07-14T09:00:00.000Z");
+    assert.equal(oldest.parsedFileCount, 2);
+    assert.equal(oldest.invalidFileCount, 1);
+
+    await writeFile(firstPath, `${JSON.stringify({
+      id: "job-late",
+      status: "pending",
+      createdAt: "2026-07-14T08:00:00.000Z",
+      updatedAt: "2026-07-14T10:00:00.000Z",
+      sourceHash: "synthetic-source",
+      contractHash: "synthetic-contract",
+      segmentIndexes: [1],
+    })}\n`, "utf8");
+    const beforeSecondScan = new Map(
+      await Promise.all([firstPath, secondPath, malformedPath].map(async (file) => {
+        const fileStat = await stat(file);
+        return [file, { mtimeMs: fileStat.mtimeMs, size: fileStat.size }];
+      })),
+    );
+    const changed = await benchmark.scanQueueDirectoryReadOnly(directory, {
+      layout: "legacy_flat_job_scan",
+      order: "oldest",
+    });
+    assert.equal(changed.selectedJobId, "job-late");
+    assert.equal(changed.selectedCreatedAt, "2026-07-14T08:00:00.000Z");
+    assert.equal(changed.candidateCount, 2);
+    assert.ok(changed.candidatePayloadBytes > 0);
+    assert.equal((await readdir(directory)).some((name) => /lock/i.test(name)), false);
+    for (const [file, snapshot] of beforeSecondScan) {
+      const after = await stat(file);
+      assert.deepEqual({ mtimeMs: after.mtimeMs, size: after.size }, snapshot);
+    }
+    assert.notDeepEqual(before.get(firstPath), beforeSecondScan.get(firstPath));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("queue benchmark parses 0/100/500/1000 candidates for both layouts and cleans up", async () => {
+  const benchmark = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  assert.equal(typeof benchmark.benchmarkReadOnlyQueueScans, "function");
+  const outputRoot = path.join(process.cwd(), ".tmp-batch-benchmark", `queue-benchmark-test-${process.pid}`);
+  const runId = "regression";
+  await rm(outputRoot, { recursive: true, force: true });
+  try {
+    const result = await benchmark.benchmarkReadOnlyQueueScans(outputRoot, 1, 0, {
+      runId,
+      payloadProfile: {
+        fileStorePending: { p50: 512, p95: 768 },
+        legacyFlat: { p50: 384, p95: 640 },
+      },
+    });
+    for (const count of [0, 100, 500, 1000]) {
+      assert.ok(result.timingsMs[`queue_claim_${count}`]);
+      const fileStore = result.extensions.layouts.file_store_pending_scan[String(count)];
+      const legacy = result.extensions.layouts.legacy_flat_job_scan[String(count)];
+      assert.equal(fileStore.parsedFileCount, count);
+      assert.equal(legacy.parsedFileCount, count);
+      assert.equal(fileStore.invalidFileCount, 1);
+      assert.equal(legacy.invalidFileCount, 1);
+      assert.equal(fileStore.queueLayout, "file_store_pending_scan");
+      assert.equal(legacy.queueLayout, "legacy_flat_job_scan");
+    }
+    await assert.rejects(
+      stat(path.join(outputRoot, `queue-scan-${runId}`)),
+      (error) => error?.code === "ENOENT",
+    );
+  } finally {
+    await rm(outputRoot, { recursive: true, force: true });
+  }
 });
 
 test("canonical prompt hashes are computed from live frozen output, not fixture archive hashes", () => {

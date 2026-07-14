@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -22,6 +22,12 @@ const {
 } = require("../lib/batch-generation-metrics.ts");
 
 const scriptRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const OBSERVED_QUEUE_PAYLOAD_BYTES = Object.freeze({
+  fileStorePending: Object.freeze({ p50: 89_675, p95: 169_349 }),
+  legacyFlat: Object.freeze({ p50: 52_731, p95: 670_756 }),
+});
+const QUEUE_SCAN_COUNTS = Object.freeze([0, 100, 500, 1000]);
+const VALID_JOB_STATUSES = new Set(["pending", "running", "completed", "failed"]);
 
 export async function runBenchmarkCli(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
@@ -76,10 +82,10 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
     ".tmp-batch-benchmark",
     `phase-0-fixture-${fixtureNumber}.json`,
   ));
-  const queueTimings = await benchmarkReadOnlyQueueScans(path.dirname(outputPath), iterations, warmups);
+  const queueBenchmark = await benchmarkReadOnlyQueueScans(path.dirname(outputPath), iterations, warmups);
   const baselineAggregate = aggregateTimedReplays(baselineRuns);
   const taskAggregate = aggregateTimedReplays(taskRuns);
-  Object.assign(taskAggregate.timingsMs, queueTimings);
+  Object.assign(taskAggregate.timingsMs, queueBenchmark.timingsMs);
   const quality = taskRuns.at(-1).quality;
   const report = createBatchBenchmarkReport({
     gitCommit: gitValue(taskRoot, ["rev-parse", "HEAD"]),
@@ -94,7 +100,7 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
     payloadBytes: taskAggregate.payloadBytes,
     invocationCounters: taskRuns.at(-1).invocationCounters,
     quality,
-    extensions: createBenchmarkExtensions(taskAdapter, quality),
+    extensions: createBenchmarkExtensions(taskAdapter, quality, queueBenchmark.extensions),
     generatedAt: new Date().toISOString(),
   });
   assertBatchBenchmarkInvariants(report);
@@ -148,7 +154,7 @@ function loadPipelineAdapter(root) {
   return createFrozenDashboardLocalAdapter(root);
 }
 
-function createBenchmarkExtensions(adapter, quality) {
+function createBenchmarkExtensions(adapter, quality, queueExtensions) {
   const modelPromptLengths = [...quality.modelPromptLengths].sort((left, right) => left - right);
   const at = (fraction) => modelPromptLengths[
     Math.min(modelPromptLengths.length - 1, Math.max(0, Math.ceil(modelPromptLengths.length * fraction) - 1))
@@ -168,41 +174,192 @@ function createBenchmarkExtensions(adapter, quality) {
     uniquePatchPaths: quality.uniquePatchPaths,
     routeDecisionCounts: quality.routeDecisionCounts,
     findingCounts: quality.findingCounts,
+    queueScanSemantics: queueExtensions.queueScanSemantics,
+    queueLayout: queueExtensions.queueLayout,
+    queueCandidateScans: queueExtensions.layouts,
   };
 }
 
-async function benchmarkReadOnlyQueueScans(outputRoot, iterations, warmups) {
-  const root = path.join(outputRoot, `queue-scan-${process.pid}`);
+export async function benchmarkReadOnlyQueueScans(outputRoot, iterations, warmups, options = {}) {
+  const runId = String(options.runId || process.pid).replace(/[^A-Za-z0-9._-]+/g, "-");
+  const root = path.join(outputRoot, `queue-scan-${runId}`);
+  const payloadProfile = options.payloadProfile || OBSERVED_QUEUE_PAYLOAD_BYTES;
   await rm(root, { recursive: true, force: true });
   await mkdir(root, { recursive: true });
   try {
-    const results = {};
-    for (const count of [0, 100, 500, 1000]) {
-      const directory = path.join(root, String(count));
-      await mkdir(directory, { recursive: true });
-      await Promise.all(Array.from({ length: count }, (_, index) => writeFile(
-        path.join(directory, `historical-${String(index).padStart(4, "0")}.json`),
-        "{}\n",
-        "utf8",
-      )));
-      for (let warmup = 0; warmup < warmups; warmup += 1) await scanQueueDirectoryReadOnly(directory);
-      const samples = [];
-      for (let iteration = 0; iteration < iterations; iteration += 1) {
-        const startedAt = performance.now();
-        await scanQueueDirectoryReadOnly(directory);
-        samples.push(performance.now() - startedAt);
-      }
-      results[`queue_claim_${count}`] = summarizeNumericSamples(samples);
+    const timingsMs = {};
+    const layouts = {
+      file_store_pending_scan: {},
+      legacy_flat_job_scan: {},
+    };
+    for (const count of QUEUE_SCAN_COUNTS) {
+      const countRoot = path.join(root, String(count));
+      const fileStoreDirectory = path.join(countRoot, "file-store", "pending");
+      const legacyDirectory = path.join(countRoot, "legacy-flat");
+      await writeSyntheticQueueLayout(
+        fileStoreDirectory,
+        count,
+        "file_store_pending_scan",
+        payloadProfile.fileStorePending,
+      );
+      await writeSyntheticQueueLayout(
+        legacyDirectory,
+        count,
+        "legacy_flat_job_scan",
+        payloadProfile.legacyFlat,
+      );
+
+      const fileStoreMeasurement = await measureQueueCandidateScan({
+        directory: fileStoreDirectory,
+        layout: "file_store_pending_scan",
+        iterations,
+        warmups,
+      });
+      const legacyMeasurement = await measureQueueCandidateScan({
+        directory: legacyDirectory,
+        layout: "legacy_flat_job_scan",
+        iterations,
+        warmups,
+      });
+      timingsMs[`queue_claim_${count}`] = fileStoreMeasurement.timingMs;
+      layouts.file_store_pending_scan[String(count)] = fileStoreMeasurement.metadata;
+      layouts.legacy_flat_job_scan[String(count)] = legacyMeasurement.metadata;
     }
-    return results;
+    return {
+      timingsMs,
+      extensions: {
+        queueScanSemantics: "candidate_discovery_only: readdir -> read -> JSON.parse -> validate -> createdAt sort -> select",
+        queueLayout: ["file_store_pending_scan", "legacy_flat_job_scan"],
+        layouts,
+      },
+    };
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 }
 
-async function scanQueueDirectoryReadOnly(directory) {
-  const names = (await readdir(directory)).filter((name) => name.endsWith(".json")).sort();
-  return names[0] || null;
+async function writeSyntheticQueueLayout(directory, count, layout, payloadProfile) {
+  await mkdir(directory, { recursive: true });
+  const batchSize = 25;
+  for (let offset = 0; offset < count; offset += batchSize) {
+    const pendingWrites = [];
+    for (let index = offset; index < Math.min(count, offset + batchSize); index += 1) {
+      const status = layout === "file_store_pending_scan"
+        ? "pending"
+        : index % 7 === 0
+          ? "completed"
+          : index % 11 === 0
+            ? "running"
+            : index % 13 === 0
+              ? "failed"
+              : "pending";
+      const createdAt = new Date(Date.UTC(2026, 6, 14, 12, 0, 0) + (count - index) * 1000).toISOString();
+      const targetBytes = index % 20 === 0 ? payloadProfile.p95 : payloadProfile.p50;
+      const value = {
+        id: `${layout}-${String(index).padStart(4, "0")}`,
+        status,
+        createdAt,
+        updatedAt: createdAt,
+        sourceHash: "1".repeat(64),
+        contractHash: "2".repeat(64),
+        segmentIndexes: [index + 1],
+      };
+      const body = serializeSyntheticJob(value, targetBytes);
+      pendingWrites.push(writeFile(
+        path.join(directory, `historical-${String(index).padStart(4, "0")}.json`),
+        body,
+        "utf8",
+      ));
+    }
+    await Promise.all(pendingWrites);
+  }
+  await writeFile(path.join(directory, "malformed.json"), "{malformed-json}\n", "utf8");
+}
+
+function serializeSyntheticJob(value, targetBytes) {
+  const withPadding = { ...value, payloadPadding: "" };
+  const base = `${JSON.stringify(withPadding)}\n`;
+  const missingBytes = Math.max(0, Number(targetBytes) - Buffer.byteLength(base, "utf8"));
+  withPadding.payloadPadding = "x".repeat(missingBytes);
+  return `${JSON.stringify(withPadding)}\n`;
+}
+
+async function measureQueueCandidateScan({ directory, layout, iterations, warmups }) {
+  for (let warmup = 0; warmup < warmups; warmup += 1) {
+    await scanQueueDirectoryReadOnly(directory, { layout, order: "oldest" });
+  }
+  let attempts = 0;
+  let timingMs;
+  let metadata;
+  do {
+    const samples = [];
+    for (let iteration = 0; iteration < iterations; iteration += 1) {
+      const startedAt = performance.now();
+      metadata = await scanQueueDirectoryReadOnly(directory, { layout, order: "oldest" });
+      samples.push(performance.now() - startedAt);
+    }
+    timingMs = summarizeNumericSamples(samples);
+    attempts += 1;
+  } while (iterations > 1 && timingMs.coefficientOfVariation > 0.2 && attempts < 2);
+  return {
+    timingMs,
+    metadata: {
+      ...metadata,
+      timingMs,
+      measurementAttempts: attempts,
+      environmentStable: timingMs.coefficientOfVariation <= 0.2,
+    },
+  };
+}
+
+export async function scanQueueDirectoryReadOnly(directory, options = {}) {
+  const layout = options.layout === "legacy_flat_job_scan"
+    ? "legacy_flat_job_scan"
+    : "file_store_pending_scan";
+  const order = options.order === "newest" ? "newest" : "oldest";
+  const names = (await readdir(directory))
+    .filter((name) => name.toLowerCase().endsWith(".json"))
+    .sort((left, right) => left.localeCompare(right));
+  const candidates = [];
+  let parsedFileCount = 0;
+  let invalidFileCount = 0;
+  let candidatePayloadBytes = 0;
+  for (const name of names) {
+    const raw = await readFile(path.join(directory, name), "utf8");
+    candidatePayloadBytes += Buffer.byteLength(raw, "utf8");
+    let value;
+    try {
+      value = JSON.parse(raw);
+      parsedFileCount += 1;
+    } catch {
+      invalidFileCount += 1;
+      continue;
+    }
+    const id = typeof value?.id === "string" ? value.id.trim() : "";
+    const status = typeof value?.status === "string" ? value.status.trim().toLowerCase() : "";
+    const createdAtMs = Date.parse(typeof value?.createdAt === "string" ? value.createdAt : "");
+    if (!id || !VALID_JOB_STATUSES.has(status) || !Number.isFinite(createdAtMs)) {
+      invalidFileCount += 1;
+      continue;
+    }
+    if (status !== "pending") continue;
+    candidates.push({ id, name, createdAt: value.createdAt, createdAtMs });
+  }
+  candidates.sort((left, right) => (
+    left.createdAtMs - right.createdAtMs
+      || left.id.localeCompare(right.id)
+      || left.name.localeCompare(right.name)
+  ));
+  const selected = order === "newest" ? candidates.at(-1) : candidates[0];
+  return {
+    queueLayout: layout,
+    parsedFileCount,
+    invalidFileCount,
+    candidateCount: candidates.length,
+    candidatePayloadBytes,
+    selectedJobId: selected?.id || null,
+    selectedCreatedAt: selected?.createdAt || null,
+  };
 }
 
 async function collectEnvironment(root) {
