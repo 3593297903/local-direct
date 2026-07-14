@@ -192,6 +192,26 @@ export async function getFileJob<T extends FileJobRecord>(rootDir: string, names
   return found.job;
 }
 
+export async function listFileJobsByStatus<T extends FileJobRecord>(
+  rootDir: string,
+  namespace: string,
+  status: FileJobStatus,
+) {
+  await ensureFileJobStore(rootDir, namespace);
+  const directory = stateDir(rootDir, namespace, status);
+  const entries = (await readdir(directory, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
+  const jobs: T[] = [];
+  for (const entry of entries) {
+    try {
+      jobs.push(await readJobFile<T>(path.join(directory, entry.name)));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return jobs;
+}
+
 export async function claimNextFileJob<T extends FileJobRecord>(
   rootDir: string,
   namespace: string,
@@ -200,6 +220,7 @@ export async function claimNextFileJob<T extends FileJobRecord>(
     runningTimeoutMs?: number;
     workerId?: string;
     canRecoverRunningJob?: (job: T) => boolean | Promise<boolean>;
+    canClaimPendingJob?: (job: T) => boolean | Promise<boolean>;
     claimLeaseWriteOptions?: Omit<AtomicReplaceJsonOptions, "rootDir">;
   } = {},
 ) {
@@ -222,6 +243,7 @@ export async function claimNextFileJob<T extends FileJobRecord>(
   candidates.sort((left, right) => direction * (Date.parse(left.job.createdAt) - Date.parse(right.job.createdAt)));
 
   for (const candidate of candidates) {
+    if (options.canClaimPendingJob && !(await options.canClaimPendingJob(candidate.job))) continue;
     const pendingPath = path.join(pendingDir, candidate.name);
     const runningPath = path.join(stateDir(rootDir, namespace, "running"), candidate.name);
     const claimLockPath = path.join(rootDir, namespace, "claim-locks", candidate.name.replace(/\.json$/, ""));

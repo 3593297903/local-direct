@@ -18,12 +18,14 @@ import { applyPromptSafetyPolicyDeep, type PromptSafetyDiff } from "./prompt-saf
 import { readCodexRuntimeHealth } from "./codex-runtime-health";
 import {
   assertFinalizationFilesStable,
+  buildFinalizedResultRef,
   CODEX_FINALIZATION_PROTOCOL_VERSION,
   CodexJobFinalizationError,
   createJobStagingDirectory,
   hashCanonicalJson,
   publishFinalizedJob,
   readAndValidateFinalManifest,
+  readAndValidateRecoverableFinalManifest,
   readStrictFinalizationJson,
   type CodexFinalizedResultRef,
   writeFinalManifest,
@@ -36,6 +38,7 @@ import {
   finishPendingFileJob,
   finishRunningFileJob,
   getFileJob,
+  listFileJobsByStatus,
   putPendingFileJob,
   readRunningFileJob,
   updateRunningFileJob,
@@ -263,11 +266,13 @@ export async function getVideoPromptPackCodexJob(jobId: string, options: QueueOp
 export async function claimNextVideoPromptPackCodexJob(options: ClaimOptions = {}) {
   const rootDir = resolveRootDir(options);
   await migrateLegacyVideoPromptPackJobs(rootDir);
+  await recoverFinalizedVideoPromptPackCodexJobs(rootDir, options.runningTimeoutMs);
   const claimed = await claimNextFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, {
     order: options.order,
     runningTimeoutMs: options.runningTimeoutMs,
     workerId: options.workerId,
     canRecoverRunningJob: (job) => canRecoverRenderPackJob(rootDir, job, options.runningTimeoutMs),
+    canClaimPendingJob: (job) => normalizeStoredRenderPackJob(job).protocolVersion === CODEX_FINALIZATION_PROTOCOL_VERSION,
   });
   if (!claimed) return null;
   const normalized = normalizeStoredRenderPackJob(claimed);
@@ -1102,6 +1107,136 @@ function normalizeStoredRenderPackJob(job: VideoPromptPackCodexJob): VideoPrompt
   };
 }
 
+export async function recoverFinalizedVideoPromptPackCodexJobs(rootDir: string, _runningTimeoutMs = 0) {
+  const runningJobs = await listFileJobsByStatus<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, "running");
+  let recovered = 0;
+  for (const stored of runningJobs) {
+    const job = normalizeStoredRenderPackJob(stored);
+    if (job.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION
+      || job.status !== "running"
+      || job.stage !== "finalizing"
+      || !job.leaseId) continue;
+    try {
+      const resultRef = job.resultRef || await recoverRenderPackResultReference(rootDir, job);
+      if (!resultRef) continue;
+      if (!job.resultRef || !sameResultRef(job.resultRef, resultRef)) {
+        await updateRunningFileJob<VideoPromptPackCodexJob>(
+          rootDir,
+          TASK_ROOT,
+          job.id,
+          job.leaseId,
+          job.fencingToken,
+          { stage: "finalizing", resultRef, resultAvailable: false },
+        );
+      }
+      await completeVideoPromptPackCodexJob(job.id, job.leaseId, job.fencingToken, resultRef, { rootDir });
+      recovered += 1;
+    } catch (error) {
+      const code = String((error as { code?: unknown } | null)?.code || "");
+      if (code === "FINALIZATION_OUTPUT_MISSING" || code === "FINALIZATION_STALE_FENCE") continue;
+      if (code === "FINALIZATION_ATOMIC_REPLACE_FAILED") throw error;
+      await failVideoPromptPackCodexJob(
+        job.id,
+        job.leaseId,
+        job.fencingToken,
+        error instanceof Error ? error.message : "Render Pack finalization recovery failed",
+        code || "FINALIZATION_SCHEMA_INVALID",
+        { rootDir },
+      ).catch((failure) => {
+        if (String((failure as { code?: unknown } | null)?.code || "") !== "FINALIZATION_STALE_FENCE") throw failure;
+      });
+    }
+  }
+  return recovered;
+}
+
+async function recoverRenderPackResultReference(rootDir: string, job: VideoPromptPackCodexJob) {
+  if (job.stagingDir) {
+    try {
+      const manifest = await validateRecoverableRenderPackDirectory(job, job.stagingDir);
+      return publishFinalizedJob({
+        ...renderPackRecoveryIdentity(rootDir, job, manifest.resultHash),
+        stagingDir: job.stagingDir,
+      });
+    } catch (error) {
+      if (String((error as { code?: unknown } | null)?.code || "") !== "FINALIZATION_OUTPUT_MISSING") throw error;
+    }
+  }
+
+  const resultRoot = path.join(rootDir, TASK_ROOT, "results", job.id);
+  const entries = await readdir(resultRoot, { withFileTypes: true, encoding: "utf8" }).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[a-f0-9]{64}$/.test(entry.name)) continue;
+    const directory = path.join(resultRoot, entry.name);
+    try {
+      const manifest = await validateRecoverableRenderPackDirectory(job, directory);
+      if (manifest.resultHash !== entry.name) {
+        throw new VideoPromptPackCodexQueueError(
+          "Render Pack immutable directory does not match its result hash",
+          "FINALIZATION_HASH_MISMATCH",
+        );
+      }
+      return buildFinalizedResultRef(job.id, manifest.resultHash);
+    } catch (error) {
+      const code = String((error as { code?: unknown } | null)?.code || "");
+      if (code === "FINALIZATION_STALE_FENCE" || code === "FINALIZATION_IDENTITY_MISMATCH") continue;
+      throw error;
+    }
+  }
+  return null;
+}
+
+async function validateRecoverableRenderPackDirectory(job: VideoPromptPackCodexJob, directory: string) {
+  const expectedIndexes = requestedRenderPackIndexes(job);
+  const manifest = await readAndValidateRecoverableFinalManifest({
+    directory,
+    expected: {
+      jobId: job.id,
+      taskClass: "render_pack",
+      leaseId: job.leaseId!,
+      fencingToken: job.fencingToken,
+      sourceHash: job.sourceHash,
+      ...(job.contractHash ? { contractHash: job.contractHash } : {}),
+      segmentIndexes: expectedIndexes,
+    },
+  });
+  const listedResultIndexes = manifest.outputFiles
+    .filter((output) => output.kind === "render_result")
+    .map((output) => parseEpisodeIndexFromFileName(path.posix.basename(output.relativePath)))
+    .sort((left, right) => left - right);
+  if (JSON.stringify(listedResultIndexes) !== JSON.stringify(expectedIndexes)) {
+    throw new VideoPromptPackCodexQueueError(
+      "Render Pack manifest does not list exactly the requested segment results",
+      "FINALIZATION_IDENTITY_MISMATCH",
+    );
+  }
+  await validateExactRenderSegmentFiles(path.join(directory, "segments"), expectedIndexes);
+  await validateExactRenderCoverageFiles(
+    path.join(directory, "coverage"),
+    expectedIndexes,
+    job.coverageSidecarEnabled,
+  );
+  const result = await readPackResult(bindRenderPackJobToPublishedResult(job, directory), true);
+  if (hashCanonicalJson(renderPackResultProjection(result)) !== manifest.resultHash) {
+    throw new VideoPromptPackCodexQueueError(
+      "Recoverable Render Pack canonical result hash does not match its manifest",
+      "FINALIZATION_HASH_MISMATCH",
+    );
+  }
+  return manifest;
+}
+
+function renderPackRecoveryIdentity(rootDir: string, job: VideoPromptPackCodexJob, resultHash: string) {
+  return {
+    rootDir,
+    namespace: TASK_ROOT,
+    ...renderPackFinalizationIdentity(job, resultHash),
+  };
+}
+
 async function canRecoverRenderPackJob(
   rootDir: string,
   job: VideoPromptPackCodexJob,
@@ -1258,6 +1393,11 @@ function renderPackStatePath(
 
 function episodeFileName(episodeIndex: number) {
   return `episode-${String(episodeIndex).padStart(3, "0")}.json`;
+}
+
+function parseEpisodeIndexFromFileName(fileName: string) {
+  const match = /^episode-(\d{3})\.json$/i.exec(fileName);
+  return match ? Number.parseInt(match[1], 10) : -1;
 }
 
 function coverageFileName(episodeIndex: number) {

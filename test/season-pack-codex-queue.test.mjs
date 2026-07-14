@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -16,6 +16,7 @@ const {
   claimNextSeasonPackCodexJob,
   completeSeasonPackCodexJob,
   createSeasonPackCodexJob,
+  failPendingSeasonPackCodexJob,
   finalizeSeasonPackCodexJobFiles,
   getSeasonPackCodexJob,
   toSeasonPackCodexJobStatusDto,
@@ -1151,6 +1152,191 @@ test("season finalization rejects output changed between post-exit stability rea
       /changed|stable|hash/i,
     );
     clearTimeout(mutation);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("claim sweep completes a published Season Pack finalization without another Codex attempt", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createSeasonPackCodexJob({ script: "One recoverable segment.", episodeCount: 1 }, { rootDir });
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir });
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 1, generatedEpisodes: [1] }), "utf8");
+    writeLockedSeasonPlan(claimed, 1);
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1)), "utf8");
+    await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "executing", { rootDir });
+    const finalizing = await updateSeasonPackCodexJobStage(
+      claimed.id,
+      claimed.leaseId,
+      claimed.fencingToken,
+      "finalizing",
+      { rootDir },
+    );
+    const finalized = await finalizeSeasonPackCodexJobFiles(finalizing, {
+      rootDir,
+      codexExitCode: 0,
+      stabilityDelayMs: 0,
+    });
+    const runningPath = path.join(rootDir, ".tmp-season-pack-codex", "running", `${claimed.id}.json`);
+    const running = JSON.parse(readFileSync(runningPath, "utf8"));
+    const staleAt = new Date(Date.now() - 60_000).toISOString();
+    writeFileSync(runningPath, JSON.stringify({
+      ...running,
+      heartbeatAt: staleAt,
+      updatedAt: staleAt,
+      finalizingAt: staleAt,
+    }, null, 2), "utf8");
+
+    const next = await claimNextSeasonPackCodexJob({ rootDir, runningTimeoutMs: 1 });
+    assert.equal(next, null);
+    const recovered = await getSeasonPackCodexJob(claimed.id, { rootDir });
+    assert.equal(recovered.status, "completed");
+    assert.equal(recovered.resultAvailable, true);
+    assert.equal(recovered.resultRef.resultHash, finalized.resultRef.resultHash);
+    assert.equal(recovered.attempt, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("protocol v2 Season worker skips protocol v1 pending jobs", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const legacy = await createSeasonPackCodexJob({
+      script: "Legacy pending season job.",
+      episodeCount: 1,
+    }, { rootDir });
+    const pendingPath = path.join(rootDir, ".tmp-season-pack-codex", "pending", `${legacy.id}.json`);
+    const legacyRecord = JSON.parse(readFileSync(pendingPath, "utf8"));
+    writeFileSync(pendingPath, JSON.stringify({
+      ...legacyRecord,
+      protocolVersion: 1,
+      createdAt: "2000-01-01T00:00:00.000Z",
+      updatedAt: "2000-01-01T00:00:00.000Z",
+    }, null, 2), "utf8");
+    const current = await createSeasonPackCodexJob({
+      script: "Current protocol v2 season job.",
+      episodeCount: 1,
+    }, { rootDir });
+
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir });
+    assert.equal(claimed.id, current.id);
+    assert.equal(claimed.protocolVersion, 2);
+    assert.equal(JSON.parse(readFileSync(pendingPath, "utf8")).protocolVersion, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("completed protocol v2 Season Pack refuses a missing immutable manifest", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createSeasonPackCodexJob({ script: "Manifest guard season.", episodeCount: 1 }, { rootDir });
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir });
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 1, generatedEpisodes: [1] }), "utf8");
+    writeLockedSeasonPlan(claimed, 1);
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1)), "utf8");
+    await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "executing", { rootDir });
+    const finalizing = await updateSeasonPackCodexJobStage(
+      claimed.id,
+      claimed.leaseId,
+      claimed.fencingToken,
+      "finalizing",
+      { rootDir },
+    );
+    const finalized = await finalizeSeasonPackCodexJobFiles(finalizing, {
+      rootDir,
+      codexExitCode: 0,
+      stabilityDelayMs: 0,
+    });
+    await completeSeasonPackCodexJob(
+      claimed.id,
+      claimed.leaseId,
+      claimed.fencingToken,
+      finalized.resultRef,
+      { rootDir },
+    );
+    const manifestPath = path.join(
+      rootDir,
+      ".tmp-season-pack-codex",
+      ...finalized.resultRef.manifestRelativePath.split("/"),
+    );
+    rmSync(manifestPath, { force: true });
+
+    await assert.rejects(
+      () => getSeasonPackCodexJob(claimed.id, { rootDir }),
+      (error) => error?.code === "FINALIZATION_OUTPUT_MISSING",
+    );
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("legacy completed Season Pack jobs remain readable without protocol v2 publication", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const created = await createSeasonPackCodexJob({
+      script: "Legacy completed season.",
+      episodeCount: 1,
+    }, { rootDir });
+    const pendingPath = path.join(rootDir, ".tmp-season-pack-codex", "pending", `${created.id}.json`);
+    const legacyJobsDir = path.join(rootDir, ".tmp-season-pack-codex", "jobs");
+    const completedPath = path.join(legacyJobsDir, `${created.id}.json`);
+    mkdirSync(legacyJobsDir, { recursive: true });
+    const pending = JSON.parse(readFileSync(pendingPath, "utf8"));
+    const legacyEpisode = sampleEpisodeInput(1);
+    writeFileSync(completedPath, JSON.stringify({
+      ...pending,
+      protocolVersion: 1,
+      stage: "completed",
+      status: "completed",
+      resultAvailable: true,
+      resultRef: null,
+      result: {
+        seasonPlan: { projectTitle: "Legacy season" },
+        episodes: [{ episodeIndex: 1, input: legacyEpisode }],
+      },
+      completedAt: new Date().toISOString(),
+    }, null, 2), "utf8");
+    rmSync(pendingPath, { force: true });
+
+    const observed = await getSeasonPackCodexJob(created.id, { rootDir });
+    assert.equal(observed.protocolVersion, 1);
+    assert.equal(observed.status, "completed");
+    assert.equal(observed.resultAvailable, true);
+    assert.equal(observed.result.episodes[0].input.title, legacyEpisode.title);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("quota circuit can atomically fail pending Season Pack work without bypassing a running lease", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const pending = await createSeasonPackCodexJob({ script: "Pending quota task.", episodeCount: 1 }, { rootDir });
+    const failed = await failPendingSeasonPackCodexJob(
+      pending.id,
+      "Codex quota exhausted",
+      "CODEX_QUOTA_EXHAUSTED",
+      { rootDir },
+    );
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.errorCode, "CODEX_QUOTA_EXHAUSTED");
+
+    await createSeasonPackCodexJob({ script: "Claimed quota task.", episodeCount: 1 }, { rootDir });
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir });
+    const preserved = await failPendingSeasonPackCodexJob(
+      claimed.id,
+      "Codex quota exhausted",
+      "CODEX_QUOTA_EXHAUSTED",
+      { rootDir },
+    );
+    assert.equal(preserved.status, "running");
+    assert.equal(preserved.leaseId, claimed.leaseId);
+    assert.equal(preserved.fencingToken, claimed.fencingToken);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

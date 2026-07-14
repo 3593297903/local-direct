@@ -100,6 +100,13 @@ type ReadFinalManifestInput = {
   expected: Omit<CodexFinalizationIdentity, "rootDir" | "namespace"> & Partial<Pick<CodexFinalizationIdentity, "rootDir" | "namespace">>;
 };
 
+type ReadRecoverableFinalManifestInput = {
+  directory: string;
+  expected: Pick<CodexFinalizationIdentity,
+    "jobId" | "taskClass" | "leaseId" | "fencingToken" | "sourceHash"
+  > & Partial<Pick<CodexFinalizationIdentity, "contractHash" | "segmentIndexes">>;
+};
+
 type PublishFinalizedJobInput = CodexFinalizationIdentity & {
   stagingDir: string;
   retryDelaysMs?: readonly number[];
@@ -259,6 +266,28 @@ export async function readAndValidateFinalManifest(input: ReadFinalManifestInput
   return manifest;
 }
 
+export async function readAndValidateRecoverableFinalManifest(input: ReadRecoverableFinalManifestInput) {
+  const parsed = await readStrictFinalizationJson(input.directory, CODEX_FINAL_MANIFEST_FILE);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new CodexJobFinalizationError("FINALIZATION_SCHEMA_INVALID", "Finalization manifest must be an object");
+  }
+  const manifest = parsed as CodexFinalManifestV2;
+  validateManifestShape(manifest);
+  return readAndValidateFinalManifest({
+    directory: input.directory,
+    expected: {
+      ...input.expected,
+      ...(input.expected.contractHash
+        ? { contractHash: input.expected.contractHash }
+        : manifest.contractHash
+          ? { contractHash: manifest.contractHash }
+          : {}),
+      segmentIndexes: input.expected.segmentIndexes || manifest.segmentIndexes,
+      resultHash: manifest.resultHash,
+    },
+  });
+}
+
 export async function publishFinalizedJob(input: PublishFinalizedJobInput): Promise<CodexFinalizedResultRef> {
   validateIdentity(input);
   const queueRoot = queueRootPath(input.rootDir, input.namespace);
@@ -268,7 +297,7 @@ export async function publishFinalizedJob(input: PublishFinalizedJobInput): Prom
     path.join(queueRoot, "results"),
     path.join(queueRoot, "results", input.jobId, input.resultHash),
   );
-  const resultRef = buildResultRef(input.jobId, input.resultHash);
+  const resultRef = buildFinalizedResultRef(input.jobId, input.resultHash);
 
   try {
     await stat(destination);
@@ -419,7 +448,7 @@ function validateManifestIdentity(
   }
 }
 
-function buildResultRef(jobId: string, resultHash: string): CodexFinalizedResultRef {
+export function buildFinalizedResultRef(jobId: string, resultHash: string): CodexFinalizedResultRef {
   const relativePath = ["results", jobId, resultHash].join("/");
   return {
     protocolVersion: CODEX_FINALIZATION_PROTOCOL_VERSION,

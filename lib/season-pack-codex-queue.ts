@@ -22,6 +22,7 @@ import {
 import { applyPromptSafetyPolicyDeep, type PromptSafetyDiff } from "./prompt-safety-policy";
 import { readCodexRuntimeHealth } from "./codex-runtime-health";
 import {
+  buildFinalizedResultRef,
   CODEX_FINALIZATION_PROTOCOL_VERSION,
   type CodexFinalizedResultRef,
   CodexJobFinalizationError,
@@ -30,6 +31,7 @@ import {
   hashCanonicalJson,
   publishFinalizedJob,
   readAndValidateFinalManifest,
+  readAndValidateRecoverableFinalManifest,
   readStrictFinalizationJson,
   writeFinalManifest,
 } from "./codex-job-finalization";
@@ -37,8 +39,10 @@ import {
   claimNextFileJob,
   ensureFileJobStore,
   FileJobLeaseError,
+  finishPendingFileJob,
   finishRunningFileJob,
   getFileJob,
+  listFileJobsByStatus,
   putPendingFileJob,
   readRunningFileJob,
   updateRunningFileJob,
@@ -350,11 +354,13 @@ export async function getSeasonPackCodexJob(jobId: string, options: QueueOptions
 export async function claimNextSeasonPackCodexJob(options: ClaimOptions = {}) {
   const rootDir = resolveRootDir(options);
   await ensureFileJobStore(rootDir, TASK_ROOT);
+  await recoverFinalizedSeasonPackCodexJobs(rootDir);
   const claimed = await claimNextFileJob<SeasonPackCodexJob>(rootDir, TASK_ROOT, {
     order: options.order,
     runningTimeoutMs: options.runningTimeoutMs,
     workerId: options.workerId,
     canRecoverRunningJob: (job) => canRecoverSeasonPackJob(rootDir, job),
+    canClaimPendingJob: (job) => normalizeStoredSeasonPackJob(job).protocolVersion === CODEX_FINALIZATION_PROTOCOL_VERSION,
   });
   if (!claimed) return null;
   const normalized = normalizeStoredSeasonPackJob(claimed);
@@ -461,11 +467,7 @@ export async function finalizeSeasonPackCodexJobFiles(
   });
   const result = await readSeasonPackResult(job);
   const segmentIndexes = result.episodes.map((episode) => episode.episodeIndex);
-  const contractHash = hashCanonicalJson(result.episodes.map((episode) => ({
-    episodeIndex: episode.episodeIndex,
-    contractHash: episode.input.segmentContract?.contractHash || null,
-    lockedSegmentPlan: episode.input.lockedSegmentPlan || null,
-  })));
+  const contractHash = seasonResultContractHash(result);
   const resultHash = hashCanonicalJson(result);
   const identity = {
     rootDir,
@@ -571,6 +573,29 @@ export async function failSeasonPackCodexJob(
     updatedAt: new Date().toISOString(),
   };
   return finishRunningFileJob(rootDir, TASK_ROOT, updated, "failed");
+}
+
+export async function failPendingSeasonPackCodexJob(
+  jobId: string,
+  message: string | undefined,
+  errorCode: string | undefined,
+  options: QueueOptions = {},
+) {
+  const rootDir = resolveRootDir(options);
+  const job = normalizeStoredSeasonPackJob(await getFileJob<SeasonPackCodexJob>(rootDir, TASK_ROOT, jobId));
+  if (job.status === "failed") return job;
+  if (job.status !== "pending") return job;
+  const updated: SeasonPackCodexJob = {
+    ...job,
+    status: "failed",
+    stage: "failed",
+    resultAvailable: false,
+    result: null,
+    error: message || "Codex season pack generation is unavailable",
+    errorCode: errorCode || null,
+    updatedAt: new Date().toISOString(),
+  };
+  return finishPendingFileJob(rootDir, TASK_ROOT, updated, "failed");
 }
 
 export function toSeasonPackCodexJobStatusDto(job: SeasonPackCodexJob) {
@@ -921,17 +946,186 @@ function assertSeasonPackLease(job: SeasonPackCodexJob, leaseId: string, fencing
   }
 }
 
+export async function recoverFinalizedSeasonPackCodexJobs(rootDir: string) {
+  const runningJobs = await listFileJobsByStatus<SeasonPackCodexJob>(rootDir, TASK_ROOT, "running");
+  let recovered = 0;
+  for (const stored of runningJobs) {
+    const job = normalizeStoredSeasonPackJob(stored);
+    if (job.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION
+      || job.status !== "running"
+      || job.stage !== "finalizing"
+      || !job.leaseId) continue;
+    try {
+      const recovery = job.resultRef && job.contractHash
+        ? {
+            resultRef: job.resultRef,
+            contractHash: job.contractHash,
+            segmentIndexes: seasonSegmentIndexes(job),
+          }
+        : await recoverSeasonPackResultReference(rootDir, job);
+      if (!recovery) continue;
+      if (!job.resultRef || !sameResultRef(job.resultRef, recovery.resultRef) || job.contractHash !== recovery.contractHash) {
+        await updateRunningFileJob<SeasonPackCodexJob>(
+          rootDir,
+          TASK_ROOT,
+          job.id,
+          job.leaseId,
+          job.fencingToken,
+          {
+            stage: "finalizing",
+            contractHash: recovery.contractHash,
+            resultRef: recovery.resultRef,
+            resultAvailable: false,
+            resolvedEpisodeCount: recovery.segmentIndexes.length,
+            episodeCount: job.segmentCountMode === "auto" ? recovery.segmentIndexes.length : job.episodeCount,
+          },
+        );
+      }
+      await completeSeasonPackCodexJob(
+        job.id,
+        job.leaseId,
+        job.fencingToken,
+        recovery.resultRef,
+        { rootDir },
+      );
+      recovered += 1;
+    } catch (error) {
+      const code = String((error as { code?: unknown } | null)?.code || "");
+      if (code === "FINALIZATION_OUTPUT_MISSING" || code === "FINALIZATION_STALE_FENCE") continue;
+      if (code === "FINALIZATION_ATOMIC_REPLACE_FAILED") throw error;
+      await failSeasonPackCodexJob(
+        job.id,
+        job.leaseId,
+        job.fencingToken,
+        error instanceof Error ? error.message : "Season Pack finalization recovery failed",
+        code || "FINALIZATION_SCHEMA_INVALID",
+        { rootDir },
+      ).catch((failure) => {
+        if (String((failure as { code?: unknown } | null)?.code || "") !== "FINALIZATION_STALE_FENCE") throw failure;
+      });
+    }
+  }
+  return recovered;
+}
+
+async function recoverSeasonPackResultReference(rootDir: string, job: SeasonPackCodexJob) {
+  if (job.stagingDir) {
+    try {
+      const recovery = await validateRecoverableSeasonPackDirectory(job, job.stagingDir);
+      const resultRef = await publishFinalizedJob({
+        ...seasonPackRecoveryIdentity(rootDir, job, recovery),
+        stagingDir: job.stagingDir,
+      });
+      return { ...recovery, resultRef };
+    } catch (error) {
+      if (String((error as { code?: unknown } | null)?.code || "") !== "FINALIZATION_OUTPUT_MISSING") throw error;
+    }
+  }
+
+  const resultRoot = path.join(rootDir, TASK_ROOT, "results", job.id);
+  const entries = await readdir(resultRoot, { withFileTypes: true }).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[a-f0-9]{64}$/.test(entry.name)) continue;
+    const directory = path.join(resultRoot, entry.name);
+    try {
+      const recovery = await validateRecoverableSeasonPackDirectory(job, directory);
+      if (recovery.resultHash !== entry.name) {
+        throw new SeasonPackCodexQueueError(
+          "Season Pack immutable directory does not match its result hash",
+          "FINALIZATION_HASH_MISMATCH",
+        );
+      }
+      return {
+        ...recovery,
+        resultRef: buildFinalizedResultRef(job.id, recovery.resultHash),
+      };
+    } catch (error) {
+      const code = String((error as { code?: unknown } | null)?.code || "");
+      if (code === "FINALIZATION_STALE_FENCE" || code === "FINALIZATION_IDENTITY_MISMATCH") continue;
+      throw error;
+    }
+  }
+  return null;
+}
+
+async function validateRecoverableSeasonPackDirectory(job: SeasonPackCodexJob, directory: string) {
+  const manifest = await readAndValidateRecoverableFinalManifest({
+    directory,
+    expected: {
+      jobId: job.id,
+      taskClass: "season_pack",
+      leaseId: job.leaseId!,
+      fencingToken: job.fencingToken,
+      sourceHash: job.sourceHash,
+    },
+  });
+  const result = await readSeasonPackResult(bindSeasonPackJobToPublishedResult(job, directory));
+  const segmentIndexes = result.episodes.map((episode) => episode.episodeIndex).sort((left, right) => left - right);
+  const expectedIndexes = Array.from({ length: segmentIndexes.length }, (_, index) => index + 1);
+  if (JSON.stringify(segmentIndexes) !== JSON.stringify(expectedIndexes)
+    || (job.segmentCountMode === "fixed" && segmentIndexes.length !== job.episodeCount)) {
+    throw new SeasonPackCodexQueueError(
+      "Recoverable Season Pack segment identities do not match the request",
+      "FINALIZATION_IDENTITY_MISMATCH",
+    );
+  }
+  const contractHash = seasonResultContractHash(result);
+  if (manifest.contractHash !== contractHash
+    || JSON.stringify(manifest.segmentIndexes) !== JSON.stringify(segmentIndexes)
+    || hashCanonicalJson(result) !== manifest.resultHash) {
+    throw new SeasonPackCodexQueueError(
+      "Recoverable Season Pack identity or canonical result hash does not match its manifest",
+      "FINALIZATION_HASH_MISMATCH",
+    );
+  }
+  const expectedPaths = [
+    "manifest.json",
+    "season-plan.json",
+    ...segmentIndexes.map((episodeIndex) => path.posix.join("episodes", episodeFileName(episodeIndex))),
+  ].sort((left, right) => left.localeCompare(right));
+  const actualPaths = manifest.outputFiles.map((output) => output.relativePath).sort((left, right) => left.localeCompare(right));
+  if (JSON.stringify(actualPaths) !== JSON.stringify(expectedPaths)) {
+    throw new SeasonPackCodexQueueError(
+      "Season Pack manifest does not list exactly the requested outputs",
+      "FINALIZATION_IDENTITY_MISMATCH",
+    );
+  }
+  return { resultHash: manifest.resultHash, contractHash, segmentIndexes };
+}
+
+function seasonPackRecoveryIdentity(
+  rootDir: string,
+  job: SeasonPackCodexJob,
+  recovery: { resultHash: string; contractHash: string; segmentIndexes: number[] },
+) {
+  return {
+    rootDir,
+    namespace: TASK_ROOT,
+    jobId: job.id,
+    taskClass: "season_pack" as const,
+    leaseId: job.leaseId!,
+    fencingToken: job.fencingToken,
+    sourceHash: job.sourceHash,
+    contractHash: recovery.contractHash,
+    segmentIndexes: recovery.segmentIndexes,
+    resultHash: recovery.resultHash,
+  };
+}
+
+function seasonResultContractHash(result: SeasonPackCodexJobResult) {
+  return hashCanonicalJson(result.episodes.map((episode) => ({
+    episodeIndex: episode.episodeIndex,
+    contractHash: episode.input.segmentContract?.contractHash || null,
+    lockedSegmentPlan: episode.input.lockedSegmentPlan || null,
+  })));
+}
+
 async function canRecoverSeasonPackJob(rootDir: string, job: SeasonPackCodexJob) {
   const runtime = await readCodexRuntimeHealth("season-pack", { rootDir, maxAgeMs: 90_000 });
   if (runtime.status === "healthy") return false;
-  if (job.stagingDir) {
-    try {
-      const outputStat = await stat(job.stagingDir);
-      if (Date.now() - outputStat.mtimeMs < 5 * 60_000) return false;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
   return true;
 }
 

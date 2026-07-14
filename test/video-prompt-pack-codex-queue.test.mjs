@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -593,6 +593,355 @@ test("a batch snapshot can disable coverage sidecars without changing the main r
     const completed = await finalizeAndCompleteRenderPack(claimed, rootDir);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.segments[0].coverageSidecar, null);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("claim sweep completes a published Render Pack finalization without another Codex attempt", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "Recovery segment",
+        script: "Recover a worker-finalized segment without running Codex again.",
+        renderInputScript: "Render one complete segment result.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("Recovery segment"), null, 2), "utf8");
+    const finalizing = await enterRenderPackFinalizing(claimed, rootDir);
+    const finalized = await finalizeVideoPromptPackCodexJobFiles(finalizing, {
+      rootDir,
+      codexExitCode: 0,
+      stabilityDelayMs: 0,
+    });
+    const runningPath = path.join(rootDir, ".tmp-video-prompt-pack-codex", "running", `${claimed.id}.json`);
+    const running = JSON.parse(readFileSync(runningPath, "utf8"));
+    const staleAt = new Date(Date.now() - 60_000).toISOString();
+    writeFileSync(runningPath, JSON.stringify({
+      ...running,
+      heartbeatAt: staleAt,
+      updatedAt: staleAt,
+      finalizingAt: staleAt,
+    }, null, 2), "utf8");
+
+    const next = await claimNextVideoPromptPackCodexJob({ rootDir, runningTimeoutMs: 1 });
+    assert.equal(next, null);
+    const recovered = await getVideoPromptPackCodexJob(claimed.id, { rootDir });
+    assert.equal(recovered.status, "completed");
+    assert.equal(recovered.resultAvailable, true);
+    assert.equal(recovered.resultRef.resultHash, finalized.resultRef.resultHash);
+    assert.equal(recovered.attempt, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("claim sweep publishes a valid staging manifest and completes without another Codex attempt", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 2,
+        title: "Staging recovery segment",
+        script: "Resume atomic publication from a worker-owned manifest.",
+        renderInputScript: "Render one complete segment result.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("Staging recovery segment"), null, 2), "utf8");
+    const finalizing = await enterRenderPackFinalizing(claimed, rootDir);
+    const finalized = await finalizeVideoPromptPackCodexJobFiles(finalizing, {
+      rootDir,
+      codexExitCode: 0,
+      stabilityDelayMs: 0,
+    });
+    const publishedDir = path.join(
+      rootDir,
+      ".tmp-video-prompt-pack-codex",
+      ...finalized.resultRef.relativePath.split("/"),
+    );
+    renameSync(publishedDir, claimed.stagingDir);
+    const runningPath = path.join(rootDir, ".tmp-video-prompt-pack-codex", "running", `${claimed.id}.json`);
+    const running = JSON.parse(readFileSync(runningPath, "utf8"));
+    const staleAt = new Date(Date.now() - 60_000).toISOString();
+    writeFileSync(runningPath, JSON.stringify({
+      ...running,
+      resultRef: null,
+      resultAvailable: false,
+      heartbeatAt: staleAt,
+      updatedAt: staleAt,
+    }, null, 2), "utf8");
+
+    const next = await claimNextVideoPromptPackCodexJob({ rootDir, runningTimeoutMs: 1 });
+    assert.equal(next, null);
+    const recovered = await getVideoPromptPackCodexJob(claimed.id, { rootDir });
+    assert.equal(recovered.status, "completed");
+    assert.equal(recovered.resultRef.resultHash, finalized.resultRef.resultHash);
+    assert.equal(recovered.attempt, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("healthy Render Pack heartbeat protects staging without a final manifest", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "Healthy worker segment",
+        script: "A healthy worker still owns this staging attempt.",
+        renderInputScript: "Do not duplicate the active execution.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    const runtimeRoot = path.join(rootDir, ".tmp-codex-runtime");
+    mkdirSync(path.join(runtimeRoot, "workers"), { recursive: true });
+    const runtimeFingerprint = "runtime-fingerprint";
+    const environment = {
+      schemaVersion: 1,
+      status: "healthy",
+      checkedAt: new Date().toISOString(),
+      codexVersion: "test",
+      runtimeFingerprint,
+      errors: [],
+    };
+    writeFileSync(path.join(runtimeRoot, "environment.json"), JSON.stringify(environment), "utf8");
+    writeFileSync(path.join(runtimeRoot, "workers", "video-prompt-pack.json"), JSON.stringify({
+      schemaVersion: 1,
+      workerName: "video-prompt-pack",
+      pid: process.pid,
+      heartbeatAt: new Date().toISOString(),
+      runtimeFingerprint,
+      status: "healthy",
+      environment,
+    }), "utf8");
+    const runningPath = path.join(rootDir, ".tmp-video-prompt-pack-codex", "running", `${claimed.id}.json`);
+    const running = JSON.parse(readFileSync(runningPath, "utf8"));
+    const staleAt = new Date(Date.now() - 60_000).toISOString();
+    writeFileSync(runningPath, JSON.stringify({ ...running, heartbeatAt: staleAt, updatedAt: staleAt }, null, 2), "utf8");
+
+    const next = await claimNextVideoPromptPackCodexJob({ rootDir, runningTimeoutMs: 1 });
+    assert.equal(next, null);
+    const active = await getVideoPromptPackCodexJob(claimed.id, { rootDir });
+    assert.equal(active.status, "running");
+    assert.equal(active.fencingToken, claimed.fencingToken);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("protocol v2 Render worker skips protocol v1 pending jobs", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const legacy = await createVideoPromptPackCodexJob({
+      idempotencyKey: "legacy-pending",
+      segments: [{
+        episodeIndex: 1,
+        title: "Legacy pending",
+        script: "Legacy pending input.",
+        renderInputScript: "Legacy worker only.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const pendingPath = path.join(rootDir, ".tmp-video-prompt-pack-codex", "pending", `${legacy.id}.json`);
+    const legacyRecord = JSON.parse(readFileSync(pendingPath, "utf8"));
+    writeFileSync(pendingPath, JSON.stringify({
+      ...legacyRecord,
+      protocolVersion: 1,
+      createdAt: "2000-01-01T00:00:00.000Z",
+      updatedAt: "2000-01-01T00:00:00.000Z",
+    }, null, 2), "utf8");
+    const current = await createVideoPromptPackCodexJob({
+      idempotencyKey: "protocol-v2-pending",
+      segments: [{
+        episodeIndex: 2,
+        title: "Protocol v2 pending",
+        script: "Protocol v2 pending input.",
+        renderInputScript: "Protocol v2 worker input.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    assert.equal(claimed.id, current.id);
+    assert.equal(claimed.protocolVersion, 2);
+    assert.equal(JSON.parse(readFileSync(pendingPath, "utf8")).protocolVersion, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("Render Pack never exposes intermediate output and complete replay is idempotent across 100 reads", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "Race segment",
+        script: "Intermediate writes must remain private.",
+        renderInputScript: "Render a final immutable segment.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("Intermediate race"), null, 2), "utf8");
+    for (let index = 0; index < 100; index += 1) {
+      const observed = await getVideoPromptPackCodexJob(claimed.id, { rootDir });
+      assert.equal(observed.status, "running");
+      assert.equal(observed.resultAvailable, false);
+      assert.equal(observed.result, null);
+    }
+    writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("Final race"), null, 2), "utf8");
+    const finalizing = await enterRenderPackFinalizing(claimed, rootDir);
+    const finalized = await finalizeVideoPromptPackCodexJobFiles(finalizing, {
+      rootDir,
+      codexExitCode: 0,
+      stabilityDelayMs: 0,
+    });
+    const completed = await completeVideoPromptPackCodexJob(
+      claimed.id,
+      claimed.leaseId,
+      claimed.fencingToken,
+      finalized.resultRef,
+      { rootDir },
+    );
+    for (let index = 0; index < 100; index += 1) {
+      const replay = await completeVideoPromptPackCodexJob(
+        claimed.id,
+        claimed.leaseId,
+        claimed.fencingToken,
+        finalized.resultRef,
+        { rootDir },
+      );
+      assert.equal(replay.resultRef.resultHash, completed.resultRef.resultHash);
+      assert.equal(replay.attempt, 1);
+    }
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("Render finalization rejects output changed after Codex close and before stable publication", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "Rewrite segment",
+        script: "The process writes and then rewrites a parseable result.",
+        renderInputScript: "Publish only the stable final bytes.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("First parseable result"), null, 2), "utf8");
+    const finalizing = await enterRenderPackFinalizing(claimed, rootDir);
+    const mutation = setTimeout(() => {
+      writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("Rewritten final result"), null, 2), "utf8");
+    }, 10);
+    await assert.rejects(
+      () => finalizeVideoPromptPackCodexJobFiles(finalizing, {
+        rootDir,
+        codexExitCode: 0,
+        stabilityDelayMs: 75,
+      }),
+      /changed|stable|hash/i,
+    );
+    clearTimeout(mutation);
+    const observed = await getVideoPromptPackCodexJob(claimed.id, { rootDir });
+    assert.equal(observed.status, "running");
+    assert.equal(observed.resultAvailable, false);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("completed protocol v2 Render Pack refuses a missing immutable manifest", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "Manifest guard segment",
+        script: "A completed job must retain its immutable manifest.",
+        renderInputScript: "Render one complete result.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("Manifest guard segment"), null, 2), "utf8");
+    const completed = await finalizeAndCompleteRenderPack(claimed, rootDir);
+    const manifestPath = path.join(
+      rootDir,
+      ".tmp-video-prompt-pack-codex",
+      ...completed.resultRef.manifestRelativePath.split("/"),
+    );
+    rmSync(manifestPath, { force: true });
+    await assert.rejects(
+      () => getVideoPromptPackCodexJob(claimed.id, { rootDir }),
+      (error) => error?.code === "FINALIZATION_OUTPUT_MISSING",
+    );
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("legacy completed Render Pack jobs remain readable without protocol v2 publication", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const created = await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "Legacy completed segment",
+        script: "Legacy completed input.",
+        renderInputScript: "Legacy result.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const pendingPath = path.join(rootDir, ".tmp-video-prompt-pack-codex", "pending", `${created.id}.json`);
+    const completedDir = path.join(rootDir, ".tmp-video-prompt-pack-codex", "completed");
+    const completedPath = path.join(completedDir, `${created.id}.json`);
+    mkdirSync(completedDir, { recursive: true });
+    const legacyResult = sampleAnalysisResult("Legacy completed segment");
+    const pending = JSON.parse(readFileSync(pendingPath, "utf8"));
+    writeFileSync(completedPath, JSON.stringify({
+      ...pending,
+      protocolVersion: 1,
+      stage: "completed",
+      status: "completed",
+      resultAvailable: true,
+      resultRef: null,
+      result: {
+        segments: [{
+          episodeIndex: 1,
+          outputPath: "legacy-output.json",
+          coverageOutputPath: "legacy-coverage.json",
+          result: legacyResult,
+          resultHash: "legacy-result-hash",
+          coverageSidecar: null,
+        }],
+      },
+      completedAt: new Date().toISOString(),
+    }, null, 2), "utf8");
+    rmSync(pendingPath, { force: true });
+
+    const observed = await getVideoPromptPackCodexJob(created.id, { rootDir });
+    assert.equal(observed.protocolVersion, 1);
+    assert.equal(observed.status, "completed");
+    assert.equal(observed.resultAvailable, true);
+    assert.equal(observed.result.segments[0].result.title, "Legacy completed segment");
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
