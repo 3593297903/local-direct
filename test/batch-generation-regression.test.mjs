@@ -59,6 +59,22 @@ const MODEL_KINDS = [
   "contract_correction",
 ];
 
+const COMPLETE_DASHBOARD_PIPELINE_FUNCTIONS = [
+  "buildVideoGenerationPromptText",
+  "cleanPromptValue",
+  "cleanPromptContentType",
+  "sanitizeBatchSegmentText",
+  "sanitizeBatchNegativePrompt",
+  "sanitizeBatchSegmentOutput",
+  "normalizeBatchSegmentResultForQuality",
+  "canonicalizeBatchSegmentResult",
+  "inferBatchEpisodeSourceInfo",
+  "minimumBatchStoryboardShotCount",
+  "maximumBatchStoryboardShotCount",
+  "minimumBatchFullPromptLength",
+  "normalizePatchAndEvaluateBatchSegment",
+];
+
 function replayFixture(inputFixture) {
   const fixture = cloneFixture(inputFixture);
   const replay = runTimedBatchFixtureReplay(fixture, createFrozenDashboardLocalAdapter(process.cwd()));
@@ -374,18 +390,231 @@ test("clean fixture replay invokes no model-backed adapter", () => {
   }
 });
 
-test("frozen production adapter is bound to all four Dashboard pipeline functions", () => {
+test("frozen replay passes the complete Dashboard quality option snapshot", () => {
+  const fixture = cloneFixture(fixture20);
+  const baseAdapter = createFrozenDashboardLocalAdapter(process.cwd());
+  const snapshots = [];
+  const adapter = {
+    ...baseAdapter,
+    evaluateBatchSegmentQuality(result, options) {
+      snapshots.push(structuredClone(options));
+      return baseAdapter.evaluateBatchSegmentQuality(result, options);
+    },
+  };
+  runTimedBatchFixtureReplay(fixture, adapter);
+  assert.ok(typeof fixture.baseScript === "string" && fixture.baseScript.length > 0);
+  assert.ok(snapshots.length >= fixture.segmentCount);
+  const snapshot = snapshots[0];
+  for (const key of [
+    "segmentIndex",
+    "expectedShotCount",
+    "sourceShotCount",
+    "minShotCount",
+    "maxShotCount",
+    "requestedDuration",
+    "contract",
+    "coverageDecisions",
+    "coverageMode",
+    "fullPromptText",
+    "minFullPromptLength",
+  ]) assert.ok(Object.hasOwn(snapshot, key), `quality options must include ${key}`);
+  assert.equal(snapshot.segmentIndex, 1);
+  assert.equal(snapshot.expectedShotCount, 4);
+  assert.equal(snapshot.sourceShotCount, 4);
+  assert.equal(snapshot.minShotCount, 0);
+  assert.equal(snapshot.maxShotCount, 5);
+  assert.equal(snapshot.requestedDuration, fixture.requestedDuration);
+  assert.equal(snapshot.contract.contractHash, fixture.contracts[0].contractHash);
+  assert.ok(snapshot.coverageDecisions.length >= 1);
+  assert.ok(snapshot.coverageDecisions.every((decision) => decision.status === "covered"));
+  assert.equal(snapshot.coverageMode, "shadow");
+  assert.ok(snapshot.fullPromptText.length >= 900);
+  assert.equal(snapshot.minFullPromptLength, 900);
+});
+
+test("coverage validation is included in full local pipeline timing", () => {
+  for (const fixture of [fixture20, fixture30]) {
+    const replay = runTimedBatchFixtureReplay(
+      cloneFixture(fixture),
+      createFrozenDashboardLocalAdapter(process.cwd()),
+    );
+    const expectedCoverageDecisions = fixture.contracts.reduce(
+      (total, contract) => total + contract.requiredEventSlots.length,
+      0,
+    );
+    assert.ok(Object.hasOwn(replay.timingsMs, "coverage_validation_total"));
+    assert.ok(replay.timingsMs.coverage_validation_total >= 0);
+    assert.equal(replay.quality.coverageDecisionCounts.covered, expectedCoverageDecisions);
+    assert.equal(replay.quality.coverageDecisionCounts.ambiguous || 0, 0);
+    assert.equal(replay.quality.coverageDecisionCounts.definite_missing || 0, 0);
+  }
+});
+
+test("coverage mutations route to local, Judge and path-repair traps without real jobs", () => {
+  const adapter = createFrozenDashboardLocalAdapter(process.cwd());
+
+  const ambiguousShadow = runTimedBatchFixtureReplay(
+    createCoverageDecisionFixture("ambiguous", "shadow"),
+    adapter,
+    { coverageStage: "shadow" },
+  );
+  assert.equal(ambiguousShadow.quality.routeDecisionCounts.accept, 1);
+  assert.equal(ambiguousShadow.invocationCounters.coverage_judge.executing, 0);
+  assert.equal(ambiguousShadow.invocationCounters.path_repair.executing, 0);
+
+  assert.throws(
+    () => runTimedBatchFixtureReplay(
+      createCoverageDecisionFixture("ambiguous", "active"),
+      adapter,
+      { coverageStage: "judge-active" },
+    ),
+    (error) => error instanceof UnexpectedBenchmarkModelInvocation
+      && error.kind === "coverageJudge",
+  );
+
+  assert.throws(
+    () => runTimedBatchFixtureReplay(
+      createCoverageDecisionFixture("definite_missing", "active"),
+      adapter,
+      { coverageStage: "patch-active" },
+    ),
+    (error) => error instanceof UnexpectedBenchmarkModelInvocation
+      && error.kind === "pathRepair",
+  );
+});
+
+test("source shot limits and requested duration affect replay routing", () => {
+  for (const shotCount of [3, 4, 5, 6]) {
+    const fixture = createShotBoundaryFixture(shotCount);
+    const adapter = createFrozenDashboardLocalAdapter(process.cwd());
+    if (shotCount === 3 || shotCount === 6) {
+      assert.throws(
+        () => runTimedBatchFixtureReplay(fixture, adapter),
+        (error) => error instanceof UnexpectedBenchmarkModelInvocation
+          && error.kind === "singleGeneration",
+      );
+    } else {
+      const replay = runTimedBatchFixtureReplay(fixture, adapter);
+      assert.equal(replay.quality.accepted, 1);
+      assert.equal(replay.invocationCounters.single_generation.executing, 0);
+    }
+  }
+});
+
+function createShotBoundaryFixture(shotCount) {
+  const fixture = cloneFixture(fixture30);
+  const sourceResult = fixture.renderedResults.find((result) => result.storyboard.length === 5);
+  const storyboard = Array.from({ length: shotCount }, (_, index) => {
+    const template = sourceResult.storyboard[index % sourceResult.storyboard.length];
+    return {
+      ...structuredClone(template),
+      shotNumber: index + 1,
+      timeRange: `${index * 2}s-${(index + 1) * 2}s`,
+    };
+  });
+  const result = {
+    ...structuredClone(sourceResult),
+    duration: "15秒",
+    storyboard,
+  };
+  const contract = {
+    ...structuredClone(fixture.contracts[0]),
+    segmentIndex: 1,
+    durationSeconds: 15,
+    shotCount,
+    requiredEventSlots: [],
+    characterLocks: [],
+  };
+  return {
+    ...fixture,
+    fixtureId: `shot-boundary-${shotCount}`,
+    segmentCount: 1,
+    baseScript: "第1段｜合成镜头边界测试\n本段仅声明剧情范围，不声明源镜头。",
+    contracts: [contract],
+    renderedResults: [result],
+    qualityContext: [{ episodeIndex: 1, expectedShotCount: shotCount, minFullPromptLength: 900 }],
+    expected: undefined,
+  };
+}
+
+function createCoverageDecisionFixture(status, coverageMode) {
+  const fixture = cloneFixture(fixture20);
+  const contract = structuredClone(fixture.contracts[0]);
+  const result = structuredClone(fixture.renderedResults[0]);
+  const slot = contract.requiredEventSlots[0];
+  const decision = {
+    segmentIndex: 1,
+    slotId: slot.id,
+    label: slot.label,
+    importance: "blocking",
+    status,
+    evidencePaths: status === "ambiguous" ? ["storyboard[0].videoPrompt"] : [],
+    evidenceQuotes: status === "ambiguous" ? [result.storyboard[0].videoPrompt.slice(0, 32)] : [],
+    repairTargets: slot.repairTargets,
+    repairPaths: ["storyboard[0].videoPrompt"],
+    reasonCode: status === "definite_missing" ? "required_field_empty" : "absence_not_proven",
+  };
+  return {
+    ...fixture,
+    fixtureId: `coverage-route-${status}-${coverageMode}`,
+    segmentCount: 1,
+    contracts: [contract],
+    renderedResults: [result],
+    qualityContext: [{
+      episodeIndex: 1,
+      expectedShotCount: contract.shotCount,
+      minFullPromptLength: 900,
+      coverageSidecar: null,
+      coverageDecisions: [decision],
+      coverageMode,
+    }],
+    expected: undefined,
+  };
+}
+
+test("frozen production adapter is bound to the complete Dashboard pipeline closure", () => {
   const source = extractDashboardProductionSourceFingerprint(process.cwd());
   assert.match(source.fingerprint, /^[a-f0-9]{64}$/);
-  assert.deepEqual(source.functionNames, [
-    "buildVideoGenerationPromptText",
-    "normalizeBatchSegmentResultForQuality",
-    "canonicalizeBatchSegmentResult",
-    "normalizePatchAndEvaluateBatchSegment",
-  ]);
+  assert.deepEqual(source.functionNames, COMPLETE_DASHBOARD_PIPELINE_FUNCTIONS);
   const adapter = createFrozenDashboardLocalAdapter(process.cwd());
   assert.equal(adapter.adapterVersion, FROZEN_DASHBOARD_ADAPTER_VERSION);
   assert.equal(adapter.productionSourceFingerprint, source.fingerprint);
+  assert.equal(adapter.adapterVersion, "frozen-dashboard-local-v2");
+});
+
+test("Dashboard fingerprint covers copied helpers but ignores unrelated UI", async () => {
+  const source = await readFile(path.join(process.cwd(), "components", "DashboardClient.tsx"), "utf8");
+  const root = path.join(process.cwd(), ".tmp-batch-benchmark", `fingerprint-closure-${process.pid}-${Date.now()}`);
+  try {
+    await mkdir(path.join(root, "components"), { recursive: true });
+    const dashboardPath = path.join(root, "components", "DashboardClient.tsx");
+    await writeFile(dashboardPath, source, "utf8");
+    const original = extractDashboardProductionSourceFingerprint(root);
+
+    const helperMutation = source.replace(
+      'function cleanPromptValue(value: unknown, fallback = "") {',
+      'function cleanPromptValue(value: unknown, fallback = "合成回退") {',
+    );
+    await writeFile(dashboardPath, helperMutation, "utf8");
+    const helperChanged = extractDashboardProductionSourceFingerprint(root);
+    assert.notEqual(helperChanged.fingerprint, original.fingerprint);
+
+    await writeFile(dashboardPath, `${source}\nconst UnrelatedPhaseZeroUiMarker = "ignored";\n`, "utf8");
+    const uiChanged = extractDashboardProductionSourceFingerprint(root);
+    assert.equal(uiChanged.fingerprint, original.fingerprint);
+
+    await writeFile(
+      dashboardPath,
+      source.replace("function sanitizeBatchNegativePrompt", "function omittedBatchNegativePrompt"),
+      "utf8",
+    );
+    assert.throws(
+      () => extractDashboardProductionSourceFingerprint(root),
+      /sanitizeBatchNegativePrompt/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Dashboard source fingerprint refuses an incomplete extraction", async () => {
@@ -404,6 +633,16 @@ test("Dashboard source fingerprint refuses an incomplete extraction", async () =
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("benchmark rejects baseline and task pipeline fingerprint drift", async () => {
+  const benchmark = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  assert.equal(typeof benchmark.assertMatchingProductionSourceFingerprints, "function");
+  assert.doesNotThrow(() => benchmark.assertMatchingProductionSourceFingerprints("same", "same"));
+  assert.throws(
+    () => benchmark.assertMatchingProductionSourceFingerprints("baseline", "task"),
+    /fingerprint differs/i,
+  );
 });
 
 test("canonical prompt hashes are computed from live frozen output, not fixture archive hashes", () => {

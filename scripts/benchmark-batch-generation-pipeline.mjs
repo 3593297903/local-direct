@@ -45,11 +45,10 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
 
   const baselineAdapter = loadPipelineAdapter(baselineRoot);
   const taskAdapter = loadPipelineAdapter(taskRoot);
-  if (baselineAdapter.productionSourceFingerprint !== taskAdapter.productionSourceFingerprint) {
-    throw new Error(
-      "Dashboard pipeline source fingerprint differs between baseline and task; review and upgrade Frozen Adapter first",
-    );
-  }
+  assertMatchingProductionSourceFingerprints(
+    baselineAdapter.productionSourceFingerprint,
+    taskAdapter.productionSourceFingerprint,
+  );
   for (let iteration = 0; iteration < warmups; iteration += 1) {
     if (iteration % 2 === 0) {
       runTimedBatchFixtureReplay(fixture, baselineAdapter);
@@ -136,6 +135,13 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
     extensions: report.extensions,
   }, null, 2));
   return finalReport;
+}
+
+export function assertMatchingProductionSourceFingerprints(baselineFingerprint, taskFingerprint) {
+  if (baselineFingerprint === taskFingerprint) return;
+  throw new Error(
+    "Dashboard pipeline source fingerprint differs between baseline and task; review and upgrade Frozen Adapter first",
+  );
 }
 
 function loadPipelineAdapter(root) {

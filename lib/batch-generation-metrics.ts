@@ -21,14 +21,33 @@ import type {
   DeterministicQualityPatchResult,
 } from "./batch-segment-quality-gate";
 import type { SegmentContract } from "./batch-segment-contract";
+import type {
+  CoverageDecision,
+  SegmentCoverageSidecar,
+} from "./batch-event-coverage";
+import type { BatchEventCoverageStage } from "./batch-segment-outcome-router";
 
-export const FROZEN_DASHBOARD_ADAPTER_VERSION = "frozen-dashboard-local-v1";
+export const FROZEN_DASHBOARD_ADAPTER_VERSION = "frozen-dashboard-local-v2";
 
 const DASHBOARD_PIPELINE_FUNCTIONS = [
   "buildVideoGenerationPromptText",
+  "cleanPromptValue",
+  "cleanPromptContentType",
+  "sanitizeBatchSegmentText",
+  "sanitizeBatchNegativePrompt",
+  "sanitizeBatchSegmentOutput",
   "normalizeBatchSegmentResultForQuality",
   "canonicalizeBatchSegmentResult",
+  "inferBatchEpisodeSourceInfo",
+  "minimumBatchStoryboardShotCount",
+  "maximumBatchStoryboardShotCount",
+  "minimumBatchFullPromptLength",
   "normalizePatchAndEvaluateBatchSegment",
+] as const;
+
+const DASHBOARD_PIPELINE_CONSTANTS = [
+  "MIN_BATCH_FULL_PROMPT_LENGTH",
+  "TASK_ONE_SAFETY_ENABLED",
 ] as const;
 
 export type NumericSampleSummary = {
@@ -86,6 +105,7 @@ export type BatchGenerationFixtureLike = {
   schemaVersion: 1;
   fixtureId: string;
   sourceHash: string;
+  baseScript: string;
   requestedDuration: string;
   segmentCount: number;
   contracts: SegmentContract[];
@@ -94,6 +114,9 @@ export type BatchGenerationFixtureLike = {
     episodeIndex: number;
     expectedShotCount: number;
     minFullPromptLength: number;
+    coverageSidecar?: SegmentCoverageSidecar | null;
+    coverageDecisions?: CoverageDecision[];
+    coverageMode?: "shadow" | "active";
   }>;
   expected?: {
     adapterVersion?: string;
@@ -126,6 +149,11 @@ export type BatchPipelineAdapter = {
   routeBatchSegmentOutcome: (input: Record<string, unknown>) => {
     action: string;
   };
+  validateSegmentEventCoverage: (
+    result: AnalysisResult,
+    contract: SegmentContract,
+    sidecar?: SegmentCoverageSidecar | null,
+  ) => CoverageDecision[];
 };
 
 export type BenchmarkModelAdapters = {
@@ -174,6 +202,7 @@ type TimedReplayResult = {
     routeDecisionCounts: Record<string, number>;
     findingCounts: Record<"blocking" | "patchable" | "warning" | "risk", number>;
     blockingFindingFingerprints: string[];
+    coverageDecisionCounts: Record<CoverageDecision["status"], number>;
   };
 };
 
@@ -205,25 +234,45 @@ export function extractDashboardProductionSourceFingerprint(root: string) {
     ts.ScriptKind.TSX,
   );
   const functionSources = new Map<string, string>();
+  const constantSources = new Map<string, string>();
   for (const statement of sourceFile.statements) {
-    if (!ts.isFunctionDeclaration(statement) || !statement.name) continue;
-    const name = statement.name.text;
-    if (!(DASHBOARD_PIPELINE_FUNCTIONS as readonly string[]).includes(name)) continue;
-    functionSources.set(name, source.slice(statement.getStart(sourceFile), statement.end).trim());
+    if (ts.isFunctionDeclaration(statement) && statement.name) {
+      const name = statement.name.text;
+      if ((DASHBOARD_PIPELINE_FUNCTIONS as readonly string[]).includes(name)) {
+        functionSources.set(name, source.slice(statement.getStart(sourceFile), statement.end).trim());
+      }
+      continue;
+    }
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name)) continue;
+      const name = declaration.name.text;
+      if (!(DASHBOARD_PIPELINE_CONSTANTS as readonly string[]).includes(name)) continue;
+      constantSources.set(name, source.slice(statement.getStart(sourceFile), statement.end).trim());
+    }
   }
-  const missing = DASHBOARD_PIPELINE_FUNCTIONS.filter((name) => !functionSources.has(name));
+  const missing = [
+    ...DASHBOARD_PIPELINE_FUNCTIONS.filter((name) => !functionSources.has(name)),
+    ...DASHBOARD_PIPELINE_CONSTANTS.filter((name) => !constantSources.has(name)),
+  ];
   if (missing.length) {
     throw new Error(`Cannot fingerprint Dashboard pipeline functions: ${missing.join(", ")}`);
   }
-  const canonicalSource = DASHBOARD_PIPELINE_FUNCTIONS
-    .map((name) => `${name}\n${functionSources.get(name)}`)
-    .join("\n\n");
+  const canonicalSource = [
+    ...DASHBOARD_PIPELINE_FUNCTIONS.map((name) => `${name}\n${functionSources.get(name)}`),
+    ...DASHBOARD_PIPELINE_CONSTANTS.map((name) => `${name}\n${constantSources.get(name)}`),
+  ].join("\n\n");
   return {
     dashboardPath,
     functionNames: [...DASHBOARD_PIPELINE_FUNCTIONS],
+    constantNames: [...DASHBOARD_PIPELINE_CONSTANTS],
     functionHashes: Object.fromEntries(DASHBOARD_PIPELINE_FUNCTIONS.map((name) => [
       name,
       hashText(functionSources.get(name) || ""),
+    ])),
+    constantHashes: Object.fromEntries(DASHBOARD_PIPELINE_CONSTANTS.map((name) => [
+      name,
+      hashText(constantSources.get(name) || ""),
     ])),
     fingerprint: hashText(canonicalSource),
   };
@@ -235,6 +284,7 @@ export function createFrozenDashboardLocalAdapter(root: string): BatchPipelineAd
   const gate = rootRequire(path.join(resolvedRoot, "lib", "batch-segment-quality-gate.ts"));
   const qualityReport = rootRequire(path.join(resolvedRoot, "lib", "batch-segment-quality-report.ts"));
   const router = rootRequire(path.join(resolvedRoot, "lib", "batch-segment-outcome-router.ts"));
+  const coverage = rootRequire(path.join(resolvedRoot, "lib", "batch-event-coverage.ts"));
   const tokenSanitizer = rootRequire(path.join(resolvedRoot, "lib", "internal-prompt-token-sanitizer.ts"));
   const sourceFingerprint = extractDashboardProductionSourceFingerprint(resolvedRoot);
 
@@ -346,7 +396,98 @@ export function createFrozenDashboardLocalAdapter(root: string): BatchPipelineAd
     applyDeterministicQualityPatchWithDiff: gate.applyDeterministicQualityPatchWithDiff,
     createSegmentQualityReport: qualityReport.createSegmentQualityReport,
     routeBatchSegmentOutcome: router.routeBatchSegmentOutcome,
+    validateSegmentEventCoverage: coverage.validateSegmentEventCoverage,
   };
+}
+
+function inferFrozenBatchEpisodeSourceInfo(baseScript: string, episodeIndex: number) {
+  const lines = String(baseScript || "").replace(/\r\n?/g, "\n").split("\n");
+  let active = false;
+  let title = "";
+  let duration = "";
+  let shotCount = 0;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const segmentMatch = line.match(/^第\s*([0-9一二三四五六七八九十百]+)\s*(?:段|集)\s*(?:[｜|:：\-—]\s*)?(.+)?$/);
+    if (segmentMatch) {
+      const localizedIndex = parseFrozenLocalizedInteger(segmentMatch[1]);
+      active = localizedIndex === episodeIndex;
+      if (active) {
+        title = `第${episodeIndex}段｜${String(segmentMatch[2] || `第${episodeIndex}段`).trim()}`;
+        shotCount = 0;
+      }
+      continue;
+    }
+    if (!active) continue;
+    const durationMatch = line.match(/^(?:总时长|时长)\s*[：:]\s*(\d+(?:\.\d+)?)\s*秒/);
+    if (durationMatch) duration = `${Number(durationMatch[1])}秒`;
+    const shotMatch = line.match(
+      /^(\d+(?:\.\d+)?|(?:\d{1,2}:)?\d{1,2}:\d{2})\s*(?:s|秒)?\s*[-—~～至到]\s*(\d+(?:\.\d+)?|(?:\d{1,2}:)?\d{1,2}:\d{2})\s*(?:s|秒)?\s*(?:[｜|:：\-—]\s*)?镜头\s*[0-9一二三四五六七八九十百]+/,
+    );
+    if (shotMatch) {
+      shotCount += 1;
+      const endSeconds = parseFrozenTimecodeSeconds(shotMatch[2]);
+      if (endSeconds !== undefined) duration = `${endSeconds}秒`;
+    } else if (/^镜头\s*[0-9一二三四五六七八九十百]+(?:\s*[｜|:：\-—]|$)/.test(line)) {
+      shotCount += 1;
+    }
+  }
+  return { title, duration, shotCount };
+}
+
+function minimumFrozenStoryboardShotCount(result: AnalysisResult, requestedDuration: string) {
+  const seconds = parseFrozenDurationSeconds(result.duration) || parseFrozenDurationSeconds(requestedDuration);
+  if (!seconds) return 0;
+  if (seconds <= 8) return 2;
+  if (seconds <= 20) return 4;
+  if (seconds <= 60) return 5;
+  return 6;
+}
+
+function maximumFrozenStoryboardShotCount(result: AnalysisResult, requestedDuration: string) {
+  const seconds = parseFrozenDurationSeconds(result.duration) || parseFrozenDurationSeconds(requestedDuration);
+  if (!seconds) return 0;
+  if (seconds <= 8) return 3;
+  if (seconds <= 20) return 5;
+  if (seconds <= 60) return 8;
+  return 0;
+}
+
+function minimumFrozenFullPromptLength(storyboard: unknown[]) {
+  return storyboard.length ? 900 : 900;
+}
+
+function parseFrozenDurationSeconds(value: unknown) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text || /^auto$/i.test(text)) return 0;
+  const match = text.match(/(\d+(?:\.\d+)?)\s*(?:秒|s|seconds?)/i) || text.match(/^(\d+(?:\.\d+)?)$/);
+  if (!match) return 0;
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) ? seconds : 0;
+}
+
+function parseFrozenTimecodeSeconds(value: string) {
+  const text = value.trim();
+  if (/^\d+(?:\.\d+)?$/.test(text)) return Number(text);
+  const parts = text.split(":").map((part) => Number(part));
+  if (parts.some((part) => !Number.isFinite(part))) return undefined;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return undefined;
+}
+
+function parseFrozenLocalizedInteger(value: string) {
+  const text = value.trim();
+  if (/^\d+$/.test(text)) return Number(text);
+  const digits: Record<string, number> = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (text === "十") return 10;
+  const tenIndex = text.indexOf("十");
+  if (tenIndex >= 0) {
+    const tens = text.slice(0, tenIndex) ? digits[text.slice(0, tenIndex)] : 1;
+    const ones = text.slice(tenIndex + 1) ? digits[text.slice(tenIndex + 1)] : 0;
+    return tens === undefined || ones === undefined ? 0 : tens * 10 + ones;
+  }
+  return digits[text] || 0;
 }
 
 export function createThrowingBenchmarkModelAdapters(
@@ -502,7 +643,10 @@ export function assertBatchBenchmarkInvariants(report: BatchBenchmarkReportV1) {
 export function runTimedBatchFixtureReplay(
   fixture: BatchGenerationFixtureLike,
   adapter: BatchPipelineAdapter,
-  options: { modelAdapters?: BenchmarkModelAdapters } = {},
+  options: {
+    modelAdapters?: BenchmarkModelAdapters;
+    coverageStage?: BatchEventCoverageStage;
+  } = {},
 ): TimedReplayResult {
   if (fixture.expected?.adapterVersion && fixture.expected.adapterVersion !== adapter.adapterVersion) {
     throw new Error("Fixture adapter version does not match the frozen production adapter");
@@ -521,6 +665,7 @@ export function runTimedBatchFixtureReplay(
   const uninstall = installBatchInvocationObserver((event) => invocationEvents.push(event));
   const timers = {
     quality_gate_total: 0,
+    coverage_validation_total: 0,
     deterministic_patch_total: 0,
     canonical_prompt_total: 0,
     cache_encode_total: 0,
@@ -546,6 +691,12 @@ export function runTimedBatchFixtureReplay(
     routeDecisionCounts: {} as Record<string, number>,
     findingCounts: { blocking: 0, patchable: 0, warning: 0, risk: 0 },
     blockingFindingFingerprints: [] as string[],
+    coverageDecisionCounts: {
+      covered: 0,
+      ambiguous: 0,
+      definite_missing: 0,
+      contradiction: 0,
+    } as Record<CoverageDecision["status"], number>,
   };
   const patchPaths = new Set<string>();
   const cachedSegments: Array<Record<string, unknown>> = [];
@@ -556,15 +707,43 @@ export function runTimedBatchFixtureReplay(
       const contract = fixture.contracts[offset];
       const context = fixture.qualityContext[offset];
       const normalizedResult = adapter.normalizeBatchSegmentResultForQuality(rawResult);
+      const sourceInfo = inferFrozenBatchEpisodeSourceInfo(fixture.baseScript, context.episodeIndex);
+      const coverageMode = context.coverageMode || "shadow";
+      const coverageStage = options.coverageStage
+        || (coverageMode === "active" ? "local" : "shadow");
+      const resolveCoverageDecisions = (candidate: AnalysisResult) => {
+        if (!contract) return [];
+        if (context.coverageDecisions) return context.coverageDecisions;
+        const coverageStartedAt = performance.now();
+        const decisions = adapter.validateSegmentEventCoverage(
+          candidate,
+          contract,
+          context.coverageSidecar,
+        );
+        timers.coverage_validation_total += performance.now() - coverageStartedAt;
+        return decisions;
+      };
+      const buildQualityOptions = (candidate: AnalysisResult) => ({
+        segmentIndex: context.episodeIndex,
+        expectedShotCount: contract?.shotCount ?? context.expectedShotCount,
+        sourceShotCount: sourceInfo.shotCount,
+        minShotCount: sourceInfo.shotCount > 0
+          ? 0
+          : minimumFrozenStoryboardShotCount(candidate, fixture.requestedDuration),
+        maxShotCount: maximumFrozenStoryboardShotCount(candidate, fixture.requestedDuration),
+        requestedDuration: fixture.requestedDuration,
+        contract,
+        coverageDecisions: contract ? resolveCoverageDecisions(candidate) : undefined,
+        coverageMode,
+        fullPromptText: adapter.buildVideoGenerationPromptText(candidate),
+        minFullPromptLength: minimumFrozenFullPromptLength(candidate.storyboard || []),
+      });
 
       const firstGateStartedAt = performance.now();
-      const firstGate = adapter.evaluateBatchSegmentQuality(normalizedResult, {
-        ...context,
-        segmentIndex: context.episodeIndex,
-        contract,
-        fullPromptText: adapter.buildVideoGenerationPromptText(normalizedResult),
-        coverageMode: "shadow",
-      });
+      const firstGate = adapter.evaluateBatchSegmentQuality(
+        normalizedResult,
+        buildQualityOptions(normalizedResult),
+      );
       timers.quality_gate_total += performance.now() - firstGateStartedAt;
 
       const patchStartedAt = performance.now();
@@ -580,20 +759,22 @@ export function runTimedBatchFixtureReplay(
       let finalGate = firstGate;
       if (patched.patchDiffs.length) {
         const finalGateStartedAt = performance.now();
-        finalGate = adapter.evaluateBatchSegmentQuality(canonicalResult, {
-          ...context,
-          segmentIndex: context.episodeIndex,
-          contract,
-          fullPromptText: adapter.buildVideoGenerationPromptText(canonicalResult),
-          coverageMode: "shadow",
-        });
+        finalGate = adapter.evaluateBatchSegmentQuality(
+          canonicalResult,
+          buildQualityOptions(canonicalResult),
+        );
         timers.quality_gate_total += performance.now() - finalGateStartedAt;
+      }
+
+      const finalCoverageDecisions = contract ? resolveCoverageDecisions(canonicalResult) : [];
+      for (const decision of finalCoverageDecisions) {
+        replayQuality.coverageDecisionCounts[decision.status] += 1;
       }
 
       const route = adapter.routeBatchSegmentOutcome({
         gate: finalGate,
         hasUsableResult: Array.isArray(canonicalResult.storyboard) && canonicalResult.storyboard.length > 0,
-        coverageStage: "shadow",
+        coverageStage,
       });
       const report = adapter.createSegmentQualityReport({
         batchId: `fixture:${fixture.fixtureId}`,

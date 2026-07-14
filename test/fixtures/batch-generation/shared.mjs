@@ -101,6 +101,7 @@ export function createBatchGenerationFixture({ fixtureId, segmentCount, shapePro
       episodeIndex: index,
       expectedShotCount: shotCount,
       minFullPromptLength: 900,
+      coverageMode: "shadow",
     });
     globalShotOffset += shotCount;
   }
@@ -109,11 +110,13 @@ export function createBatchGenerationFixture({ fixtureId, segmentCount, shapePro
     renderedResults.map((result) => Buffer.byteLength(JSON.stringify(result), "utf8")),
   );
   renderedResults.forEach((result, index) => padResultJsonBytes(result, resultByteBudgets[index]));
+  const baseScript = buildSyntheticBaseScript(contracts);
 
   return freezeFixture({
     schemaVersion: 1,
     fixtureId,
     sourceHash: hashText(`local-director-phase-zero:${fixtureId}:synthetic-source-v2`),
+    baseScript,
     requestedDuration: "15秒以内",
     segmentCount,
     contracts,
@@ -166,8 +169,8 @@ export function createBatchGenerationFixture({ fixtureId, segmentCount, shapePro
       needsReviewSegmentIndexes: [],
       blockingFindingFingerprints: [],
       uniquePatchPaths: [...expectedPatchPaths].sort(),
-      adapterVersion: "frozen-dashboard-local-v1",
-      productionSourceFingerprint: "1e2343056569182e97215a1e9bdf7a040aa3ffeeee3067d726753d242bf3239f",
+      adapterVersion: "frozen-dashboard-local-v2",
+      productionSourceFingerprint: "805aa2b46f96d33fd89c5fa4a82a8d7390bde1983c0f62139a988e0d2a78a237",
     },
   });
 }
@@ -258,6 +261,8 @@ export function createFixtureManifest(fixture, shapeProfile, contractByteSummary
 
 function createContract(segmentIndex, scenario, shotCount, shapeProfile) {
   const selectedActions = selectActions(scenario.actions, shotCount);
+  const primaryAction = selectedActions[0];
+  const closingAction = selectedActions.at(-1);
   const [firstPerson, secondPerson] = scenario.people;
   const [firstWardrobe, secondWardrobe] = scenario.wardrobe;
   const [primaryProp, secondaryProp, closingProp] = scenario.props;
@@ -272,14 +277,14 @@ function createContract(segmentIndex, scenario, shotCount, shapeProfile) {
     {
       suffix: "primary_action",
       label: `${primaryProp}完成本段核心核对动作`,
-      anchors: [primaryProp, firstPerson, secondPerson, closingProp],
-      concepts: selectedActions.map((action) => action[1].slice(0, 10)),
+      anchors: [primaryProp, secondaryProp, primaryAction[2], primaryAction[1]],
+      concepts: [primaryAction[1], primaryAction[2], scenario.title],
     },
     {
       suffix: "joint_close",
       label: `${firstPerson}与${secondPerson}共同确认${closingProp}归位`,
-      anchors: [firstPerson, secondPerson, closingProp, primaryProp],
-      concepts: ["共同确认", "归位", "扣合", "关闭", "完成"],
+      anchors: [primaryProp, closingProp, firstPerson, secondPerson],
+      concepts: [closingAction[1], closingAction[2], scenario.title],
     },
     {
       suffix: "continuity_verified",
@@ -372,6 +377,17 @@ function createContract(segmentIndex, scenario, shotCount, shapeProfile) {
     ...contractWithoutHash,
     contractHash: `sc_${hashText(canonicalizeFixture(contractWithoutHash)).slice(0, 16)}`,
   };
+}
+
+function buildSyntheticBaseScript(contracts) {
+  return contracts.map((contract) => [
+    contract.title,
+    `时长：${contract.durationSeconds}秒`,
+    ...contract.requiredShotBeats.map((shot) => (
+      `${shot.timeRange}｜镜头${shot.shotNumber}｜${shot.beat}`
+    )),
+    `原文范围：${contract.sourceText}`,
+  ].join("\n")).join("\n\n");
 }
 
 function createEventSlot(segmentIndex, suffix, label, anchors, concepts, repairTargetCount, termsPerGroup) {
