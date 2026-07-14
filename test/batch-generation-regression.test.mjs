@@ -456,6 +456,66 @@ test("manifest cannot pass when copied observed counts differ from live replay",
   }
 });
 
+test("phase-zero acceptance JSON is UTF-8 without BOM and JSON.parse compatible", async () => {
+  const { writeJsonEvidence } = await import("../scripts/finalize-task-one-phase-0r.mjs");
+  const root = path.join(
+    process.cwd(),
+    ".tmp-batch-benchmark",
+    `phase-zero-json-${process.pid}-${Date.now()}`,
+  );
+  const target = path.join(root, "acceptance.json");
+  try {
+    await mkdir(root, { recursive: true });
+    await writeJsonEvidence(target, { schemaVersion: 1, status: "accepted" });
+    const bytes = await readFile(target);
+    assert.notDeepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+    const text = bytes.toString("utf8");
+    assert.equal(text.trimStart()[0], "{");
+    assert.deepEqual(JSON.parse(text), { schemaVersion: 1, status: "accepted" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("any required false check forces acceptance status rejected", async () => {
+  const { evaluateRequiredChecks } = await import("../scripts/finalize-task-one-phase-0r.mjs");
+  const acceptance = evaluateRequiredChecks([
+    { id: "required-pass", required: true, passed: true },
+    { id: "required-fail", required: true, passed: false },
+    { id: "informational", required: false, passed: false },
+  ]);
+  assert.equal(acceptance.status, "rejected");
+  assert.deepEqual(acceptance.failedRequiredCheckIds, ["required-fail"]);
+});
+
+test("benchmark commit or production fingerprint mismatch forces rejected", async () => {
+  const {
+    buildBenchmarkIdentityChecks,
+    evaluateRequiredChecks,
+  } = await import("../scripts/finalize-task-one-phase-0r.mjs");
+  const checks = buildBenchmarkIdentityChecks({
+    gitCommit: "task-mismatch",
+    fixtureHash: "fixture-ok",
+    baseline: { gitCommit: "baseline-ok" },
+    extensions: {
+      adapterVersion: "adapter-ok",
+      productionSourceFingerprint: "fingerprint-mismatch",
+    },
+  }, {
+    taskCommit: "task-ok",
+    baselineCommit: "baseline-ok",
+    fixtureHash: "fixture-ok",
+    adapterVersion: "adapter-ok",
+    productionSourceFingerprint: "fingerprint-ok",
+  }, "fixture-20");
+  const acceptance = evaluateRequiredChecks(checks);
+  assert.equal(acceptance.status, "rejected");
+  assert.deepEqual(acceptance.failedRequiredCheckIds, [
+    "fixture-20.gitCommit",
+    "fixture-20.productionSourceFingerprint",
+  ]);
+});
+
 test("representative fixtures remain synthetic and privacy-safe", () => {
   const serialized = canonicalizeFixture(collectFixtureContentText({ fixture20, fixture30 }));
   assert.doesNotMatch(serialized, /PRIVATE_/i);
