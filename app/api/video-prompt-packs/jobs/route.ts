@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { createVideoPromptPackCodexJob } from "@/lib/video-prompt-pack-codex-queue";
+import {
+  createVideoPromptPackCodexJob,
+  toVideoPromptPackCodexJobStatusDto,
+} from "@/lib/video-prompt-pack-codex-queue";
 import { CODEX_QUOTA_EXHAUSTED_CODE, assertCodexRuntimeAvailable } from "@/lib/codex-runtime-state";
 import type { SegmentContract } from "@/lib/batch-segment-contract";
 import { fileJobRouteError } from "@/lib/file-job-route-error";
@@ -33,7 +36,7 @@ export async function POST(request: NextRequest) {
     const body = RequestSchema.parse(await request.json());
     await assertCodexRuntimeAvailable();
     const job = await createVideoPromptPackCodexJob(body);
-    return NextResponse.json({ ok: true, job }, { status: 201 });
+    return NextResponse.json({ ok: true, job: toVideoPromptPackCodexJobStatusDto(job) }, { status: 201 });
   } catch (error: any) {
     const isQuotaError = error?.code === CODEX_QUOTA_EXHAUSTED_CODE || String(error?.message || "").includes(CODEX_QUOTA_EXHAUSTED_CODE);
     if (isQuotaError) {

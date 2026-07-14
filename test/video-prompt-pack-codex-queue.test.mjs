@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -16,7 +16,9 @@ const {
   claimNextVideoPromptPackCodexJob,
   completeVideoPromptPackCodexJob,
   createVideoPromptPackCodexJob,
+  finalizeVideoPromptPackCodexJobFiles,
   getVideoPromptPackCodexJob,
+  updateVideoPromptPackCodexJobStage,
 } = require("../lib/video-prompt-pack-codex-queue.ts");
 
 function makeTempRoot() {
@@ -62,6 +64,209 @@ function sampleAnalysisResult(title = "Segment result") {
     ],
   };
 }
+
+async function enterRenderPackFinalizing(claimed, rootDir) {
+  await updateVideoPromptPackCodexJobStage(
+    claimed.id,
+    claimed.leaseId,
+    claimed.fencingToken,
+    "executing",
+    { rootDir },
+  );
+  return updateVideoPromptPackCodexJobStage(
+    claimed.id,
+    claimed.leaseId,
+    claimed.fencingToken,
+    "finalizing",
+    { rootDir },
+  );
+}
+
+async function finalizeAndCompleteRenderPack(claimed, rootDir) {
+  const finalizing = await enterRenderPackFinalizing(claimed, rootDir);
+  const finalized = await finalizeVideoPromptPackCodexJobFiles(finalizing, {
+    rootDir,
+    codexExitCode: 0,
+    stabilityDelayMs: 0,
+  });
+  return completeVideoPromptPackCodexJob(
+    finalizing.id,
+    finalizing.leaseId,
+    finalizing.fencingToken,
+    finalized.resultRef,
+    { rootDir },
+  );
+}
+
+test("protocol v2 render packs never complete from a parseable intermediate file", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 3,
+        title: "Intermediate segment",
+        script: "Intermediate source text for a render pack.",
+        renderInputScript: "Render the requested segment without publishing an intermediate draft.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    assert.equal(job.protocolVersion, 2);
+    assert.equal(job.stage, "pending");
+    assert.equal(job.resultAvailable, false);
+
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    assert.equal(claimed.protocolVersion, 2);
+    assert.equal(claimed.stage, "claimed");
+    assert.match(claimed.segments[0].outputPath, /staging/i);
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(
+      claimed.segments[0].outputPath,
+      JSON.stringify(sampleAnalysisResult("Intermediate segment"), null, 2),
+      "utf8",
+    );
+
+    const observed = await getVideoPromptPackCodexJob(job.id, { rootDir });
+    assert.equal(observed.status, "running");
+    assert.equal(observed.resultAvailable, false);
+    assert.equal(observed.result, null);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("render pack finalization publishes exactly the requested segment identities", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const job = await createVideoPromptPackCodexJob({
+      segments: [2, 4].map((episodeIndex) => ({
+        episodeIndex,
+        title: `Segment ${episodeIndex}`,
+        script: `Segment ${episodeIndex} source text.`,
+        renderInputScript: `Render segment ${episodeIndex} with complete structural fields.`,
+        duration: "12 seconds",
+      })),
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    for (const segment of claimed.segments) {
+      mkdirSync(path.dirname(segment.outputPath), { recursive: true });
+      writeFileSync(segment.outputPath, JSON.stringify(sampleAnalysisResult(segment.title), null, 2), "utf8");
+    }
+
+    const completed = await finalizeAndCompleteRenderPack(claimed, rootDir);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.stage, "completed");
+    assert.equal(completed.resultAvailable, true);
+    assert.deepEqual(completed.result.segments.map((segment) => segment.episodeIndex), [2, 4]);
+    assert.equal(completed.resultRef.protocolVersion, 2);
+    assert.match(completed.resultRef.resultHash, /^[a-f0-9]{64}$/);
+
+    const reloaded = await getVideoPromptPackCodexJob(job.id, { rootDir });
+    assert.equal(reloaded.resultAvailable, true);
+    assert.equal(reloaded.resultRef.resultHash, completed.resultRef.resultHash);
+    assert.deepEqual(reloaded.result.segments.map((segment) => segment.episodeIndex), [2, 4]);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("render pack finalization rejects a missing requested segment with a stable code", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createVideoPromptPackCodexJob({
+      segments: [1, 2].map((episodeIndex) => ({
+        episodeIndex,
+        title: `Segment ${episodeIndex}`,
+        script: `Segment ${episodeIndex} source text.`,
+        renderInputScript: `Render segment ${episodeIndex} with complete structural fields.`,
+        duration: "12 seconds",
+      })),
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(
+      claimed.segments[0].outputPath,
+      JSON.stringify(sampleAnalysisResult(claimed.segments[0].title), null, 2),
+      "utf8",
+    );
+    const finalizing = await enterRenderPackFinalizing(claimed, rootDir);
+
+    await assert.rejects(
+      finalizeVideoPromptPackCodexJobFiles(finalizing, { rootDir, codexExitCode: 0, stabilityDelayMs: 0 }),
+      (error) => error?.code === "PACK_FINALIZATION_MISSING_SEGMENT",
+    );
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("render pack finalization excludes coverage evidence outside allowed contract fields", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const contract = {
+      contractSchemaVersion: 2,
+      coveragePolicyVersion: "test",
+      sourceHash: "src_test",
+      segmentIndex: 1,
+      title: "第1段",
+      sourceText: "大妈认出照片中的邻居。",
+      durationSeconds: 12,
+      shotCount: 1,
+      requiredEvents: ["大妈认出邻居"],
+      requiredEventSlots: [{
+        id: "recognition",
+        label: "大妈认出邻居",
+        importance: "blocking",
+        anchorGroups: [["大妈"]],
+        conceptGroups: [["认出"]],
+        contradictionGroups: [],
+        evidenceSelectors: [{ source: "storyboard", shotNumber: "any", fields: ["dialogue"], requireExecutableShot: true }],
+        repairTargets: [{ shotNumber: 1, field: "dialogue" }],
+      }],
+      forbiddenFutureEvents: [],
+      characterLocks: [],
+      characters: [],
+      locations: [],
+      props: [],
+      requiredShotBeats: [{ shotNumber: 1, timeRange: "0s-12s", beat: "辨认", visualFocus: "照片" }],
+      safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+      contractHash: "sc_sidecar_path",
+    };
+    await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "第1段",
+        script: contract.sourceText,
+        renderInputScript: "生成完整提示词",
+        duration: "12秒",
+        shotCount: 1,
+        segmentContract: contract,
+      }],
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
+    const result = sampleAnalysisResult("第1段");
+    result.storyboard[0].dialogue = "大妈：这是隔壁老周。";
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    mkdirSync(path.dirname(claimed.segments[0].coverageOutputPath), { recursive: true });
+    writeFileSync(claimed.segments[0].outputPath, JSON.stringify(result, null, 2), "utf8");
+    writeFileSync(claimed.segments[0].coverageOutputPath, JSON.stringify({
+      schemaVersion: 1,
+      segmentIndex: 1,
+      contractHash: contract.contractHash,
+      receipts: [{ slotId: "recognition", evidence: [{ path: "workflow.fullVideoPrompt", quote: "第1段" }] }],
+    }), "utf8");
+    const completed = await finalizeAndCompleteRenderPack(claimed, rootDir);
+    assert.equal(completed.result.segments[0].coverageSidecar, null);
+    const manifestPath = path.join(
+      rootDir,
+      ".tmp-video-prompt-pack-codex",
+      ...completed.resultRef.manifestRelativePath.split("/"),
+    );
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    assert.equal(manifest.outputFiles.some((output) => output.kind === "coverage_sidecar"), false);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
 
 test("creates, claims, and completes a video prompt render pack job with independent segment JSON files", async () => {
   const rootDir = makeTempRoot();
@@ -156,7 +361,7 @@ test("creates, claims, and completes a video prompt render pack job with indepen
       writeFileSync(segment.outputPath, JSON.stringify(sampleAnalysisResult(segment.title), null, 2), "utf8");
     }
 
-    const completed = await completeVideoPromptPackCodexJob(job.id, claimed.leaseId, claimed.fencingToken, { rootDir });
+    const completed = await finalizeAndCompleteRenderPack(claimed, rootDir);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.segments.length, 5);
     assert.deepEqual(completed.result.segments.map((segment) => segment.episodeIndex), [1, 2, 3, 4, 5]);
@@ -320,6 +525,7 @@ test("coverage sidecars stay separate and never make a valid main result fail", 
     const result = sampleAnalysisResult("第1段");
     result.storyboard[0].dialogue = "大妈：这是隔壁老周。";
     mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    mkdirSync(path.dirname(claimed.segments[0].coverageOutputPath), { recursive: true });
     writeFileSync(claimed.segments[0].outputPath, JSON.stringify(result, null, 2), "utf8");
     writeFileSync(claimed.segments[0].coverageOutputPath, JSON.stringify({
       schemaVersion: 1,
@@ -333,7 +539,7 @@ test("coverage sidecars stay separate and never make a valid main result fail", 
     assert.match(claimed.prompt, /slotId=recognition/);
     assert.match(claimed.prompt, /storyboard\[\*\]\.dialogue/);
 
-    const completed = await completeVideoPromptPackCodexJob(job.id, claimed.leaseId, claimed.fencingToken, { rootDir });
+    const completed = await finalizeAndCompleteRenderPack(claimed, rootDir);
     assert.equal(completed.result.segments[0].result.coverage, undefined);
     assert.equal(completed.result.segments[0].coverageSidecar.receipts[0].slotId, "recognition");
     assert.match(completed.result.segments[0].coverageSidecar.resultHash, /^sr_[a-z0-9]+$/);
@@ -351,14 +557,10 @@ test("coverage sidecars stay separate and never make a valid main result fail", 
     }, { rootDir });
     const invalidClaimed = await claimNextVideoPromptPackCodexJob({ rootDir });
     mkdirSync(path.dirname(invalidClaimed.segments[0].outputPath), { recursive: true });
+    mkdirSync(path.dirname(invalidClaimed.segments[0].coverageOutputPath), { recursive: true });
     writeFileSync(invalidClaimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("第2段")), "utf8");
     writeFileSync(invalidClaimed.segments[0].coverageOutputPath, "{not-json", "utf8");
-    const invalidCompleted = await completeVideoPromptPackCodexJob(
-      invalidJob.id,
-      invalidClaimed.leaseId,
-      invalidClaimed.fencingToken,
-      { rootDir },
-    );
+    const invalidCompleted = await finalizeAndCompleteRenderPack(invalidClaimed, rootDir);
     assert.equal(invalidCompleted.result.segments[0].coverageSidecar, null);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
@@ -385,9 +587,10 @@ test("a batch snapshot can disable coverage sidecars without changing the main r
 
     const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
     mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    mkdirSync(path.dirname(claimed.segments[0].coverageOutputPath), { recursive: true });
     writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("第1段"), null, 2), "utf8");
     writeFileSync(claimed.segments[0].coverageOutputPath, "{ invalid sidecar", "utf8");
-    const completed = await completeVideoPromptPackCodexJob(job.id, claimed.leaseId, claimed.fencingToken, { rootDir });
+    const completed = await finalizeAndCompleteRenderPack(claimed, rootDir);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.segments[0].coverageSidecar, null);
   } finally {

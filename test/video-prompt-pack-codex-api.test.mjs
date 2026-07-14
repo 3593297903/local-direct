@@ -46,4 +46,8 @@ test("video prompt render pack worker runs bounded concurrent pack tasks", () =>
   assert.match(worker, /Promise\.race\(activeTasks\)/);
   assert.match(worker, /\/api\/video-prompt-packs\/jobs\/claim/);
   assert.match(worker, /Do not use 同上/);
+  assert.match(worker, /child\.on\("close"/);
+  assert.doesNotMatch(worker, /child\.on\("exit"/);
+  assert.match(worker, /finalizeVideoPromptPackCodexJobFiles/);
+  assert.match(worker, /resultRef/);
 });
