@@ -26,6 +26,7 @@ test("season pack Codex job API exposes create, poll, claim, complete, and fail 
 
   const pollRoute = readFileSync(routes[1], "utf8");
   assert.match(pollRoute, /getSeasonPackCodexJob/);
+  assert.match(pollRoute, /toSeasonPackCodexJobStatusDto/);
 
   const claimRoute = readFileSync(routes[2], "utf8");
   assert.match(claimRoute, /claimNextSeasonPackCodexJob/);
@@ -33,7 +34,11 @@ test("season pack Codex job API exposes create, poll, claim, complete, and fail 
 
   const completeRoute = readFileSync(routes[3], "utf8");
   assert.match(completeRoute, /completeSeasonPackCodexJob/);
+  assert.match(completeRoute, /leaseId/);
+  assert.match(completeRoute, /fencingToken/);
+  assert.match(completeRoute, /resultRef/);
 
   const failRoute = readFileSync(routes[4], "utf8");
   assert.match(failRoute, /failSeasonPackCodexJob/);
+  assert.match(failRoute, /errorCode/);
 });

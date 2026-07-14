@@ -1,23 +1,21 @@
 import { NextResponse } from "next/server";
-import { failSeasonPackCodexJob, getSeasonPackCodexJob } from "@/lib/season-pack-codex-queue";
+import { getSeasonPackCodexJob, toSeasonPackCodexJobStatusDto } from "@/lib/season-pack-codex-queue";
 import { getCodexRuntimeState } from "@/lib/codex-runtime-state";
+import { fileJobRouteError } from "@/lib/file-job-route-error";
 
 export const runtime = "nodejs";
 
 export async function GET(_request: Request, context: { params: Promise<{ jobId: string }> }) {
   try {
     const params = await context.params;
-    let job = await getSeasonPackCodexJob(params.jobId);
+    const job = await getSeasonPackCodexJob(params.jobId);
+    const status = toSeasonPackCodexJobStatusDto(job);
     const codexState = await getCodexRuntimeState();
     if (!codexState.available && (job.status === "pending" || job.status === "running")) {
-      job = await failSeasonPackCodexJob(params.jobId, codexState.message);
-      return NextResponse.json({ ok: true, job, codexUnavailable: codexState });
+      return NextResponse.json({ ok: true, job: status, codexUnavailable: codexState });
     }
-    return NextResponse.json({ ok: true, job });
+    return NextResponse.json({ ok: true, job: status });
   } catch (error: any) {
-    return NextResponse.json(
-      { ok: false, error: error?.message || "Season pack Codex job not found" },
-      { status: 404 },
-    );
+    return fileJobRouteError(error, "Season pack Codex job not found");
   }
 }

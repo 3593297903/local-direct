@@ -281,6 +281,49 @@ export async function readRunningFileJob<T extends FileJobRecord>(
   return { job, runningPath };
 }
 
+export async function updateRunningFileJob<T extends FileJobRecord>(
+  rootDir: string,
+  namespace: string,
+  jobId: string,
+  leaseId: string,
+  fencingToken: number,
+  update: Partial<T> | ((current: T) => T),
+) {
+  const release = await acquireJobStateLock(rootDir, namespace, jobId);
+  try {
+    const runningPath = filePath(rootDir, namespace, "running", jobId);
+    let current: T;
+    try {
+      current = await readJobFile<T>(runningPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new FileJobLeaseError();
+      throw error;
+    }
+    if (current.status !== "running" || !leaseId || current.leaseId !== leaseId
+      || Number(current.fencingToken || 0) !== Number(fencingToken || 0)) {
+      throw new FileJobLeaseError();
+    }
+    const nextValue = typeof update === "function"
+      ? update(current)
+      : { ...current, ...update } as T;
+    const updated = {
+      ...nextValue,
+      id: current.id,
+      status: "running" as const,
+      leaseId: current.leaseId,
+      workerId: current.workerId,
+      attempt: current.attempt,
+      fencingToken: current.fencingToken,
+      heartbeatAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as T;
+    await writeJobFile(rootDir, runningPath, updated);
+    return updated;
+  } finally {
+    await release();
+  }
+}
+
 export async function finishRunningFileJob<T extends FileJobRecord>(
   rootDir: string,
   namespace: string,

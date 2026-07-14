@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -16,7 +16,10 @@ const {
   claimNextSeasonPackCodexJob,
   completeSeasonPackCodexJob,
   createSeasonPackCodexJob,
+  finalizeSeasonPackCodexJobFiles,
   getSeasonPackCodexJob,
+  toSeasonPackCodexJobStatusDto,
+  updateSeasonPackCodexJobStage,
 } = require("../lib/season-pack-codex-queue.ts");
 
 function makeTempRoot() {
@@ -129,6 +132,27 @@ function writeLockedSeasonPlan(claimed, episodeCount, options = {}) {
   );
 }
 
+async function finalizeAndCompleteSeasonPack(claimed, rootDir) {
+  if (!existsSync(claimed.manifestPath) && claimed.episodeCount > 0) {
+    const generatedEpisodes = Array.from({ length: claimed.episodeCount }, (_, index) => index + 1);
+    writeFileSync(
+      claimed.manifestPath,
+      JSON.stringify({ episodeCount: claimed.episodeCount, generatedEpisodes }, null, 2),
+      "utf8",
+    );
+  }
+  await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "executing", { rootDir });
+  const finalizing = await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "finalizing", { rootDir });
+  const finalized = await finalizeSeasonPackCodexJobFiles(finalizing, { rootDir, codexExitCode: 0 });
+  return completeSeasonPackCodexJob(
+    claimed.id,
+    claimed.leaseId,
+    claimed.fencingToken,
+    finalized.resultRef,
+    { rootDir },
+  );
+}
+
 test("creates, claims, and completes a season planning job from per-episode input packs", async () => {
   const rootDir = makeTempRoot();
   try {
@@ -168,7 +192,7 @@ test("creates, claims, and completes a season planning job from per-episode inpu
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
     writeFileSync(path.join(claimed.episodesDir, "episode-002.json"), JSON.stringify(sampleEpisodeInput(2), null, 2), "utf8");
 
-    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.episodes.length, 2);
     assert.equal(completed.result.episodes[0].episodeIndex, 1);
@@ -250,7 +274,7 @@ test("cleans undefined bridge placeholders from season planning input packs befo
       "utf8",
     );
 
-    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     assert.equal(completed.status, "completed");
     const serialized = JSON.stringify(completed.result);
     assert.doesNotMatch(serialized, /\bundefined\b/i);
@@ -296,7 +320,7 @@ test("cleans contradictory renderer instructions from segment render scripts", a
       "utf8",
     );
 
-    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     const renderInputScript = completed.result.episodes[0].input.renderInputScript;
     assert.doesNotMatch(renderInputScript, /不要输出 workflow\.fullVideoPrompt/);
     assert.doesNotMatch(renderInputScript, /Do not include workflow\.fullVideoPrompt/i);
@@ -340,7 +364,7 @@ test("creates automatic season planning jobs and resolves segment count from the
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
     writeFileSync(path.join(claimed.episodesDir, "episode-002.json"), JSON.stringify(sampleEpisodeInput(2), null, 2), "utf8");
 
-    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     assert.equal(completed.status, "completed");
     assert.equal(completed.episodeCount, 2);
     assert.equal(completed.resolvedEpisodeCount, 2);
@@ -398,7 +422,7 @@ test("packs season plan beats into locked segments before render input generatio
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { sourceText: "", duration: "", shotCount: 4, renderInputScript: "" }), null, 2), "utf8");
     writeFileSync(path.join(claimed.episodesDir, "episode-002.json"), JSON.stringify(sampleEpisodeInput(2, { sourceText: "", duration: "", shotCount: 4, renderInputScript: "" }), null, 2), "utf8");
 
-    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result.seasonPlan.lockedSegments.length, 2);
     assert.deepEqual(completed.result.seasonPlan.lockedSegments[0].beatIds, ["B001", "B002", "B003"]);
@@ -461,7 +485,7 @@ test("prefers locked season segments over legacy generic segments", async () => 
     );
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { sourceText: "", duration: "", shotCount: 3, renderInputScript: "" }), null, 2), "utf8");
 
-    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     assert.equal(completed.result.episodes[0].input.title, "第1段｜锁定段");
     assert.equal(completed.result.episodes[0].input.duration, "8秒");
     assert.match(completed.result.episodes[0].input.renderInputScript, /B001/);
@@ -544,7 +568,7 @@ test("coerces episode input pack shot count to the locked segment contract when 
       "utf8",
     );
 
-    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     const input = completed.result.episodes[0].input;
     assert.equal(input.shotCount, 3);
     assert.equal(input.segmentContract.shotCount, 3);
@@ -624,7 +648,7 @@ test("coerces stale segment contract shot count to the locked segment plan when 
       "utf8",
     );
 
-    const completed = await completeSeasonPackCodexJob(claimed.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     const input = completed.result.episodes[0].input;
     assert.equal(input.shotCount, 4);
     assert.equal(input.segmentContract.shotCount, 4);
@@ -659,7 +683,7 @@ test("rejects season planning output without locked beats or locked segments", a
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
 
     await assert.rejects(
-      () => completeSeasonPackCodexJob(claimed.id, { rootDir }),
+      () => finalizeAndCompleteSeasonPack(claimed, rootDir),
       /locked beat plan|beats|lockedSegments/i,
     );
   } finally {
@@ -716,6 +740,7 @@ test("fills episode input metadata and render script from structured source", as
     });
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 1, generatedEpisodes: [1] }, null, 2), "utf8");
     writeLockedSeasonPlan(claimed, 1, {
       durations: [13],
       sourceTexts: [structuredSourceWithFourShots()],
@@ -723,7 +748,7 @@ test("fills episode input metadata and render script from structured source", as
     });
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(input, null, 2), "utf8");
 
-    const completed = await completeSeasonPackCodexJob(job.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     const episode = completed.result.episodes[0].input;
     assert.equal(episode.title, "第1段｜七天期限后的第一夜");
     assert.equal(episode.duration, "13秒");
@@ -755,7 +780,7 @@ test("rejects season pack output that still writes final AnalysisResult JSON", a
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleFinalAnalysisResult(1), null, 2), "utf8");
 
     await assert.rejects(
-      () => completeSeasonPackCodexJob(job.id, { rootDir }),
+      () => finalizeAndCompleteSeasonPack(claimed, rootDir),
       /Episode Input Pack, not a final AnalysisResult/,
     );
   } finally {
@@ -781,7 +806,7 @@ test("rejects season planning that compresses explicit source shot count", async
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { shotCount: 3 }), null, 2), "utf8");
 
     await assert.rejects(
-      () => completeSeasonPackCodexJob(job.id, { rootDir }),
+      () => finalizeAndCompleteSeasonPack(claimed, rootDir),
       /shotCount 3 does not match source segment shot count 4/,
     );
   } finally {
@@ -808,7 +833,7 @@ test("recognizes colon episode headings and timecode shot lines before validatin
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { shotCount: 2 }), null, 2), "utf8");
 
     await assert.rejects(
-      () => completeSeasonPackCodexJob(job.id, { rootDir }),
+      () => finalizeAndCompleteSeasonPack(claimed, rootDir),
       /shotCount 2 does not match source segment shot count 4/,
     );
   } finally {
@@ -839,7 +864,7 @@ test("caps short source segments at five planned shots unless dense mode exists"
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { shotCount: 8 }), null, 2), "utf8");
 
     await assert.rejects(
-      () => completeSeasonPackCodexJob(job.id, { rootDir }),
+      () => finalizeAndCompleteSeasonPack(claimed, rootDir),
       /too many planned shots: 8 \/ 5/,
     );
   } finally {
@@ -860,6 +885,7 @@ test("removes source episode labels from render input while preserving segment n
     assert.ok(claimed);
 
     mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 1, generatedEpisodes: [1] }, null, 2), "utf8");
     writeLockedSeasonPlan(claimed, 1, {
       sourceTexts: [source],
     });
@@ -873,7 +899,7 @@ test("removes source episode labels from render input while preserving segment n
       "utf8",
     );
 
-    const completed = await completeSeasonPackCodexJob(job.id, { rootDir });
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
     const input = completed.result.episodes[0].input;
     assert.equal(input.title, "第1段｜车棚里的发现");
     assert.match(input.renderInputScript, /第 1 段/);
@@ -903,7 +929,7 @@ test("rejects compact one-shot season input packs when no explicit source shot l
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1, { shotCount: 1 }), null, 2), "utf8");
 
     await assert.rejects(
-      () => completeSeasonPackCodexJob(job.id, { rootDir }),
+      () => finalizeAndCompleteSeasonPack(claimed, rootDir),
       /too few planned shots: 1 \/ 3/,
     );
   } finally {
@@ -933,7 +959,7 @@ test("rejects poisoned render input text", async () => {
     );
 
     await assert.rejects(
-      () => completeSeasonPackCodexJob(job.id, { rootDir }),
+      () => finalizeAndCompleteSeasonPack(claimed, rootDir),
       /invalid undefined\/null text/,
     );
   } finally {
@@ -966,9 +992,165 @@ test("does not complete a season pack job when an expected episode file is missi
     writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
 
     await assert.rejects(
-      () => completeSeasonPackCodexJob(job.id, { rootDir }),
+      () => finalizeAndCompleteSeasonPack(claimed, rootDir),
       /episode-002\.json/,
     );
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("protocol v2 season packs stay unavailable until worker validation, manifest publication, and fenced completion", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const created = await createSeasonPackCodexJob({
+      script: "Segment one establishes the room. Segment two reveals the note.",
+      episodeCount: 2,
+      duration: "15 seconds",
+    }, { rootDir });
+    assert.equal(created.protocolVersion, 2);
+    assert.equal(created.stage, "pending");
+    assert.equal(created.resultAvailable, false);
+
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, order: "oldest", workerId: "season-test-worker" });
+    assert.ok(claimed);
+    assert.equal(claimed.status, "running");
+    assert.equal(claimed.stage, "claimed");
+    assert.match(claimed.stagingDir, /staging/);
+    assert.match(claimed.manifestPath, /staging/);
+    assert.ok(claimed.leaseId);
+    assert.equal(claimed.fencingToken, 1);
+
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 2, generatedEpisodes: [1, 2] }, null, 2), "utf8");
+    writeLockedSeasonPlan(claimed, 2, {
+      titles: [sampleEpisodeInput(1).title, sampleEpisodeInput(2).title],
+      sourceTexts: [sampleEpisodeInput(1).sourceText, sampleEpisodeInput(2).sourceText],
+    });
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
+    writeFileSync(path.join(claimed.episodesDir, "episode-002.json"), JSON.stringify(sampleEpisodeInput(2), null, 2), "utf8");
+
+    const beforeFinalization = await getSeasonPackCodexJob(created.id, { rootDir });
+    assert.equal(beforeFinalization.status, "running");
+    assert.equal(beforeFinalization.resultAvailable, false);
+    assert.equal(beforeFinalization.result, null);
+
+    await assert.rejects(
+      () => completeSeasonPackCodexJob(
+        claimed.id,
+        claimed.leaseId,
+        claimed.fencingToken,
+        { protocolVersion: 2, resultHash: "0".repeat(64), relativePath: "results/missing", manifestRelativePath: "results/missing/final-manifest.v2.json" },
+        { rootDir },
+      ),
+      /manifest|finaliz|result/i,
+    );
+
+    await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "executing", { rootDir });
+    const finalizing = await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "finalizing", { rootDir });
+    assert.ok(finalizing.claimedAt);
+    assert.ok(finalizing.executingAt);
+    assert.ok(finalizing.finalizingAt);
+    const finalized = await finalizeSeasonPackCodexJobFiles(finalizing, { rootDir, codexExitCode: 0 });
+    const completed = await completeSeasonPackCodexJob(
+      claimed.id,
+      claimed.leaseId,
+      claimed.fencingToken,
+      finalized.resultRef,
+      { rootDir },
+    );
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.stage, "completed");
+    assert.equal(completed.resultAvailable, true);
+    assert.equal(completed.result.episodes.length, 2);
+    assert.equal(completed.resultRef.resultHash, finalized.resultRef.resultHash);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("protocol v2 season status hides staging paths and provisional prompt data", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const created = await createSeasonPackCodexJob({ script: "A stable two-segment source.", episodeCount: 2 }, { rootDir });
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, workerId: "season-status-worker" });
+    assert.ok(claimed);
+
+    const status = toSeasonPackCodexJobStatusDto(claimed);
+    assert.equal(status.id, created.id);
+    assert.equal(status.protocolVersion, 2);
+    assert.equal(status.resultAvailable, false);
+    assert.equal(status.episodeCount, 2);
+    assert.equal("prompt" in status, false);
+    assert.equal("script" in status, false);
+    assert.equal("stagingDir" in status, false);
+    assert.equal("manifestPath" in status, false);
+    assert.equal("result" in status, false);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("season finalization rejects a fixed-count manifest that disagrees with the request", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createSeasonPackCodexJob({ script: "One requested segment.", episodeCount: 1 }, { rootDir });
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir });
+    assert.ok(claimed);
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 2, generatedEpisodes: [1, 2] }), "utf8");
+    writeLockedSeasonPlan(claimed, 1);
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1)), "utf8");
+
+    await assert.rejects(() => finalizeAndCompleteSeasonPack(claimed, rootDir), /episodeCount|segment count|requested/i);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("season finalization rejects UTF-8 BOM in required model output", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createSeasonPackCodexJob({ script: "One requested segment.", episodeCount: 1 }, { rootDir });
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir });
+    assert.ok(claimed);
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 1, generatedEpisodes: [1] }), "utf8");
+    writeLockedSeasonPlan(claimed, 1);
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), `\uFEFF${JSON.stringify(sampleEpisodeInput(1))}`, "utf8");
+
+    await assert.rejects(() => finalizeAndCompleteSeasonPack(claimed, rootDir), /UTF-8|BOM|encoding/i);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("season finalization rejects output changed between post-exit stability reads", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createSeasonPackCodexJob({ script: "One requested segment.", episodeCount: 1 }, { rootDir });
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir });
+    assert.ok(claimed);
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 1, generatedEpisodes: [1] }), "utf8");
+    writeLockedSeasonPlan(claimed, 1);
+    const episodePath = path.join(claimed.episodesDir, "episode-001.json");
+    writeFileSync(episodePath, JSON.stringify(sampleEpisodeInput(1)), "utf8");
+    await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "executing", { rootDir });
+    const finalizing = await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "finalizing", { rootDir });
+    const mutation = setTimeout(() => {
+      try {
+        writeFileSync(episodePath, JSON.stringify(sampleEpisodeInput(1, { title: "Changed after exit" })), "utf8");
+      } catch {
+        // A premature publication is the behavior this red test is designed to expose.
+      }
+    }, 10);
+
+    await assert.rejects(
+      () => finalizeSeasonPackCodexJobFiles(finalizing, { rootDir, codexExitCode: 0, stabilityDelayMs: 75 }),
+      /changed|stable|hash/i,
+    );
+    clearTimeout(mutation);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

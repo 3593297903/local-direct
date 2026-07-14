@@ -106,6 +106,12 @@ type PublishFinalizedJobInput = CodexFinalizationIdentity & {
   renameImpl?: (source: string, destination: string) => Promise<void>;
 };
 
+type StableFinalizationFilesInput = {
+  directory: string;
+  relativePaths: string[];
+  delayMs?: number;
+};
+
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const TRANSIENT_WINDOWS_FILE_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 const FINALIZATION_RETRY_DELAYS_MS = [0, 50, 100, 200, 400, 800] as const;
@@ -306,6 +312,55 @@ export async function publishFinalizedJob(input: PublishFinalizedJobInput): Prom
   );
 }
 
+export function hashCanonicalJson(value: unknown) {
+  return sha256(JSON.stringify(sortCanonicalValue(value)));
+}
+
+export async function readStrictFinalizationJson(directory: string, relativePath: string) {
+  const root = path.resolve(directory);
+  const normalized = normalizeRelativeOutputPath(relativePath);
+  const target = assertPathInside(root, path.join(root, ...normalized.split("/")));
+  let text: string;
+  try {
+    text = await readStrictUtf8(target);
+  } catch (error) {
+    if (error instanceof CodexJobFinalizationError) throw error;
+    throw new CodexJobFinalizationError(
+      (error as NodeJS.ErrnoException).code === "ENOENT" ? "FINALIZATION_OUTPUT_MISSING" : "FINALIZATION_ENCODING_INVALID",
+      `Finalization JSON is missing or not strict UTF-8: ${normalized}`,
+      { cause: error },
+    );
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    throw new CodexJobFinalizationError(
+      "FINALIZATION_SCHEMA_INVALID",
+      `Finalization JSON is invalid: ${normalized}`,
+      { cause: error },
+    );
+  }
+}
+
+export async function assertFinalizationFilesStable(input: StableFinalizationFilesInput) {
+  const directory = path.resolve(input.directory);
+  const relativePaths = [...new Set(input.relativePaths.map(normalizeRelativeOutputPath))]
+    .sort((left, right) => left.localeCompare(right));
+  if (!relativePaths.length) {
+    throw new CodexJobFinalizationError("FINALIZATION_OUTPUT_MISSING", "Finalization stability check has no outputs");
+  }
+  const first = await snapshotFinalizationFiles(directory, relativePaths);
+  await wait(Math.max(0, input.delayMs ?? 25));
+  const second = await snapshotFinalizationFiles(directory, relativePaths);
+  if (JSON.stringify(first) !== JSON.stringify(second)) {
+    throw new CodexJobFinalizationError(
+      "FINALIZATION_HASH_MISMATCH",
+      "Finalization output changed between post-exit stability reads",
+    );
+  }
+  return second;
+}
+
 function validateIdentity(identity: Omit<CodexFinalizationIdentity, "rootDir" | "namespace">) {
   assertSafePathComponent(identity.jobId, "jobId");
   assertSafePathComponent(identity.leaseId, "leaseId");
@@ -430,6 +485,25 @@ function normalizeSegmentIndexes(value: number[]) {
   return indexes;
 }
 
+async function snapshotFinalizationFiles(directory: string, relativePaths: string[]) {
+  return Promise.all(relativePaths.map(async (relativePath) => {
+    const target = assertPathInside(directory, path.join(directory, ...relativePath.split("/")));
+    let bytes: Buffer;
+    try {
+      const info = await stat(target);
+      if (!info.isFile() || info.size <= 0) throw new Error("not a non-empty file");
+      bytes = await readFile(target);
+    } catch (error) {
+      throw new CodexJobFinalizationError(
+        "FINALIZATION_OUTPUT_MISSING",
+        `Finalization output is missing or empty: ${relativePath}`,
+        { cause: error },
+      );
+    }
+    return { relativePath, byteLength: bytes.byteLength, sha256: sha256(bytes) };
+  }));
+}
+
 function assertSafePathComponent(value: string, field: string) {
   if (typeof value !== "string" || !value || value !== path.basename(value) || value === "." || value === "..") {
     throw new CodexJobFinalizationError("FINALIZATION_SCHEMA_INVALID", `Finalization ${field} is invalid`);
@@ -458,6 +532,16 @@ async function readStrictUtf8(target: string) {
 
 function sha256(value: Uint8Array | string) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function sortCanonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortCanonicalValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => [key, sortCanonicalValue(nested)]),
+  );
 }
 
 function wait(delayMs: number) {

@@ -2,10 +2,19 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
 import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
 import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
+
+process.env.TS_NODE_COMPILER_OPTIONS ||= JSON.stringify({ module: "commonjs", moduleResolution: "node" });
+const require = createRequire(import.meta.url);
+require("ts-node/register/transpile-only");
+const {
+  finalizeSeasonPackCodexJobFiles,
+  updateSeasonPackCodexJobStage,
+} = require("../lib/season-pack-codex-queue.ts");
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.SEASON_PACK_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -49,13 +58,38 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed season pack job ${task.id} (${task.episodeCount} episodes).`);
   try {
-    await withCodexCliSlot("primary", task.id, () => runCodex(task));
-    await assertSeasonPackOutput(task);
-    await completeTask(task);
+    let activeTask = await updateSeasonPackCodexJobStage(
+      task.id,
+      task.leaseId,
+      task.fencingToken,
+      "waiting_slot",
+      { rootDir },
+    );
+    await withCodexCliSlot("primary", task.id, async () => {
+      activeTask = await updateSeasonPackCodexJobStage(
+        task.id,
+        task.leaseId,
+        task.fencingToken,
+        "executing",
+        { rootDir },
+      );
+      await runCodex(activeTask);
+    });
+    await assertSeasonPackOutput(activeTask);
+    activeTask = await updateSeasonPackCodexJobStage(
+      task.id,
+      task.leaseId,
+      task.fencingToken,
+      "finalizing",
+      { rootDir },
+    );
+    const finalized = await finalizeSeasonPackCodexJobFiles(activeTask, { rootDir, codexExitCode: 0 });
+    await completeTask(activeTask, finalized.resultRef);
     console.log(`Completed season pack job ${task.id}: ${task.packDir}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await failTask(task, message).catch((failError) => {
+    const errorCode = typeof error?.code === "string" ? error.code : undefined;
+    await failTask(task, message, errorCode).catch((failError) => {
       console.error(`Could not report failed season pack job ${task.id}:`, failError);
     });
     console.error(`Season pack job ${task.id} failed: ${message}`);
@@ -67,12 +101,21 @@ async function claimTask() {
   return data.task || null;
 }
 
-async function completeTask(task) {
-  await postJson(`/api/season-pack/jobs/${encodeURIComponent(task.id)}/complete`, {});
+async function completeTask(task, resultRef) {
+  await postJson(`/api/season-pack/jobs/${encodeURIComponent(task.id)}/complete`, {
+    leaseId: task.leaseId,
+    fencingToken: task.fencingToken,
+    resultRef,
+  });
 }
 
-async function failTask(task, message) {
-  await postJson(`/api/season-pack/jobs/${encodeURIComponent(task.id)}/fail`, { message });
+async function failTask(task, message, errorCode) {
+  await postJson(`/api/season-pack/jobs/${encodeURIComponent(task.id)}/fail`, {
+    leaseId: task.leaseId,
+    fencingToken: task.fencingToken,
+    message,
+    errorCode,
+  });
 }
 
 async function postJson(pathname, body) {
@@ -80,6 +123,7 @@ async function postJson(pathname, body) {
     method: "POST",
     headers: {
       "content-type": "application/json",
+      "x-worker-id": `season-pack-${process.pid}`,
       ...(workerToken ? { "x-season-pack-codex-token": workerToken } : {}),
     },
     body: JSON.stringify(body),
@@ -141,7 +185,7 @@ async function runCodex(task) {
       clearTimeout(timeout);
       reject(new Error(buildCodexFailureMessage(error.message, capturedOutput)));
     });
-    child.on("exit", (code) => {
+    child.on("close", (code) => {
       clearTimeout(timeout);
       if (timedOut) return;
       if (code === 0) resolve();
