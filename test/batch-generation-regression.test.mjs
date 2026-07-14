@@ -752,12 +752,30 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
       id: "job-duplicate",
       completedAt: "2026-07-13T00:00:07.000Z",
     });
+    await writeJson(path.join(queueRoot, "completed", "job-identity.json"), {
+      ...baseJob,
+      id: "job-identity",
+      segmentIndexes: [2],
+    });
     await writeJson(path.join(queueRoot, "completed", "job-orphan.json"), {
       ...baseJob,
       id: "job-orphan",
       sourceHash: "orphan-source",
       contractHash: "orphan-contract",
       segmentIndexes: [3],
+    });
+    await writeJson(path.join(queueRoot, "completed", "job-recent.json"), {
+      ...baseJob,
+      id: "job-recent",
+      sourceHash: "orphan-source",
+      contractHash: "orphan-contract",
+      segmentIndexes: [4],
+    });
+    await writeJson(path.join(queueRoot, "completed", "job-incomplete.json"), {
+      ...baseJob,
+      id: "job-incomplete",
+      contractHash: "",
+      segmentIndexes: [],
     });
     await writeJson(path.join(queueRoot, "failed", "job-stable-error.json"), {
       ...baseJob,
@@ -794,19 +812,42 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
       startedAt: "2026-07-13T00:00:03.000Z",
       completedAt: "2026-07-13T00:00:07.000Z",
     });
+    const identityReferencedResult = {
+      episodeIndex: 2,
+      title: "身份引用合成结果",
+      workflow: { fullVideoPrompt: "PRIVATE_IDENTITY_PROMPT_MARKER" },
+    };
     const completeResult = path.join(resultRoot, "job-complete", "episode-001.json");
     await writeJson(completeResult, {
       jobId: "job-complete",
       title: "合成结果",
       workflow: { fullVideoPrompt: "PRIVATE_PROMPT_MARKER" },
     });
-    await writeJson(path.join(resultRoot, "job-orphan", "episode-003.json"), {
-      jobId: "job-orphan",
+    const identityResultPath = path.join(resultRoot, "job-identity", "episode-002.json");
+    await writeJson(identityResultPath, identityReferencedResult);
+    const orphanResultPath = path.join(resultRoot, "job-orphan", "episode-003.json");
+    await writeJson(orphanResultPath, {
       title: "孤立合成结果",
       workflow: { fullVideoPrompt: "PRIVATE_ORPHAN_PROMPT_MARKER" },
     });
-    await writeJson(path.join(resultRoot, "job-result-without-job", "episode-004.json"), {
+    const recentResultPath = path.join(resultRoot, "job-recent", "episode-004.json");
+    await writeJson(recentResultPath, {
+      episodeIndex: 4,
+      title: "近期合成结果",
+      workflow: { fullVideoPrompt: "PRIVATE_RECENT_PROMPT_MARKER" },
+    });
+    const incompleteResultPath = path.join(resultRoot, "job-incomplete", "episode-006.json");
+    await writeJson(incompleteResultPath, {
+      title: "身份不完整合成结果",
+      workflow: { fullVideoPrompt: "PRIVATE_INCOMPLETE_PROMPT_MARKER" },
+    });
+    const resultWithoutJobPath = path.join(resultRoot, "job-result-without-job", "episode-007.json");
+    await writeJson(resultWithoutJobPath, {
       jobId: "job-result-without-job",
+      status: "completed",
+      sourceHash: "no-cache-source",
+      contractHash: "no-cache-contract",
+      segmentIndex: 7,
       title: "无任务结果",
       workflow: { fullVideoPrompt: "PRIVATE_RESULT_WITHOUT_JOB_MARKER" },
     });
@@ -817,12 +858,12 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
       durableBatchId: "batch-fixture",
       sourceHash: "synthetic-source",
       contractHash: "synthetic-contract",
-      resolvedSegmentCount: 2,
+      resolvedSegmentCount: 4,
       updatedAt: "2026-07-13T00:00:10.000Z",
       segmentStates: [{ index: 1, activeRepairJobId: "job-worker-started" }],
       activeJobIds: ["job-complete"],
       qualityReports: [],
-      segments: [],
+      segments: [{ episodeIndex: 2, status: "cached", result: identityReferencedResult }],
       needsReviewSegments: [],
       invocationEvents: [
         { name: "renderPackCalls", at: 1, count: 2, jobId: "job-complete" },
@@ -831,6 +872,22 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
         { name: "judgeCalls", at: 4, count: 1 },
         { name: "localPatchOperations", at: 5, count: 4 },
       ],
+    });
+    await writeJson(path.join(cacheRoot, "batch-orphan-scope.json"), {
+      schemaVersion: 2,
+      revision: 1,
+      batchId: "batch-orphan-scope",
+      durableBatchId: "batch-orphan-scope",
+      sourceHash: "orphan-source",
+      contractHash: "orphan-contract",
+      resolvedSegmentCount: 4,
+      updatedAt: "2026-07-13T00:00:10.000Z",
+      segmentStates: [],
+      activeJobIds: [],
+      qualityReports: [],
+      segments: [],
+      needsReviewSegments: [],
+      invocationEvents: [],
     });
     await writeJson(path.join(cacheRoot, "old-analyzer-report.json"), {
       schemaVersion: 1,
@@ -844,7 +901,13 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
       jobId: "job-orphan",
       prompt: "PRIVATE_EXCLUDED_EVIDENCE_MARKER",
     });
+    const referenceTime = Date.now();
     await utimes(completeResult, new Date("2026-07-13T00:00:20.000Z"), new Date("2026-07-13T00:00:20.000Z"));
+    await utimes(identityResultPath, new Date(referenceTime - 30 * 60_000), new Date(referenceTime - 30 * 60_000));
+    await utimes(orphanResultPath, new Date(referenceTime - 20 * 60_000), new Date(referenceTime - 20 * 60_000));
+    await utimes(recentResultPath, new Date(referenceTime - 60_000), new Date(referenceTime - 60_000));
+    await utimes(incompleteResultPath, new Date(referenceTime - 30 * 60_000), new Date(referenceTime - 30 * 60_000));
+    await utimes(resultWithoutJobPath, new Date(referenceTime - 30 * 60_000), new Date(referenceTime - 30 * 60_000));
     const sourceSnapshotsBefore = new Map(
       await Promise.all(
         sourceFiles.map(async (file) => {
@@ -881,7 +944,7 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
       ".tmp-video-prompt-codex",
       ".tmp-video-prompt-pack-codex",
     ]);
-    assert.equal(report.statusCounts.completed, 4);
+    assert.equal(report.statusCounts.completed, 7);
     assert.equal(report.statusCounts.failed, 2);
     assert.equal(report.statusCounts.running, 1);
     assert.equal(report.failures.CODEX_TIMEOUT, 1);
@@ -889,17 +952,65 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
     assert.equal(report.duplicates.length, 1);
     assert.equal(report.completedBeforeFinalOutput.some((item) => item.jobId === "job-complete"), true);
     assert.equal(report.resultWithoutJob.some((item) => item.jobId === "job-result-without-job"), true);
+    assert.deepEqual(report.completedResultReferenceSummary, {
+      referenced: 2,
+      orphan: 1,
+      unknown: 3,
+    });
     assert.equal(
-      report.matchingCompletedResults.some(
-        (item) => item.jobId === "job-orphan" && item.referenceStatus === "unknown",
+      report.referencedCompletedResults.some(
+        (item) => item.jobId === "job-complete" && item.reasonCode === "referenced_exact_job_id",
       ),
       true,
     );
-    assert.equal(report.orphanCompletedResults.some((item) => item.jobId === "job-orphan"), false);
+    assert.equal(
+      report.referencedCompletedResults.some(
+        (item) => item.jobId === "job-identity" && item.reasonCode === "referenced_result_identity",
+      ),
+      true,
+    );
+    assert.equal(
+      report.orphanCompletedResults.some(
+        (item) => item.jobId === "job-orphan" && item.reasonCode === "orphan_unreferenced_complete_identity",
+      ),
+      true,
+    );
+    assert.equal(
+      report.unknownCompletedResults.some(
+        (item) => item.jobId === "job-recent" && item.reasonCode === "unknown_recent_result",
+      ),
+      true,
+    );
+    assert.equal(
+      report.unknownCompletedResults.some(
+        (item) => item.jobId === "job-incomplete" && item.reasonCode === "unknown_incomplete_identity",
+      ),
+      true,
+    );
+    assert.equal(
+      report.unknownCompletedResults.some(
+        (item) => item.jobId === "job-result-without-job" && item.reasonCode === "unknown_no_durable_cache_scope",
+      ),
+      true,
+    );
+    assert.equal(
+      report.matchingCompletedResults.length,
+      report.completedResultReferenceSummary.referenced
+        + report.completedResultReferenceSummary.orphan
+        + report.completedResultReferenceSummary.unknown,
+    );
+    assert.equal(
+      new Set([
+        ...report.referencedCompletedResults,
+        ...report.orphanCompletedResults,
+        ...report.unknownCompletedResults,
+      ].map((item) => item.resultPath)).size,
+      report.matchingCompletedResults.length,
+    );
     assert.ok(report.timingsByTaskClass.render_pack.queueWaitMs.unknown >= 1);
     assert.ok(report.timingsByTaskClass.render_pack.claimWaitSupplementMs.count >= 1);
     assert.ok(report.timingsByTaskClass.render_pack.workerWallSupplementMs.count >= 1);
-    assert.equal(report.modelInvocationCounts.render_pack, 5);
+    assert.equal(report.modelInvocationCounts.render_pack, 8);
     assert.equal(report.historicalInvocationCounts.renderPackCalls.known, 2);
     assert.equal(report.historicalInvocationCounts.singleRegenerationCalls.known, 1);
     assert.equal(report.historicalInvocationCounts.pathPatchJobCreated.known, 3);
@@ -909,7 +1020,7 @@ test("real-artifact analyzer is read-only, redacts prompt bodies and preserves u
     assert.ok(report.historicalInvocationCounts.pathPatchCompleted.unknown >= 1);
     assert.doesNotMatch(
       serialized,
-      /PRIVATE_(?:ERROR|ORPHAN_|RESULT_WITHOUT_JOB_|STALE_REPORT_|EXCLUDED_EVIDENCE_)?(?:PROMPT_)?MARKER/,
+      /PRIVATE_[A-Z_]*MARKER/,
     );
     assert.equal(serialized.includes("excluded-fake-job"), false);
     assert.equal(JSON.parse(await readFile(outputPath, "utf8")).schemaVersion, 1);

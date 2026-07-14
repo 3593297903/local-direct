@@ -15,6 +15,7 @@ const ARTIFACT_SCAN_ROOTS = Object.freeze([
   ".tmp-video-prompt-pack-codex",
 ]);
 const ARTIFACT_SCAN_ROOT_SET = new Set(ARTIFACT_SCAN_ROOTS);
+const RESULT_REFERENCE_GRACE_MS = 10 * 60 * 1000;
 const INVOCATION_METRIC_NAMES = Object.freeze([
   "renderPackCalls",
   "singleRegenerationCalls",
@@ -189,28 +190,112 @@ function isDurableSegmentBatchCache(value) {
     && Array.isArray(value.needsReviewSegments);
 }
 
+function canonicalizeForHash(value) {
+  if (Array.isArray(value)) return value.map(canonicalizeForHash);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort((left, right) => left.localeCompare(right))
+      .map((key) => [key, canonicalizeForHash(value[key])]),
+  );
+}
+
+function canonicalResultHash(value) {
+  return sha256(JSON.stringify(canonicalizeForHash(value)));
+}
+
+function durableScopeKey(sourceHash, contractHash) {
+  return `${sourceHash}|${contractHash}`;
+}
+
+function durableResultIdentityKey(sourceHash, contractHash, segmentIndex, resultHash) {
+  return `${durableScopeKey(sourceHash, contractHash)}|${segmentIndex}|${resultHash}`;
+}
+
+function recordJobId(value, references) {
+  const id = cleanString(value);
+  if (id) references.add(id);
+}
+
+function collectExplicitJobIds(value, references, key = "", seen = new WeakSet()) {
+  if (typeof value === "string") {
+    if (/jobids?$/i.test(key)) recordJobId(value, references);
+    return;
+  }
+  if (Array.isArray(value)) {
+    if (/jobids$/i.test(key)) {
+      for (const candidate of value) recordJobId(candidate, references);
+      return;
+    }
+    for (const item of value) collectExplicitJobIds(item, references, key, seen);
+    return;
+  }
+  if (!isRecord(value) || seen.has(value)) return;
+  seen.add(value);
+  for (const [childKey, childValue] of Object.entries(value)) {
+    collectExplicitJobIds(childValue, references, childKey, seen);
+  }
+}
+
+function cacheSegmentIndex(value) {
+  if (!isRecord(value)) return null;
+  for (const candidate of [value.episodeIndex, value.segmentIndex, value.index]) {
+    const index = Number(candidate);
+    if (Number.isInteger(index) && index > 0) return index;
+  }
+  return null;
+}
+
+function cacheResultHashes(value) {
+  if (!isRecord(value)) return [];
+  const hashes = new Set();
+  for (const candidate of [value.resultHash, value.canonicalResultHash]) {
+    const hash = cleanString(candidate);
+    if (hash) hashes.add(hash);
+  }
+  if (isRecord(value.result) || Array.isArray(value.result)) {
+    hashes.add(canonicalResultHash(value.result));
+    hashes.add(sha256(JSON.stringify(value.result)));
+  }
+  return [...hashes];
+}
+
+function collectCachedResultIdentities(value, referenceIndex) {
+  const sourceHash = cleanString(value.sourceHash);
+  const contractHash = cleanString(value.contractHash);
+  if (!sourceHash || !contractHash) return;
+  referenceIndex.scopes.add(durableScopeKey(sourceHash, contractHash));
+
+  for (const collectionName of ["segmentStates", "segments", "needsReviewSegments"]) {
+    const collection = Array.isArray(value[collectionName]) ? value[collectionName] : [];
+    for (const item of collection) {
+      const index = cacheSegmentIndex(item);
+      if (index === null) continue;
+      for (const resultHash of cacheResultHashes(item)) {
+        referenceIndex.resultIdentities.add(
+          durableResultIdentityKey(sourceHash, contractHash, index, resultHash),
+        );
+      }
+    }
+  }
+}
+
 function createHistoricalInvocationCounts() {
   return Object.fromEntries(
     INVOCATION_METRIC_NAMES.map((name) => [name, { known: 0, unknown: 0, samples: 0 }]),
   );
 }
 
-function collectDurableCacheEvidence(value, references, historicalCounts) {
-  for (const candidate of value.activeJobIds) {
-    const id = cleanString(candidate);
-    if (id) references.add(id);
-  }
-  for (const state of value.segmentStates) {
-    const id = cleanString(isRecord(state) ? state.activeRepairJobId : "");
-    if (id) references.add(id);
-  }
+function collectDurableCacheEvidence(value, referenceIndex, historicalCounts) {
+  collectExplicitJobIds(value.activeJobIds, referenceIndex.jobIds, "activeJobIds");
+  collectExplicitJobIds(value.segmentStates, referenceIndex.jobIds, "segmentStates");
+  collectExplicitJobIds(value.repairAttempts, referenceIndex.jobIds, "repairAttempts");
+  collectExplicitJobIds(value.segments, referenceIndex.jobIds, "segments");
+  collectExplicitJobIds(value.needsReviewSegments, referenceIndex.jobIds, "needsReviewSegments");
+  collectCachedResultIdentities(value, referenceIndex);
 
   const events = Array.isArray(value.invocationEvents) ? value.invocationEvents : [];
-  for (const event of events) {
-    if (!isRecord(event)) continue;
-    const id = cleanString(event.jobId);
-    if (id) references.add(id);
-  }
+  collectExplicitJobIds(events, referenceIndex.jobIds, "invocationEvents");
   for (const name of INVOCATION_METRIC_NAMES) {
     const matching = events.filter((event) => isRecord(event) && event.name === name);
     if (matching.length === 0) {
@@ -227,6 +312,85 @@ function collectDurableCacheEvidence(value, references, historicalCounts) {
       historicalCounts[name].samples += 1;
     }
   }
+}
+
+function resultSegmentIndex(result, job) {
+  for (const candidate of [result.value.segmentIndex, result.value.episodeIndex, result.value.index]) {
+    const index = Number(candidate);
+    if (Number.isInteger(index) && index > 0) return index;
+  }
+  const fileMatch = path.basename(result.path).match(/(?:episode|segment)[-_]?(\d+)/i);
+  if (fileMatch) return Number(fileMatch[1]);
+  const indexes = job ? segmentIndexes(job.value) : [];
+  return indexes.length === 1 ? indexes[0] : null;
+}
+
+function buildCompletedResultIdentity(result, job) {
+  const sourceHash = cleanString(result.value.sourceHash || job?.value.sourceHash);
+  const contractHash = cleanString(
+    result.value.contractHash
+      || result.value.batchContractHash
+      || job?.value.contractHash
+      || job?.value.batchContractHash,
+  );
+  const segmentIndex = resultSegmentIndex(result, job);
+  const complete = Boolean(sourceHash && contractHash && segmentIndex !== null);
+  const identityKey = complete
+    ? durableResultIdentityKey(sourceHash, contractHash, segmentIndex, result.canonicalSha256)
+    : null;
+  const compactIdentityKey = complete
+    ? durableResultIdentityKey(sourceHash, contractHash, segmentIndex, result.compactSha256)
+    : null;
+  return {
+    complete,
+    sourceHash,
+    contractHash,
+    segmentIndex,
+    scopeKey: sourceHash && contractHash ? durableScopeKey(sourceHash, contractHash) : null,
+    identityKey,
+    compactIdentityKey,
+    identityHash: sha256([
+      sourceHash || "?",
+      contractHash || "?",
+      segmentIndex ?? "?",
+      result.canonicalSha256,
+    ].join("|")),
+  };
+}
+
+function completionEvidence(result, job) {
+  const jobCompletedAt = timestamp(job?.value.completedAt);
+  const resultCompletedAt = timestamp(result.value.completedAt);
+  return {
+    completedAtMs: Math.max(
+      result.mtimeMs,
+      jobCompletedAt ?? Number.NEGATIVE_INFINITY,
+      resultCompletedAt ?? Number.NEGATIVE_INFINITY,
+    ),
+    outputModifiedAfterCompletionMs: jobCompletedAt === null || jobCompletedAt === undefined
+      ? null
+      : Math.round(result.mtimeMs - jobCompletedAt),
+  };
+}
+
+function completedResultReportItem(result, identity, reasonCode, referenceTimeMs, completion) {
+  return {
+    jobId: result.jobId || null,
+    resultPath: result.path,
+    resultSha256: result.sha256,
+    resultBytes: result.bytes,
+    identityHash: identity.identityHash,
+    reasonCode,
+    ageFromCompletionMs: Math.max(0, Math.round(referenceTimeMs - completion.completedAtMs)),
+    outputModifiedAfterCompletionMs: completion.outputModifiedAfterCompletionMs,
+  };
+}
+
+function sortCompletedResultItems(items) {
+  return items.sort((left, right) => (
+    String(left.jobId).localeCompare(String(right.jobId))
+      || left.resultPath.localeCompare(right.resultPath)
+  ));
 }
 
 function segmentIndexes(value) {
@@ -269,10 +433,15 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
   const files = await listJsonFiles(absoluteRoot, excludedFiles);
   const jobs = [];
   const results = [];
-  const referencedJobIds = new Set();
+  const durableReferenceIndex = {
+    jobIds: new Set(),
+    scopes: new Set(),
+    resultIdentities: new Set(),
+  };
   const historicalInvocationCounts = createHistoricalInvocationCounts();
   let durableCacheDocuments = 0;
   let ignoredCacheDocuments = 0;
+  let referenceTimeMs = 0;
   const parseErrors = [];
 
   for (const file of files) {
@@ -290,6 +459,7 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
     }
 
     const fileStat = await stat(file);
+    referenceTimeMs = Math.max(referenceTimeMs, fileStat.mtimeMs);
     if (isResultFile(file)) {
       const jobId = resultJobId(file, value);
       results.push({
@@ -297,7 +467,10 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
         path: relativeSafe(absoluteRoot, file),
         bytes: Buffer.byteLength(raw, "utf8"),
         sha256: sha256(raw),
+        canonicalSha256: canonicalResultHash(value),
+        compactSha256: sha256(JSON.stringify(value)),
         mtimeMs: fileStat.mtimeMs,
+        value,
       });
       continue;
     }
@@ -316,7 +489,7 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
     if (artifactRootName === ".tmp-segment-batch-cache") {
       if (isDurableSegmentBatchCache(value)) {
         durableCacheDocuments += 1;
-        collectDurableCacheEvidence(value, referencedJobIds, historicalInvocationCounts);
+        collectDurableCacheEvidence(value, durableReferenceIndex, historicalInvocationCounts);
       } else {
         ignoredCacheDocuments += 1;
       }
@@ -381,11 +554,23 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
   const matchingCompletedResults = [];
   const matchingNonCompletedResults = [];
   const resultWithoutJob = [];
+  const referencedCompletedResults = [];
+  const orphanCompletedResults = [];
+  const unknownCompletedResults = [];
   for (const result of results) {
     const job = jobsById.get(result.jobId);
-    if (job?.status === "completed") {
-      const completedAt = timestamp(job.value.completedAt);
-      if (completedAt !== null && result.mtimeMs > completedAt) {
+    if (!job) {
+      resultWithoutJob.push({
+        jobId: result.jobId || null,
+        resultPath: result.path,
+        resultSha256: result.sha256,
+        resultBytes: result.bytes,
+      });
+    }
+    const completedWithoutJob = !job && cleanString(result.value.status).toLowerCase() === "completed";
+    if (job?.status === "completed" || completedWithoutJob) {
+      const completedAt = timestamp(job?.value.completedAt);
+      if (job && completedAt !== null && result.mtimeMs > completedAt) {
         completedBeforeFinalOutput.push({
           jobId: result.jobId,
           resultPath: result.path,
@@ -394,13 +579,47 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
           outputModifiedAfterCompletionMs: Math.round(result.mtimeMs - completedAt),
         });
       }
-      matchingCompletedResults.push({
-        jobId: result.jobId,
-        resultPath: result.path,
-        resultSha256: result.sha256,
-        resultBytes: result.bytes,
-        referenceStatus: referencedJobIds.has(result.jobId) ? "referenced" : "unknown",
-      });
+      const identity = buildCompletedResultIdentity(result, job);
+      const completion = completionEvidence(result, job);
+      const ageFromCompletionMs = Math.max(0, referenceTimeMs - completion.completedAtMs);
+      let referenceStatus;
+      let reasonCode;
+      if (result.jobId && durableReferenceIndex.jobIds.has(result.jobId)) {
+        referenceStatus = "referenced";
+        reasonCode = "referenced_exact_job_id";
+      } else if (
+        identity.complete
+        && (
+          durableReferenceIndex.resultIdentities.has(identity.identityKey)
+          || durableReferenceIndex.resultIdentities.has(identity.compactIdentityKey)
+        )
+      ) {
+        referenceStatus = "referenced";
+        reasonCode = "referenced_result_identity";
+      } else if (ageFromCompletionMs < RESULT_REFERENCE_GRACE_MS) {
+        referenceStatus = "unknown";
+        reasonCode = "unknown_recent_result";
+      } else if (!identity.complete) {
+        referenceStatus = "unknown";
+        reasonCode = "unknown_incomplete_identity";
+      } else if (!identity.scopeKey || !durableReferenceIndex.scopes.has(identity.scopeKey)) {
+        referenceStatus = "unknown";
+        reasonCode = "unknown_no_durable_cache_scope";
+      } else {
+        referenceStatus = "orphan";
+        reasonCode = "orphan_unreferenced_complete_identity";
+      }
+      const reportItem = completedResultReportItem(
+        result,
+        identity,
+        reasonCode,
+        referenceTimeMs,
+        completion,
+      );
+      if (referenceStatus === "referenced") referencedCompletedResults.push(reportItem);
+      else if (referenceStatus === "orphan") orphanCompletedResults.push(reportItem);
+      else unknownCompletedResults.push(reportItem);
+      matchingCompletedResults.push({ ...reportItem, referenceStatus });
     } else if (job) {
       matchingNonCompletedResults.push({
         jobId: result.jobId,
@@ -408,17 +627,28 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
         resultPath: result.path,
         resultSha256: result.sha256,
         resultBytes: result.bytes,
-        referenceStatus: referencedJobIds.has(result.jobId) ? "referenced" : "unknown",
-      });
-    } else {
-      resultWithoutJob.push({
-        jobId: result.jobId || null,
-        resultPath: result.path,
-        resultSha256: result.sha256,
-        resultBytes: result.bytes,
+        referenceStatus: durableReferenceIndex.jobIds.has(result.jobId) ? "referenced" : "unknown",
       });
     }
   }
+
+  sortCompletedResultItems(referencedCompletedResults);
+  sortCompletedResultItems(orphanCompletedResults);
+  sortCompletedResultItems(unknownCompletedResults);
+  sortCompletedResultItems(matchingCompletedResults);
+  const completedResultReferenceSummary = {
+    referenced: referencedCompletedResults.length,
+    orphan: orphanCompletedResults.length,
+    unknown: unknownCompletedResults.length,
+  };
+  const unknownCompletedResultReasonCounts = Object.fromEntries(
+    [...new Set(unknownCompletedResults.map((item) => item.reasonCode))]
+      .sort((left, right) => left.localeCompare(right))
+      .map((reasonCode) => [
+        reasonCode,
+        unknownCompletedResults.filter((item) => item.reasonCode === reasonCode).length,
+      ]),
+  );
 
   const report = {
     schemaVersion: 1,
@@ -439,10 +669,14 @@ export async function analyzeBatchJobArtifacts({ root, outputPath, allowExternal
     historicalInvocationCounts,
     duplicates,
     completedBeforeFinalOutput: completedBeforeFinalOutput.sort((left, right) => left.jobId.localeCompare(right.jobId)),
-    matchingCompletedResults: matchingCompletedResults.sort((left, right) => left.jobId.localeCompare(right.jobId)),
+    completedResultReferenceSummary,
+    referencedCompletedResults,
+    orphanCompletedResults,
+    unknownCompletedResults,
+    unknownCompletedResultReasonCounts,
+    matchingCompletedResults,
     matchingNonCompletedResults: matchingNonCompletedResults.sort((left, right) => left.jobId.localeCompare(right.jobId)),
     resultWithoutJob: resultWithoutJob.sort((left, right) => String(left.jobId).localeCompare(String(right.jobId))),
-    orphanCompletedResults: [],
     parseErrors,
   };
 
