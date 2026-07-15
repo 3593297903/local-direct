@@ -364,7 +364,7 @@ export async function getSeasonPackCodexJob(jobId: string, options: QueueOptions
   const rootDir = resolveRootDir(options);
   try {
     const job = normalizeStoredSeasonPackJob(await getFileJob<SeasonPackCodexJob>(rootDir, TASK_ROOT, jobId));
-    if (job.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION) return readLegacySeasonPackJob(rootDir, jobId);
+    if (job.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION) return readOnlyLegacySeasonPackJob(job);
     if (job.status !== "completed") {
       return { ...job, result: null, resultAvailable: false };
     }
@@ -1197,7 +1197,16 @@ function resetRecoveredSeasonPackJob(job: SeasonPackCodexJob): SeasonPackCodexJo
 }
 
 async function readLegacySeasonPackJob(rootDir: string, jobId: string) {
-  return normalizeStoredSeasonPackJob(await readJob(rootDir, jobId));
+  return readOnlyLegacySeasonPackJob(normalizeStoredSeasonPackJob(await readJob(rootDir, jobId)));
+}
+
+function readOnlyLegacySeasonPackJob(job: SeasonPackCodexJob): SeasonPackCodexJob {
+  if (job.status === "completed") return job;
+  return {
+    ...job,
+    result: null,
+    resultAvailable: false,
+  };
 }
 
 function mapSeasonFinalizationError(error: CodexJobFinalizationError) {

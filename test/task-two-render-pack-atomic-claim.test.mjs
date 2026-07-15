@@ -214,7 +214,7 @@ test("malformed jobs in running recover regardless of timeout or global worker h
   }
 });
 
-test("legacy running Render Pack jobs migrate to failed without automatic re-execution", async () => {
+test("legacy running Render Pack GET is read-only without automatic re-execution", async () => {
   const rootDir = path.join(os.tmpdir(), `localdirector-render-legacy-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   try {
     const created = await createVideoPromptPackCodexJob({
@@ -238,10 +238,12 @@ test("legacy running Render Pack jobs migrate to failed without automatic re-exe
     writeFileSync(pendingPath, JSON.stringify(legacy), "utf8");
     renameSync(pendingPath, legacyPath);
 
-    const migrated = await getVideoPromptPackCodexJob(created.id, { rootDir });
-    assert.equal(migrated.status, "failed");
-    assert.match(migrated.error, /not re-executed|Legacy running/i);
-    assert.equal(existsSync(legacyPath), false);
+    const before = readFileSync(legacyPath, "utf8");
+    const observed = await getVideoPromptPackCodexJob(created.id, { rootDir });
+    assert.equal(observed.status, "running");
+    assert.equal(observed.resultAvailable, false);
+    assert.equal(readFileSync(legacyPath, "utf8"), before);
+    assert.equal(existsSync(path.join(taskRoot, "failed", `${created.id}.json`)), false);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

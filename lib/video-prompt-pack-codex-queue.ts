@@ -262,7 +262,7 @@ export async function getVideoPromptPackCodexJob(jobId: string, options: QueueOp
   const rootDir = resolveRootDir(options);
   try {
     const job = normalizeStoredRenderPackJob(await getFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, jobId));
-    if (job.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION) return syncAndSaveJob(rootDir, job);
+    if (job.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION) return readOnlyLegacyVideoPromptPackJob(job);
     if (job.status !== "completed") {
       return { ...job, result: null, resultAvailable: false };
     }
@@ -1326,34 +1326,24 @@ async function readLegacyVideoPromptPackJob(rootDir: string, jobId: string) {
   const legacyDir = path.join(rootDir, TASK_ROOT, LEGACY_JOB_DIR);
   const legacyPath = path.join(legacyDir, `${fileSegment(jobId)}.json`);
   try {
-    const legacy = normalizeStoredRenderPackJob(
+    return readOnlyLegacyVideoPromptPackJob(normalizeStoredRenderPackJob(
       JSON.parse(await readFile(legacyPath, "utf8")) as VideoPromptPackCodexJob,
-    );
-    if (legacy.status !== "running") return legacy;
-
-    const failedAt = new Date().toISOString();
-    const failed = {
-      ...legacy,
-      status: "failed" as const,
-      stage: "failed" as const,
-      leaseId: null,
-      workerId: null,
-      resultAvailable: false,
-      result: null,
-      error: "Legacy running Render Pack was not re-executed automatically; create a new idempotent job to retry.",
-      errorCode: "FINALIZATION_LEGACY_RUNNING_ABORTED",
-      failedAt,
-      updatedAt: failedAt,
-    };
-    await atomicReplaceJson(renderPackStatePath(rootDir, "failed", failed.id), failed, { rootDir });
-    await rm(legacyPath, { force: true });
-    return failed;
+    ));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       throw new VideoPromptPackCodexQueueError("Video prompt render pack Codex job not found", "JOB_NOT_FOUND");
     }
     throw new VideoPromptPackCodexQueueError("Video prompt render pack legacy job could not be read", "RENDER_PACK_JOB_INVALID");
   }
+}
+
+function readOnlyLegacyVideoPromptPackJob(job: VideoPromptPackCodexJob): VideoPromptPackCodexJob {
+  if (job.status === "completed") return job;
+  return {
+    ...job,
+    result: null,
+    resultAvailable: false,
+  };
 }
 
 function validateCreateInput(input: CreateVideoPromptPackCodexJobInput) {
