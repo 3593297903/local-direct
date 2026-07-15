@@ -360,6 +360,7 @@ export async function claimNextSeasonPackCodexJob(options: ClaimOptions = {}) {
     runningTimeoutMs: options.runningTimeoutMs,
     workerId: options.workerId,
     canRecoverRunningJob: (job) => canRecoverSeasonPackJob(rootDir, job),
+    resetRecoveredRunningJob: resetRecoveredSeasonPackJob,
     canClaimPendingJob: (job) => normalizeStoredSeasonPackJob(job).protocolVersion === CODEX_FINALIZATION_PROTOCOL_VERSION,
   });
   if (!claimed) return null;
@@ -1132,9 +1133,34 @@ function seasonResultContractHash(result: SeasonPackCodexJobResult) {
 }
 
 async function canRecoverSeasonPackJob(rootDir: string, job: SeasonPackCodexJob) {
-  const runtime = await readCodexRuntimeHealth("season-pack", { rootDir, maxAgeMs: 90_000 });
+  if (!job.workerId) return true;
+  const runtime = await readCodexRuntimeHealth("season-pack", {
+    rootDir,
+    maxAgeMs: 90_000,
+    workerInstanceId: job.workerId,
+  });
   if (runtime.status === "healthy") return false;
   return true;
+}
+
+function resetRecoveredSeasonPackJob(job: SeasonPackCodexJob): SeasonPackCodexJob {
+  return {
+    ...job,
+    stage: "pending",
+    claimedAt: undefined,
+    waitingSlotAt: undefined,
+    executingAt: undefined,
+    finalizingAt: undefined,
+    completedAt: undefined,
+    stagingDir: null,
+    contractHash: null,
+    resolvedEpisodeCount: null,
+    resultRef: null,
+    resultAvailable: false,
+    result: null,
+    error: null,
+    errorCode: null,
+  };
 }
 
 async function readLegacySeasonPackJob(rootDir: string, jobId: string) {

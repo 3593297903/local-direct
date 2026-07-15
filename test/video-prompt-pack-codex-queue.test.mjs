@@ -67,6 +67,32 @@ function sampleAnalysisResult(title = "Segment result") {
   };
 }
 
+function writeWorkerHeartbeat(rootDir, workerName, workerInstanceId, pid = 777) {
+  const runtimeRoot = path.join(rootDir, ".tmp-codex-runtime");
+  const workerRoot = path.join(runtimeRoot, "workers");
+  mkdirSync(workerRoot, { recursive: true });
+  const runtimeFingerprint = "runtime-fingerprint";
+  const environment = {
+    schemaVersion: 1,
+    status: "healthy",
+    checkedAt: new Date().toISOString(),
+    codexVersion: "test",
+    runtimeFingerprint,
+    errors: [],
+  };
+  writeFileSync(path.join(runtimeRoot, "environment.json"), JSON.stringify(environment), "utf8");
+  writeFileSync(path.join(workerRoot, `${workerName}.${workerInstanceId}.json`), JSON.stringify({
+    schemaVersion: 1,
+    workerName,
+    workerInstanceId,
+    pid,
+    heartbeatAt: new Date().toISOString(),
+    runtimeFingerprint,
+    status: "healthy",
+    environment,
+  }), "utf8");
+}
+
 async function enterRenderPackFinalizing(claimed, rootDir) {
   await updateVideoPromptPackCodexJobStage(
     claimed.id,
@@ -741,7 +767,7 @@ test("claim sweep publishes a valid staging manifest and completes without anoth
   }
 });
 
-test("healthy Render Pack heartbeat protects staging without a final manifest", async () => {
+test("exact healthy Render Pack owner protects staging without a final manifest", async () => {
   const rootDir = makeTempRoot();
   try {
     await createVideoPromptPackCodexJob({
@@ -753,28 +779,8 @@ test("healthy Render Pack heartbeat protects staging without a final manifest", 
         duration: "12 seconds",
       }],
     }, { rootDir });
-    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir });
-    const runtimeRoot = path.join(rootDir, ".tmp-codex-runtime");
-    mkdirSync(path.join(runtimeRoot, "workers"), { recursive: true });
-    const runtimeFingerprint = "runtime-fingerprint";
-    const environment = {
-      schemaVersion: 1,
-      status: "healthy",
-      checkedAt: new Date().toISOString(),
-      codexVersion: "test",
-      runtimeFingerprint,
-      errors: [],
-    };
-    writeFileSync(path.join(runtimeRoot, "environment.json"), JSON.stringify(environment), "utf8");
-    writeFileSync(path.join(runtimeRoot, "workers", "video-prompt-pack.json"), JSON.stringify({
-      schemaVersion: 1,
-      workerName: "video-prompt-pack",
-      pid: process.pid,
-      heartbeatAt: new Date().toISOString(),
-      runtimeFingerprint,
-      status: "healthy",
-      environment,
-    }), "utf8");
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir, workerId: "render-owner-instance" });
+    writeWorkerHeartbeat(rootDir, "video-prompt-pack", "render-owner-instance");
     const runningPath = path.join(rootDir, ".tmp-video-prompt-pack-codex", "running", `${claimed.id}.json`);
     const running = JSON.parse(readFileSync(runningPath, "utf8"));
     const staleAt = new Date(Date.now() - 60_000).toISOString();
@@ -785,6 +791,65 @@ test("healthy Render Pack heartbeat protects staging without a final manifest", 
     const active = await getVideoPromptPackCodexJob(claimed.id, { rootDir });
     assert.equal(active.status, "running");
     assert.equal(active.fencingToken, claimed.fencingToken);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("new Render worker with reused PID reclaims only the stale previous owner", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "PID reuse recovery",
+        script: "The old worker crashed before producing a final manifest.",
+        renderInputScript: "Render one complete result after the stale lease is recovered.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const first = await claimNextVideoPromptPackCodexJob({ rootDir, workerId: "render-old-instance" });
+    writeWorkerHeartbeat(rootDir, "video-prompt-pack", "render-new-instance", 888);
+    const runningPath = path.join(rootDir, ".tmp-video-prompt-pack-codex", "running", `${first.id}.json`);
+    const running = JSON.parse(readFileSync(runningPath, "utf8"));
+    const staleAt = new Date(Date.now() - 120_000).toISOString();
+    writeFileSync(runningPath, JSON.stringify({
+      ...running,
+      stage: "executing",
+      heartbeatAt: staleAt,
+      updatedAt: staleAt,
+      waitingSlotAt: staleAt,
+      executingAt: staleAt,
+      finalizingAt: staleAt,
+    }, null, 2), "utf8");
+
+    const reclaimed = await claimNextVideoPromptPackCodexJob({
+      rootDir,
+      runningTimeoutMs: 1,
+      workerId: "render-new-instance",
+    });
+    assert.equal(reclaimed.id, first.id);
+    assert.equal(reclaimed.workerId, "render-new-instance");
+    assert.equal(reclaimed.fencingToken, first.fencingToken + 1);
+    assert.notEqual(reclaimed.stagingDir, first.stagingDir);
+    assert.equal(reclaimed.waitingSlotAt, undefined);
+    assert.equal(reclaimed.executingAt, undefined);
+    assert.equal(reclaimed.finalizingAt, undefined);
+    assert.equal(reclaimed.resultRef, null);
+
+    await assert.rejects(
+      () => failVideoPromptPackCodexJob(first.id, first.leaseId, first.fencingToken, "stale", "TEST", { rootDir }),
+      (error) => error?.code === "FINALIZATION_STALE_FENCE",
+    );
+    await assert.rejects(
+      () => completeVideoPromptPackCodexJob(first.id, first.leaseId, first.fencingToken, {
+        protocolVersion: 2,
+        resultHash: "a".repeat(64),
+        relativePath: "results/stale/result",
+        manifestRelativePath: "results/stale/result/final-manifest.v2.json",
+      }, { rootDir }),
+      (error) => error?.code === "FINALIZATION_STALE_FENCE",
+    );
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

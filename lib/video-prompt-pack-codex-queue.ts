@@ -272,6 +272,7 @@ export async function claimNextVideoPromptPackCodexJob(options: ClaimOptions = {
     runningTimeoutMs: options.runningTimeoutMs,
     workerId: options.workerId,
     canRecoverRunningJob: (job) => canRecoverRenderPackJob(rootDir, job, options.runningTimeoutMs),
+    resetRecoveredRunningJob: resetRecoveredRenderPackJob,
     canClaimPendingJob: (job) => normalizeStoredRenderPackJob(job).protocolVersion === CODEX_FINALIZATION_PROTOCOL_VERSION,
   });
   if (!claimed) return null;
@@ -1250,21 +1251,34 @@ async function canRecoverRenderPackJob(
   job: VideoPromptPackCodexJob,
   runningTimeoutMs = 0,
 ) {
+  if (!job.workerId) return true;
   const runtime = await readCodexRuntimeHealth("video-prompt-pack", {
     rootDir,
     maxAgeMs: Math.min(Math.max(30_000, Math.floor(runningTimeoutMs / 4)), 90_000),
+    workerInstanceId: job.workerId,
   });
   if (runtime.status === "healthy") return false;
-  const recentWindowMs = Math.min(Math.max(30_000, Math.floor(runningTimeoutMs / 3)), 5 * 60_000);
-  for (const segment of job.segments) {
-    try {
-      const outputStat = await stat(segment.outputPath);
-      if (Date.now() - outputStat.mtimeMs < recentWindowMs) return false;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
   return true;
+}
+
+function resetRecoveredRenderPackJob(job: VideoPromptPackCodexJob): VideoPromptPackCodexJob {
+  return {
+    ...job,
+    stage: "pending",
+    claimedAt: undefined,
+    waitingSlotAt: undefined,
+    executingAt: undefined,
+    codexExitedAt: undefined,
+    finalizingAt: undefined,
+    completedAt: undefined,
+    failedAt: undefined,
+    stagingDir: null,
+    resultRef: null,
+    resultAvailable: false,
+    result: null,
+    error: null,
+    errorCode: null,
+  };
 }
 
 async function persistRenderPackState(

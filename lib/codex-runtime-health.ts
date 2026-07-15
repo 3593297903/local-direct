@@ -13,6 +13,7 @@ export type CodexRuntimeEnvironmentHealth = {
 export type CodexWorkerHeartbeat = {
   schemaVersion: 1;
   workerName: string;
+  workerInstanceId?: string;
   pid: number;
   heartbeatAt: string;
   runtimeFingerprint: string;
@@ -22,14 +23,14 @@ export type CodexWorkerHeartbeat = {
 
 export async function readCodexRuntimeHealth(
   workerName: string,
-  options: { rootDir?: string; maxAgeMs?: number; now?: number } = {},
+  options: { rootDir?: string; maxAgeMs?: number; now?: number; workerInstanceId?: string } = {},
 ) {
   const rootDir = path.resolve(options.rootDir || process.cwd());
   const maxAgeMs = options.maxAgeMs ?? 60_000;
   const now = options.now ?? Date.now();
   const runtimeRoot = path.join(rootDir, ".tmp-codex-runtime");
   const normalizedWorkerName = normalizeWorkerName(workerName);
-  const worker = await readLatestWorkerHeartbeat(runtimeRoot, normalizedWorkerName);
+  const worker = await readLatestWorkerHeartbeat(runtimeRoot, normalizedWorkerName, options.workerInstanceId);
   const environment = worker?.environment
     || await readJson<CodexRuntimeEnvironmentHealth>(path.join(runtimeRoot, "environment.json"));
   if (!environment) return { status: "missing" as const, environment: null, worker };
@@ -48,7 +49,7 @@ export async function readCodexRuntimeHealth(
   return { status: "healthy" as const, environment, worker, heartbeatAgeMs };
 }
 
-async function readLatestWorkerHeartbeat(runtimeRoot: string, workerName: string) {
+async function readLatestWorkerHeartbeat(runtimeRoot: string, workerName: string, workerInstanceId?: string) {
   const workerRoot = path.join(runtimeRoot, "workers");
   const candidates: CodexWorkerHeartbeat[] = [];
   try {
@@ -57,7 +58,10 @@ async function readLatestWorkerHeartbeat(runtimeRoot: string, workerName: string
       if (fileName !== `${workerName}.json` && !fileName.startsWith(`${workerName}.`)) continue;
       if (!fileName.endsWith(".json")) continue;
       const worker = await readJson<CodexWorkerHeartbeat>(path.join(workerRoot, fileName));
-      if (worker?.workerName === workerName) candidates.push(worker);
+      if (
+        worker?.workerName === workerName
+        && (!workerInstanceId || worker.workerInstanceId === workerInstanceId)
+      ) candidates.push(worker);
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;

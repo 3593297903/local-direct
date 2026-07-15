@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -22,14 +23,16 @@ const idleLogMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_IDLE_LOG_M
 const taskTimeoutMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_TASK_TIMEOUT_MS, 30 * 60_000);
 const concurrency = Math.max(1, Math.min(4, positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_CONCURRENCY, 4)));
 const workerToken = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_TOKEN || "";
-const workerId = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_ID || `video-prompt-pack-${process.pid}`;
+const workerInstanceId = `${
+  process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_ID?.trim() || `video-prompt-pack-${process.pid}`
+}-${randomUUID()}`.toLowerCase();
 const messageDir = path.join(rootDir, ".tmp-video-prompt-pack-codex", "codex-messages");
 const workerLock = await acquireWorkerFleetLock("video-prompt-pack-worker", { rootDir });
 if (!workerLock.acquired) {
   console.log(`Video prompt Render Pack worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
   process.exit(0);
 }
-const runtimeHealth = await startCodexWorkerRuntimeHealth("video-prompt-pack", { rootDir });
+const runtimeHealth = await startCodexWorkerRuntimeHealth("video-prompt-pack", { rootDir, workerInstanceId });
 installWorkerShutdown(workerLock);
 
 console.log("Local Director video prompt Render Pack Codex worker started.");
@@ -159,7 +162,7 @@ async function postJson(pathname, body) {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-worker-id": workerId,
+          "x-worker-id": workerInstanceId,
           ...(workerToken ? { "x-video-prompt-pack-codex-token": workerToken } : {}),
         },
         body: JSON.stringify(body),

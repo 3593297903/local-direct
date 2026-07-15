@@ -220,6 +220,7 @@ export async function claimNextFileJob<T extends FileJobRecord>(
     runningTimeoutMs?: number;
     workerId?: string;
     canRecoverRunningJob?: (job: T) => boolean | Promise<boolean>;
+    resetRecoveredRunningJob?: (job: T) => T;
     canClaimPendingJob?: (job: T) => boolean | Promise<boolean>;
     claimLeaseWriteOptions?: Omit<AtomicReplaceJsonOptions, "rootDir">;
   } = {},
@@ -230,6 +231,7 @@ export async function claimNextFileJob<T extends FileJobRecord>(
     namespace,
     options.runningTimeoutMs,
     options.canRecoverRunningJob,
+    options.resetRecoveredRunningJob,
   );
   await recoverStaleClaimLocks(rootDir, namespace);
   const pendingDir = stateDir(rootDir, namespace, "pending");
@@ -422,6 +424,7 @@ async function recoverStaleFileJobs<T extends FileJobRecord>(
   namespace: string,
   runningTimeoutMs = 0,
   canRecoverRunningJob?: (job: T) => boolean | Promise<boolean>,
+  resetRecoveredRunningJob?: (job: T) => T,
 ) {
   const runningDir = stateDir(rootDir, namespace, "running");
   const entries = (await readdir(runningDir, { withFileTypes: true }))
@@ -443,7 +446,10 @@ async function recoverStaleFileJobs<T extends FileJobRecord>(
       }
       const hasValidRunningLease = job.status === "running" && Boolean(job.leaseId);
       if (!hasValidRunningLease) {
-        const recovered = buildRecoveredPendingJob(job);
+        const recovered = applyRecoveredRunningJobReset(
+          buildRecoveredPendingJob(job),
+          resetRecoveredRunningJob,
+        );
         await writeJobFile(rootDir, runningPath, recovered);
         await renameWithRetry(runningPath, path.join(stateDir(rootDir, namespace, "pending"), entry.name));
         continue;
@@ -452,7 +458,10 @@ async function recoverStaleFileJobs<T extends FileJobRecord>(
       const heartbeatAt = Date.parse(job.heartbeatAt || job.startedAt || job.updatedAt);
       if (!Number.isFinite(heartbeatAt) || Date.now() - heartbeatAt < runningTimeoutMs) continue;
       if (canRecoverRunningJob && !(await canRecoverRunningJob(job))) continue;
-      const recovered = buildRecoveredPendingJob(job);
+      const recovered = applyRecoveredRunningJobReset(
+        buildRecoveredPendingJob(job),
+        resetRecoveredRunningJob,
+      );
       await writeJobFile(rootDir, runningPath, recovered);
       await renameWithRetry(runningPath, path.join(stateDir(rootDir, namespace, "pending"), entry.name));
     } finally {
@@ -493,6 +502,13 @@ function buildRecoveredPendingJob<T extends FileJobRecord>(job: T) {
     startedAt: undefined,
     updatedAt: new Date().toISOString(),
   } as T;
+}
+
+function applyRecoveredRunningJobReset<T extends FileJobRecord>(
+  job: T,
+  resetRecoveredRunningJob?: (job: T) => T,
+) {
+  return resetRecoveredRunningJob ? resetRecoveredRunningJob(job) : job;
 }
 
 async function recoverStaleClaimLocks(rootDir: string, namespace: string, staleMs = 60_000) {

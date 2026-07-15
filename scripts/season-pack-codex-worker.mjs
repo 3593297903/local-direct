@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -22,13 +23,16 @@ const pollMs = positiveInteger(process.env.SEASON_PACK_CODEX_POLL_MS, 2500);
 const idleLogMs = positiveInteger(process.env.SEASON_PACK_CODEX_IDLE_LOG_MS, 30_000);
 const taskTimeoutMs = positiveInteger(process.env.SEASON_PACK_CODEX_TASK_TIMEOUT_MS, 60 * 60_000);
 const workerToken = process.env.SEASON_PACK_CODEX_WORKER_TOKEN || "";
+const workerInstanceId = `${
+  process.env.SEASON_PACK_CODEX_WORKER_ID?.trim() || `season-pack-${process.pid}`
+}-${randomUUID()}`.toLowerCase();
 const messageDir = path.join(rootDir, ".tmp-season-pack-codex", "codex-messages");
 const workerLock = await acquireWorkerFleetLock("season-pack-worker", { rootDir });
 if (!workerLock.acquired) {
   console.log(`Season pack worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
   process.exit(0);
 }
-const runtimeHealth = await startCodexWorkerRuntimeHealth("season-pack", { rootDir });
+const runtimeHealth = await startCodexWorkerRuntimeHealth("season-pack", { rootDir, workerInstanceId });
 installWorkerShutdown(workerLock);
 
 console.log("Local Director season pack Codex worker started.");
@@ -138,7 +142,7 @@ async function postJson(pathname, body) {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-worker-id": `season-pack-${process.pid}`,
+          "x-worker-id": workerInstanceId,
           ...(workerToken ? { "x-season-pack-codex-token": workerToken } : {}),
         },
         body: JSON.stringify(body),

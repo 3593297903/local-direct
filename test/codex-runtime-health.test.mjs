@@ -150,6 +150,52 @@ test("Codex runtime reader selects the freshest heartbeat for duplicate worker i
   }
 });
 
+test("Codex runtime reader can target the exact worker instance across PID reuse", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "localdirector-runtime-owner-"));
+  try {
+    const runtimeRoot = path.join(root, ".tmp-codex-runtime");
+    const workerRoot = path.join(runtimeRoot, "workers");
+    await mkdir(workerRoot, { recursive: true });
+    const health = {
+      schemaVersion: 1,
+      status: "healthy",
+      checkedAt: "2026-07-10T01:00:00.000Z",
+      codexVersion: "codex-cli-test",
+      configRoot: root,
+      skillRoots: [],
+      skillCount: 0,
+      runtimeFingerprint: "fingerprint-owner",
+      errors: [],
+    };
+    await writeCodexRuntimeEnvironmentHealth({ rootDir: root, health });
+    await writeFile(path.join(workerRoot, "season-pack.new-instance.json"), JSON.stringify({
+      schemaVersion: 1,
+      workerName: "season-pack",
+      workerInstanceId: "season-pack-new-instance",
+      pid: 777,
+      heartbeatAt: new Date().toISOString(),
+      runtimeFingerprint: "fingerprint-owner",
+      status: "healthy",
+      environment: health,
+    }), "utf8");
+
+    const current = await readCodexRuntimeHealth({
+      rootDir: root,
+      workerName: "season-pack",
+      workerInstanceId: "season-pack-new-instance",
+    });
+    const replaced = await readCodexRuntimeHealth({
+      rootDir: root,
+      workerName: "season-pack",
+      workerInstanceId: "season-pack-old-instance",
+    });
+    assert.equal(current.worker?.workerInstanceId, "season-pack-new-instance");
+    assert.equal(replaced.worker, null, "a reused PID must not make a different worker instance healthy");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("legacy single-file worker heartbeat remains readable during upgrade", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "localdirector-runtime-legacy-worker-"));
   try {
@@ -236,5 +282,6 @@ test("Codex runtime health API and workers use the shared preflight", async () =
   assert.match(route, /readCodexRuntimeHealth/);
   assert.match(route, /CODEX_SKILL_CONFIG_INVALID/);
   assert.match(seasonWorker, /startCodexWorkerRuntimeHealth/);
+  assert.match(seasonWorker, /workerInstanceId/);
   assert.equal(packageJson.scripts["codex:runtime-check"], "node scripts/codex-runtime-check.mjs");
 });

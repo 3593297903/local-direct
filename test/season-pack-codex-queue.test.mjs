@@ -135,6 +135,32 @@ function writeLockedSeasonPlan(claimed, episodeCount, options = {}) {
   );
 }
 
+function writeWorkerHeartbeat(rootDir, workerName, workerInstanceId, pid = 777) {
+  const runtimeRoot = path.join(rootDir, ".tmp-codex-runtime");
+  const workerRoot = path.join(runtimeRoot, "workers");
+  mkdirSync(workerRoot, { recursive: true });
+  const runtimeFingerprint = "runtime-fingerprint";
+  const environment = {
+    schemaVersion: 1,
+    status: "healthy",
+    checkedAt: new Date().toISOString(),
+    codexVersion: "test",
+    runtimeFingerprint,
+    errors: [],
+  };
+  writeFileSync(path.join(runtimeRoot, "environment.json"), JSON.stringify(environment), "utf8");
+  writeFileSync(path.join(workerRoot, `${workerName}.${workerInstanceId}.json`), JSON.stringify({
+    schemaVersion: 1,
+    workerName,
+    workerInstanceId,
+    pid,
+    heartbeatAt: new Date().toISOString(),
+    runtimeFingerprint,
+    status: "healthy",
+    environment,
+  }), "utf8");
+}
+
 async function finalizeAndCompleteSeasonPack(claimed, rootDir) {
   if (!existsSync(claimed.manifestPath) && claimed.episodeCount > 0) {
     const generatedEpisodes = Array.from({ length: claimed.episodeCount }, (_, index) => index + 1);
@@ -1256,6 +1282,44 @@ test("claim sweep completes a published Season Pack finalization without another
     assert.equal(recovered.resultAvailable, true);
     assert.equal(recovered.resultRef.resultHash, finalized.resultRef.resultHash);
     assert.equal(recovered.attempt, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("unrelated healthy Season worker does not protect a stale lease owned by another instance", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createSeasonPackCodexJob({ script: "Recover the stale owner only.", episodeCount: 1 }, { rootDir });
+    const first = await claimNextSeasonPackCodexJob({ rootDir, workerId: "season-pack-old-instance" });
+    writeWorkerHeartbeat(rootDir, "season-pack", "season-pack-new-instance", 777);
+    const runningPath = path.join(rootDir, ".tmp-season-pack-codex", "running", `${first.id}.json`);
+    const running = JSON.parse(readFileSync(runningPath, "utf8"));
+    const staleAt = new Date(Date.now() - 120_000).toISOString();
+    writeFileSync(runningPath, JSON.stringify({
+      ...running,
+      stage: "executing",
+      heartbeatAt: staleAt,
+      updatedAt: staleAt,
+      waitingSlotAt: staleAt,
+      executingAt: staleAt,
+    }, null, 2), "utf8");
+
+    const reclaimed = await claimNextSeasonPackCodexJob({
+      rootDir,
+      runningTimeoutMs: 1,
+      workerId: "season-pack-new-instance",
+    });
+    assert.equal(reclaimed.id, first.id);
+    assert.equal(reclaimed.workerId, "season-pack-new-instance");
+    assert.equal(reclaimed.fencingToken, first.fencingToken + 1);
+    assert.equal(reclaimed.waitingSlotAt, undefined);
+    assert.equal(reclaimed.executingAt, undefined);
+
+    await assert.rejects(
+      () => failSeasonPackCodexJob(first.id, first.leaseId, first.fencingToken, "stale", "TEST", { rootDir }),
+      (error) => error?.code === "FINALIZATION_STALE_FENCE",
+    );
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
