@@ -116,7 +116,7 @@ async function processTask(task) {
       console.warn(`Discarded stale Render Pack lease for ${task.id}; a newer worker owns the job.`);
       return;
     }
-    if (outputReady && isTransientWorkerRequestError(error)) {
+    if (outputReady) {
       console.warn(`Render Pack output for ${task.id} is complete; completion will be reconciled from disk: ${message}`);
       return;
     }
@@ -176,7 +176,7 @@ async function postJson(pathname, body) {
       response.status,
       response.status >= 500,
     );
-    if (requestError.errorCode !== "JOB_STORAGE_BUSY" || attempt === retryDelaysMs.length - 1) {
+    if (!requestError.transient || attempt === retryDelaysMs.length - 1) {
       throw requestError;
     }
   }
@@ -191,10 +191,6 @@ class WorkerRequestError extends Error {
     this.status = status;
     this.transient = transient || errorCode === "JOB_STORAGE_BUSY";
   }
-}
-
-function isTransientWorkerRequestError(error) {
-  return error instanceof WorkerRequestError && error.transient;
 }
 
 function buildCodexPrompt(task) {

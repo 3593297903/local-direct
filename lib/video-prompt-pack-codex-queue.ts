@@ -492,6 +492,14 @@ export async function failVideoPromptPackCodexJob(
   if (job.status !== "running") {
     throw new VideoPromptPackCodexQueueError("Completed Render Pack cannot be failed", "JOB_ALREADY_COMPLETED");
   }
+  if (job.stage === "finalizing" && job.resultRef) {
+    try {
+      await validatePublishedRenderPackJob(rootDir, job);
+      return job;
+    } catch {
+      // Invalid or incomplete publications remain eligible for an explicit failure.
+    }
+  }
   const updated = applyJobStatus({
     ...job,
     status: "failed",

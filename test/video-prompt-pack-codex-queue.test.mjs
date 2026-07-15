@@ -16,8 +16,10 @@ const {
   claimNextVideoPromptPackCodexJob,
   completeVideoPromptPackCodexJob,
   createVideoPromptPackCodexJob,
+  failVideoPromptPackCodexJob,
   finalizeVideoPromptPackCodexJobFiles,
   getVideoPromptPackCodexJob,
+  recoverFinalizedVideoPromptPackCodexJobs,
   updateVideoPromptPackCodexJobStage,
 } = require("../lib/video-prompt-pack-codex-queue.ts");
 
@@ -129,6 +131,55 @@ test("protocol v2 render packs never complete from a parseable intermediate file
     assert.equal(observed.status, "running");
     assert.equal(observed.resultAvailable, false);
     assert.equal(observed.result, null);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("published Render Pack cannot be failed after completion transport outage", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "Published render segment",
+        script: "Published render output must survive a temporary complete API outage.",
+        renderInputScript: "Render one complete segment result with all required fields.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir, workerId: "render-instance-a" });
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(
+      claimed.segments[0].outputPath,
+      JSON.stringify(sampleAnalysisResult("Published render segment"), null, 2),
+      "utf8",
+    );
+    const finalizing = await enterRenderPackFinalizing(claimed, rootDir);
+    const finalized = await finalizeVideoPromptPackCodexJobFiles(finalizing, {
+      rootDir,
+      codexExitCode: 0,
+      stabilityDelayMs: 0,
+    });
+
+    const protectedJob = await failVideoPromptPackCodexJob(
+      claimed.id,
+      claimed.leaseId,
+      claimed.fencingToken,
+      "Complete API returned 500",
+      "JOB_STORAGE_BUSY",
+      { rootDir },
+    );
+    assert.equal(protectedJob.status, "running");
+    assert.equal(protectedJob.stage, "finalizing");
+    assert.equal(protectedJob.resultRef.resultHash, finalized.resultRef.resultHash);
+    assert.equal(protectedJob.resultAvailable, false);
+
+    assert.equal(await recoverFinalizedVideoPromptPackCodexJobs(rootDir, 1), 1);
+    const recovered = await getVideoPromptPackCodexJob(claimed.id, { rootDir });
+    assert.equal(recovered.status, "completed");
+    assert.equal(recovered.resultAvailable, true);
+    assert.equal(recovered.attempt, 1, "published recovery must not invoke Codex again");
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

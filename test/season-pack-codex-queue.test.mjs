@@ -16,9 +16,11 @@ const {
   claimNextSeasonPackCodexJob,
   completeSeasonPackCodexJob,
   createSeasonPackCodexJob,
+  failSeasonPackCodexJob,
   failPendingSeasonPackCodexJob,
   finalizeSeasonPackCodexJobFiles,
   getSeasonPackCodexJob,
+  recoverFinalizedSeasonPackCodexJobs,
   toSeasonPackCodexJobStatusDto,
   updateSeasonPackCodexJobStage,
 } = require("../lib/season-pack-codex-queue.ts");
@@ -996,6 +998,64 @@ test("does not complete a season pack job when an expected episode file is missi
       () => finalizeAndCompleteSeasonPack(claimed, rootDir),
       /episode-002\.json/,
     );
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("published Season Pack survives completion transport failure and recovers without another Codex attempt", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createSeasonPackCodexJob({
+      script: "A published season plan must survive a temporary completion outage.",
+      episodeCount: 1,
+      duration: "15 seconds",
+    }, { rootDir });
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, workerId: "season-instance-a" });
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeFileSync(claimed.manifestPath, JSON.stringify({ episodeCount: 1, generatedEpisodes: [1] }, null, 2), "utf8");
+    writeLockedSeasonPlan(claimed, 1, {
+      titles: [sampleEpisodeInput(1).title],
+      sourceTexts: [sampleEpisodeInput(1).sourceText],
+    });
+    writeFileSync(path.join(claimed.episodesDir, "episode-001.json"), JSON.stringify(sampleEpisodeInput(1), null, 2), "utf8");
+    await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "executing", { rootDir });
+    const finalizing = await updateSeasonPackCodexJobStage(
+      claimed.id,
+      claimed.leaseId,
+      claimed.fencingToken,
+      "finalizing",
+      { rootDir },
+    );
+    const finalized = await finalizeSeasonPackCodexJobFiles(finalizing, {
+      rootDir,
+      codexExitCode: 0,
+      stabilityDelayMs: 0,
+    });
+
+    const protectedJob = await failSeasonPackCodexJob(
+      claimed.id,
+      claimed.leaseId,
+      claimed.fencingToken,
+      "Complete API returned 500",
+      "JOB_STORAGE_BUSY",
+      { rootDir },
+    );
+    assert.equal(protectedJob.status, "running");
+    assert.equal(protectedJob.stage, "finalizing");
+    assert.equal(protectedJob.resultRef.resultHash, finalized.resultRef.resultHash);
+    assert.equal(protectedJob.resultAvailable, false);
+
+    const beforeRecovery = await getSeasonPackCodexJob(claimed.id, { rootDir });
+    assert.equal(beforeRecovery.status, "running");
+    assert.equal(beforeRecovery.resultAvailable, false);
+    assert.equal(beforeRecovery.attempt, 1);
+
+    assert.equal(await recoverFinalizedSeasonPackCodexJobs(rootDir), 1);
+    const recovered = await getSeasonPackCodexJob(claimed.id, { rootDir });
+    assert.equal(recovered.status, "completed");
+    assert.equal(recovered.resultAvailable, true);
+    assert.equal(recovered.attempt, 1, "published recovery must not invoke Codex again");
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

@@ -57,6 +57,7 @@ while (true) {
 
 async function processTask(task) {
   console.log(`Claimed season pack job ${task.id} (${task.episodeCount} episodes).`);
+  let outputReady = false;
   try {
     let activeTask = await updateSeasonPackCodexJobStage(
       task.id,
@@ -84,11 +85,20 @@ async function processTask(task) {
       { rootDir },
     );
     const finalized = await finalizeSeasonPackCodexJobFiles(activeTask, { rootDir, codexExitCode: 0 });
+    outputReady = true;
     await completeTask(activeTask, finalized.resultRef);
     console.log(`Completed season pack job ${task.id}: ${task.packDir}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const errorCode = typeof error?.code === "string" ? error.code : undefined;
+    const errorCode = typeof error?.code === "string" ? error.code : error?.errorCode;
+    if (errorCode === "JOB_LEASE_LOST" || errorCode === "FINALIZATION_STALE_FENCE") {
+      console.warn(`Discarded stale Season Pack lease for ${task.id}; a newer worker owns the job.`);
+      return;
+    }
+    if (outputReady) {
+      console.warn(`Season Pack output for ${task.id} is complete; completion will be reconciled from disk: ${message}`);
+      return;
+    }
     await failTask(task, message, errorCode).catch((failError) => {
       console.error(`Could not report failed season pack job ${task.id}:`, failError);
     });
@@ -119,20 +129,45 @@ async function failTask(task, message, errorCode) {
 }
 
 async function postJson(pathname, body) {
-  const response = await fetch(`${apiBaseUrl}${pathname}`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-worker-id": `season-pack-${process.pid}`,
-      ...(workerToken ? { "x-season-pack-codex-token": workerToken } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await response.json().catch(() => null);
-  if (!response.ok || !data?.ok) {
-    throw new Error(data?.error || `Season pack Codex worker request failed: ${response.status}`);
+  const retryDelaysMs = [0, 25, 75, 200, 500];
+  for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
+    if (retryDelaysMs[attempt]) await delay(retryDelaysMs[attempt]);
+    let response;
+    try {
+      response = await fetch(`${apiBaseUrl}${pathname}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-worker-id": `season-pack-${process.pid}`,
+          ...(workerToken ? { "x-season-pack-codex-token": workerToken } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (error) {
+      if (attempt < retryDelaysMs.length - 1) continue;
+      throw new WorkerRequestError(error instanceof Error ? error.message : "Season Pack API is unavailable", null, 0, true);
+    }
+    const data = await response.json().catch(() => null);
+    if (response.ok && data?.ok) return data;
+    const requestError = new WorkerRequestError(
+      data?.error || `Season pack Codex worker request failed: ${response.status}`,
+      data?.errorCode || data?.code,
+      response.status,
+      response.status >= 500,
+    );
+    if (!requestError.transient || attempt === retryDelaysMs.length - 1) throw requestError;
   }
-  return data;
+  throw new WorkerRequestError("Season Pack request retry budget exhausted", "JOB_STORAGE_BUSY", 503, true);
+}
+
+class WorkerRequestError extends Error {
+  constructor(message, errorCode, status, transient = false) {
+    super(message);
+    this.name = "WorkerRequestError";
+    this.errorCode = errorCode || null;
+    this.status = status;
+    this.transient = transient || errorCode === "JOB_STORAGE_BUSY";
+  }
 }
 
 function buildCodexPrompt(task) {

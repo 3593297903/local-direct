@@ -562,6 +562,14 @@ export async function failSeasonPackCodexJob(
   if (job.status !== "running") {
     throw new SeasonPackCodexQueueError("Completed Season Pack cannot be failed", "JOB_ALREADY_COMPLETED");
   }
+  if (job.stage === "finalizing" && job.resultRef) {
+    try {
+      await validatePublishedSeasonPackJob(rootDir, job);
+      return job;
+    } catch {
+      // Only a fully validated immutable publication is protected from failure.
+    }
+  }
   const updated: SeasonPackCodexJob = {
     ...job,
     status: "failed",
