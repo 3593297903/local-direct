@@ -50,6 +50,9 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
     action,
     queue: selectedQueue,
     modelCalls: 0,
+    judgeCalls: 0,
+    repairCalls: 0,
+    fallbackCalls: 0,
     counts: {
       pending: 0,
       running: 0,
@@ -63,6 +66,8 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
       invalidOwnerSkipped: 0,
       reconciled: 0,
       identityMismatch: 0,
+      actionConflict: 0,
+      stateConflict: 0,
       terminalSkipped: 0,
     },
     jobs: [],
@@ -108,6 +113,33 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
       }
     }
 
+    const intent = resolvePersistedMigrationIntent(record, existing, action);
+    if (intent.status === "state-conflict") {
+      markMigrationConflict(
+        report,
+        reportEntry,
+        "stateConflict",
+        "FINALIZATION_V1_MIGRATION_STATE_CONFLICT",
+        intent.error,
+      );
+      continue;
+    }
+    const persistedIdentityError = validatePersistedReplacementIdentity(record, existing, sourceMigration, intent);
+    if (persistedIdentityError) {
+      markIdentityMismatch(report, reportEntry, persistedIdentityError);
+      continue;
+    }
+    if (intent.status === "action-conflict") {
+      markMigrationConflict(
+        report,
+        reportEntry,
+        "actionConflict",
+        "FINALIZATION_V1_ACTION_CONFLICT",
+        intent.error,
+      );
+      continue;
+    }
+
     if (action === "requeue") {
       const expectedReplacementId = deterministicReplacementId(record);
       const referencedReplacementId = existing?.newJobId || sourceMigration?.replacementJobId || null;
@@ -140,9 +172,11 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
         terminalSource = await terminalizeLegacyRecord(rootDir, record, "requeue", replacement.id);
         await options.testHooks?.afterSourceTerminalized?.({ record, replacement, terminalSource });
       }
-      migrationMap.entries[mappingKey] = migrationMapEntry(record, "requeue", replacement.id, terminalSource);
-      await persistMigrationMap(rootDir, mappingPath, migrationMap);
-      await verifyMigratedRecord(rootDir, record, replacement, migrationMap.entries[mappingKey]);
+      if (!existing) {
+        migrationMap.entries[mappingKey] = migrationMapEntry(record, "requeue", replacement.id, terminalSource);
+        await persistMigrationMap(rootDir, mappingPath, migrationMap);
+      }
+      await verifyMigratedRecord(rootDir, record, replacement, migrationMap.entries[mappingKey] || existing);
 
       if ((existing && sourceWasActive) || (sourceMigration && !existing)) {
         report.counts.reconciled += 1;
@@ -158,19 +192,28 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
       continue;
     }
 
-    if (sourceMigration || existing) {
-      migrationMap.entries[mappingKey] = migrationMapEntry(record, "fail", null, record.job);
+    const sourceWasActive = record.status === "pending" || record.status === "running";
+    let terminalSource = record.job;
+    if (!sourceMigration || sourceWasActive) {
+      terminalSource = await terminalizeLegacyRecord(rootDir, record, "fail", null);
+      await options.testHooks?.afterSourceTerminalized?.({ record, replacement: null, terminalSource });
+    }
+    if (!existing) {
+      migrationMap.entries[mappingKey] = migrationMapEntry(record, "fail", null, terminalSource);
       await persistMigrationMap(rootDir, mappingPath, migrationMap);
+    }
+    await verifyFailedMigrationRecord(rootDir, record, migrationMap.entries[mappingKey] || existing);
+
+    if ((existing && sourceWasActive) || (sourceMigration && !existing)) {
+      report.counts.reconciled += 1;
+      reportEntry.decision = "reconciled";
+    } else if (existing || sourceMigration) {
       report.counts.alreadyMigrated += 1;
       reportEntry.decision = "already-migrated";
-      continue;
+    } else {
+      report.counts.failedByMigration += 1;
+      reportEntry.decision = "failed";
     }
-    const terminalSource = await terminalizeLegacyRecord(rootDir, record, "fail", null);
-    await options.testHooks?.afterSourceTerminalized?.({ record, replacement: null, terminalSource });
-    migrationMap.entries[mappingKey] = migrationMapEntry(record, "fail", null, terminalSource);
-    await persistMigrationMap(rootDir, mappingPath, migrationMap);
-    report.counts.failedByMigration += 1;
-    reportEntry.decision = "failed";
   }
   return report;
 }
@@ -349,6 +392,69 @@ function readSourceMigration(job) {
   };
 }
 
+export function resolvePersistedMigrationIntent(record, existingMapEntry, requestedAction) {
+  const sourceMigration = readSourceMigration(record?.job);
+  const rawSourceAction = record?.job?.legacyMigrationAction;
+  const sourceActionPresent = rawSourceAction !== undefined && rawSourceAction !== null && rawSourceAction !== "";
+  const sourceAction = normalizePersistedAction(rawSourceAction);
+  const mapAction = normalizePersistedAction(existingMapEntry?.action);
+
+  if ((sourceActionPresent && !sourceAction) || (existingMapEntry && !mapAction)) {
+    return {
+      status: "state-conflict",
+      persistedAction: sourceAction || mapAction,
+      replacementJobId: existingMapEntry?.newJobId || sourceMigration?.replacementJobId || null,
+      error: "Persisted migration state contains an invalid or missing action",
+    };
+  }
+  if (sourceAction && mapAction && sourceAction !== mapAction) {
+    return {
+      status: "state-conflict",
+      persistedAction: null,
+      replacementJobId: existingMapEntry?.newJobId || sourceMigration?.replacementJobId || null,
+      error: `Source migration action ${sourceAction} conflicts with map action ${mapAction}`,
+    };
+  }
+
+  const persistedAction = sourceAction || mapAction || null;
+  if (persistedAction && persistedAction !== requestedAction) {
+    return {
+      status: "action-conflict",
+      persistedAction,
+      replacementJobId: existingMapEntry?.newJobId || sourceMigration?.replacementJobId || null,
+      error: `Requested migration action ${requestedAction} conflicts with persisted action ${persistedAction}`,
+    };
+  }
+  return {
+    status: persistedAction ? "same-action" : "new",
+    persistedAction,
+    replacementJobId: existingMapEntry?.newJobId || sourceMigration?.replacementJobId || null,
+  };
+}
+
+function normalizePersistedAction(value) {
+  const action = String(value || "").trim().toLowerCase();
+  return action === "requeue" || action === "fail" ? action : null;
+}
+
+function validatePersistedReplacementIdentity(record, existingMapEntry, sourceMigration, intent) {
+  if (!intent.persistedAction) return null;
+  const references = [];
+  if (existingMapEntry) references.push({ label: "migration map", value: existingMapEntry.newJobId ?? null });
+  if (sourceMigration) references.push({ label: "source audit", value: sourceMigration.replacementJobId ?? null });
+
+  if (intent.persistedAction === "fail") {
+    const invalid = references.find((reference) => reference.value !== null);
+    return invalid ? `${invalid.label} contains a replacement for a persisted fail action` : null;
+  }
+
+  const expectedReplacementId = deterministicReplacementId(record);
+  const invalid = references.find((reference) => reference.value !== expectedReplacementId);
+  return invalid
+    ? `${invalid.label} does not reference the deterministic replacement job`
+    : null;
+}
+
 function deterministicReplacementId(record) {
   if (record.queue.key === "season") {
     return `season-pack-job-${createHash("sha256").update(`finalization-v1:${record.job.id}`).digest("hex").slice(0, 32)}`;
@@ -391,6 +497,29 @@ async function verifyMigratedRecord(rootDir, record, replacement, mapEntry) {
   }
 }
 
+async function verifyFailedMigrationRecord(rootDir, record, mapEntry) {
+  if (mapEntry?.action !== "fail" || mapEntry.newJobId !== null) {
+    throw identityMismatchError("Failed migration map must preserve action=fail and a null replacement identity");
+  }
+  const failedPath = path.join(rootDir, record.queue.namespace, "failed", `${record.job.id}.json`);
+  const source = await readJsonFile(failedPath);
+  if (
+    source?.legacyMigrationState !== "source_terminalized"
+    || source.legacyMigrationAction !== "fail"
+    || source.replacementJobId !== null
+    || source.errorCode !== "FINALIZATION_V1_MIGRATED_FAILED"
+  ) {
+    throw new Error("Failed legacy migration source terminalization could not be verified");
+  }
+  for (const activePath of legacyActivePaths(rootDir, record)) {
+    if (path.resolve(activePath) === path.resolve(failedPath)) continue;
+    const active = await readJsonFile(activePath);
+    if (active?.id === record.job.id && Number(active.protocolVersion) !== 2) {
+      throw new Error("Failed legacy migration source remains active after terminalization");
+    }
+  }
+}
+
 function identityMismatchError(message) {
   const error = new Error(message);
   error.code = "FINALIZATION_IDENTITY_MISMATCH";
@@ -406,6 +535,13 @@ function markIdentityMismatch(report, reportEntry, message) {
   reportEntry.decision = "manual-review";
   reportEntry.errorCode = "FINALIZATION_IDENTITY_MISMATCH";
   reportEntry.error = String(message || "Replacement identity mismatch");
+}
+
+function markMigrationConflict(report, reportEntry, countKey, errorCode, message) {
+  report.counts[countKey] += 1;
+  reportEntry.decision = "manual-review";
+  reportEntry.errorCode = errorCode;
+  reportEntry.error = String(message || "Persisted migration intent conflict");
 }
 
 async function readMigrationMap(target) {
@@ -464,7 +600,10 @@ function parseCliArguments(argv) {
 const isCli = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isCli) {
   migrateCodexFinalizationV1Jobs(parseCliArguments(process.argv.slice(2)))
-    .then((report) => process.stdout.write(`${JSON.stringify(report, null, 2)}\n`))
+    .then((report) => {
+      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      if (report.counts.actionConflict > 0 || report.counts.stateConflict > 0) process.exitCode = 1;
+    })
     .catch((error) => {
       process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = 1;

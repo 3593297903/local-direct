@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
@@ -79,6 +80,41 @@ function writeMigrationMap(rootDir, entries) {
     updatedAt: new Date().toISOString(),
     entries,
   }, null, 2)}\n`, "utf8");
+}
+
+function migrationMapPath(rootDir) {
+  return path.join(rootDir, ".tmp-codex-finalization-migration", "v1-migration-map.json");
+}
+
+function readMigrationMapBytes(rootDir) {
+  return readFileSync(migrationMapPath(rootDir), "utf8");
+}
+
+async function createActiveRequeueFixture(rootDir) {
+  const season = await createSeasonPackCodexJob({
+    script: "Persisted requeue intent must remain immutable.",
+    episodeCount: 1,
+  }, { rootDir });
+  const sourcePath = markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+  const replacement = await createSeasonPackCodexJob(
+    { script: season.script, episodeCount: 1 },
+    { rootDir, bypassV2CreatePause: true, migrationSourceJobId: season.id },
+  );
+  writeMigrationMap(rootDir, {
+    [`season:${season.id}`]: {
+      queue: "season",
+      oldJobId: season.id,
+      newJobId: replacement.id,
+      action: "requeue",
+      migratedAt: new Date().toISOString(),
+    },
+  });
+  return {
+    season,
+    replacement,
+    sourcePath,
+    replacementPath: path.join(rootDir, ".tmp-season-pack-codex", "pending", `${replacement.id}.json`),
+  };
 }
 
 test("v1 migration defaults to dry-run and does not modify queue files", async () => {
@@ -261,6 +297,147 @@ test("v1 requeue reconciles a legacy map whose source is still active", async ()
     assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 0);
     assert.equal(readFailedJob(rootDir, ".tmp-season-pack-codex", season.id).replacementJobId, replacement.id);
     assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 migration rejects requeue to fail action conflicts without changing bytes", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const fixture = await createActiveRequeueFixture(rootDir);
+    const before = {
+      source: readFileSync(fixture.sourcePath, "utf8"),
+      map: readMigrationMapBytes(rootDir),
+      replacement: readFileSync(fixture.replacementPath, "utf8"),
+    };
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+
+    assert.equal(report.counts.actionConflict, 1);
+    assert.equal(report.counts.stateConflict, 0);
+    assert.equal(report.modelCalls, 0);
+    assert.equal(report.jobs[0].decision, "manual-review");
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_ACTION_CONFLICT");
+    assert.equal(readFileSync(fixture.sourcePath, "utf8"), before.source);
+    assert.equal(readMigrationMapBytes(rootDir), before.map);
+    assert.equal(readFileSync(fixture.replacementPath, "utf8"), before.replacement);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", fixture.season.id), 1);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 migration rejects fail to requeue action conflicts for active and terminal sources", async () => {
+  for (const terminalized of [false, true]) {
+    const rootDir = makeTempRoot();
+    try {
+      const season = await createSeasonPackCodexJob({
+        script: `Persisted fail intent ${terminalized ? "terminal" : "active"}.`,
+        episodeCount: 1,
+      }, { rootDir });
+      markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+      const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+      if (terminalized) {
+        await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+      } else {
+        writeMigrationMap(rootDir, {
+          [`season:${season.id}`]: {
+            queue: "season",
+            oldJobId: season.id,
+            newJobId: null,
+            action: "fail",
+            migratedAt: new Date().toISOString(),
+          },
+        });
+      }
+      const before = snapshotFiles(rootDir);
+
+      const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+
+      assert.equal(report.counts.actionConflict, 1);
+      assert.equal(report.counts.stateConflict, 0);
+      assert.equal(report.modelCalls, 0);
+      assert.equal(report.jobs[0].decision, "manual-review");
+      assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_ACTION_CONFLICT");
+      assert.deepEqual(snapshotFiles(rootDir), before);
+      assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 0);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("v1 migration rejects a source and map action state conflict without changing bytes", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Conflicting persisted migration state.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+    await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+    const map = JSON.parse(readMigrationMapBytes(rootDir));
+    map.entries[`season:${season.id}`].action = "fail";
+    writeFileSync(migrationMapPath(rootDir), `${JSON.stringify(map, null, 2)}\n`, "utf8");
+    const before = snapshotFiles(rootDir);
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+
+    assert.equal(report.counts.stateConflict, 1);
+    assert.equal(report.counts.actionConflict, 0);
+    assert.equal(report.modelCalls, 0);
+    assert.equal(report.jobs[0].decision, "manual-review");
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+    assert.deepEqual(snapshotFiles(rootDir), before);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 migration rejects a terminal requeue to fail conflict without changing bytes", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Terminal requeue intent remains immutable.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+    await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+    const before = snapshotFiles(rootDir);
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+
+    assert.equal(report.counts.actionConflict, 1);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_ACTION_CONFLICT");
+    assert.equal(report.modelCalls, 0);
+    assert.deepEqual(snapshotFiles(rootDir), before);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 0);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 migration CLI reports action conflicts and exits nonzero", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    await createActiveRequeueFixture(rootDir);
+    const result = spawnSync(process.execPath, [
+      path.resolve("scripts/migrate-codex-finalization-v1-jobs.mjs"),
+      `--root-dir=${rootDir}`,
+      "--queue=season",
+      "--action=fail",
+    ], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: { ...process.env, TS_NODE_COMPILER_OPTIONS: process.env.TS_NODE_COMPILER_OPTIONS },
+    });
+
+    assert.notEqual(result.status, 0);
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.counts.actionConflict, 1);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_ACTION_CONFLICT");
+    assert.equal(report.modelCalls, 0);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
@@ -544,6 +721,78 @@ test("v1 fail migration is explicit, idempotent, and never calls Codex", async (
     assert.equal(second.modelCalls, 0);
     assert.equal(failed.status, "failed");
     assert.equal(failed.errorCode, "FINALIZATION_V1_MIGRATED_FAILED");
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 fail migration reconciles an existing fail map whose source is still active", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({
+      script: "Fail recovery must terminalize an active source.",
+      episodeCount: 1,
+    }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    writeMigrationMap(rootDir, {
+      [`season:${season.id}`]: {
+        queue: "season",
+        oldJobId: season.id,
+        newJobId: null,
+        action: "fail",
+        migratedAt: new Date().toISOString(),
+      },
+    });
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+    const failed = readFailedJob(rootDir, ".tmp-season-pack-codex", season.id);
+    const map = JSON.parse(readMigrationMapBytes(rootDir));
+
+    assert.equal(report.counts.reconciled, 1);
+    assert.equal(report.counts.alreadyMigrated, 0);
+    assert.equal(report.modelCalls, 0);
+    assert.equal(report.jobs[0].decision, "reconciled");
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 0);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 0);
+    assert.equal(failed.errorCode, "FINALIZATION_V1_MIGRATED_FAILED");
+    assert.equal(failed.legacyMigrationAction, "fail");
+    assert.equal(failed.replacementJobId, null);
+    assert.equal(map.entries[`season:${season.id}`].action, "fail");
+    assert.equal(map.entries[`season:${season.id}`].newJobId, null);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 fail migration backfills a missing map and is byte-idempotent afterward", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({
+      script: "Fail recovery backfills a missing map without rewriting source.",
+      episodeCount: 1,
+    }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+    await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+    rmSync(migrationMapPath(rootDir), { force: true });
+    const failedPath = path.join(rootDir, ".tmp-season-pack-codex", "failed", `${season.id}.json`);
+    const sourceBeforeBackfill = readFileSync(failedPath, "utf8");
+
+    const reconciled = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+    assert.equal(reconciled.counts.reconciled, 1);
+    assert.equal(reconciled.jobs[0].decision, "reconciled");
+    assert.equal(reconciled.modelCalls, 0);
+    assert.equal(readFileSync(failedPath, "utf8"), sourceBeforeBackfill);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 0);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 0);
+
+    const beforeReplay = snapshotFiles(rootDir);
+    const replay = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+    assert.equal(replay.counts.alreadyMigrated, 1);
+    assert.equal(replay.jobs[0].decision, "already-migrated");
+    assert.equal(replay.modelCalls, 0);
+    assert.deepEqual(snapshotFiles(rootDir), beforeReplay);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
