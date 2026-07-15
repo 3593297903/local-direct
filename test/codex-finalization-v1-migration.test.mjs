@@ -90,6 +90,47 @@ function readMigrationMapBytes(rootDir) {
   return readFileSync(migrationMapPath(rootDir), "utf8");
 }
 
+function movePendingV1ToState(rootDir, namespace, jobId, state, overrides = {}) {
+  const pendingPath = path.join(rootDir, namespace, "pending", `${jobId}.json`);
+  const stateDirectory = path.join(rootDir, namespace, state);
+  const statePath = path.join(stateDirectory, `${jobId}.json`);
+  mkdirSync(stateDirectory, { recursive: true });
+  const record = JSON.parse(readFileSync(pendingPath, "utf8"));
+  writeFileSync(statePath, `${JSON.stringify({
+    ...record,
+    protocolVersion: 1,
+    status: state,
+    ...overrides,
+  }, null, 2)}\n`, "utf8");
+  rmSync(pendingPath, { force: true });
+  return statePath;
+}
+
+function writeHealthyWorkerHeartbeat(rootDir, workerName, workerInstanceId, pid = 700) {
+  const runtimeRoot = path.join(rootDir, ".tmp-codex-runtime");
+  const workerRoot = path.join(runtimeRoot, "workers");
+  mkdirSync(workerRoot, { recursive: true });
+  const environment = {
+    schemaVersion: 1,
+    status: "healthy",
+    checkedAt: new Date().toISOString(),
+    codexVersion: "test",
+    runtimeFingerprint: "migration-r5-runtime",
+    errors: [],
+  };
+  writeFileSync(path.join(runtimeRoot, "environment.json"), JSON.stringify(environment), "utf8");
+  writeFileSync(path.join(workerRoot, `${workerName}.${workerInstanceId}.json`), JSON.stringify({
+    schemaVersion: 1,
+    workerName,
+    workerInstanceId,
+    pid,
+    heartbeatAt: new Date().toISOString(),
+    runtimeFingerprint: environment.runtimeFingerprint,
+    status: "healthy",
+    environment,
+  }), "utf8");
+}
+
 async function createActiveRequeueFixture(rootDir) {
   const season = await createSeasonPackCodexJob({
     script: "Persisted requeue intent must remain immutable.",
@@ -793,6 +834,252 @@ test("v1 fail migration backfills a missing map and is byte-idempotent afterward
     assert.equal(replay.jobs[0].decision, "already-migrated");
     assert.equal(replay.modelCalls, 0);
     assert.deepEqual(snapshotFiles(rootDir), beforeReplay);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 preflight rejects a fail map missing newJobId before mutating its active source", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Synthetic missing fail identity.", episodeCount: 1 }, { rootDir });
+    const sourcePath = markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    writeMigrationMap(rootDir, {
+      [`season:${season.id}`]: {
+        queue: "season",
+        oldJobId: season.id,
+        action: "fail",
+        migratedAt: new Date().toISOString(),
+      },
+    });
+    const before = { source: readFileSync(sourcePath, "utf8"), map: readMigrationMapBytes(rootDir) };
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+
+    assert.equal(report.counts.stateConflict, 1);
+    assert.equal(report.jobs[0].decision, "manual-review");
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+    assert.equal(readFileSync(sourcePath, "utf8"), before.source);
+    assert.equal(readMigrationMapBytes(rootDir), before.map);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 1);
+    assert.equal(existsSync(path.join(rootDir, ".tmp-season-pack-codex", "failed", `${season.id}.json`)), false);
+
+    const cli = spawnSync(process.execPath, [
+      path.resolve("scripts/migrate-codex-finalization-v1-jobs.mjs"),
+      `--root-dir=${rootDir}`,
+      "--queue=season",
+      "--action=fail",
+    ], { cwd: process.cwd(), encoding: "utf8", env: { ...process.env, TS_NODE_COMPILER_OPTIONS: process.env.TS_NODE_COMPILER_OPTIONS } });
+    assert.notEqual(cli.status, 0);
+    assert.equal(JSON.parse(cli.stdout).jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+    assert.equal(readFileSync(sourcePath, "utf8"), before.source);
+    assert.equal(readMigrationMapBytes(rootDir), before.map);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 preflight reports action conflict before a healthy running owner skip", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const fixture = await createActiveRequeueFixture(rootDir);
+    writeHealthyWorkerHeartbeat(rootDir, "season-pack", "healthy-r5-owner");
+    const runningPath = movePendingV1ToState(rootDir, ".tmp-season-pack-codex", fixture.season.id, "running", {
+      stage: "executing",
+      leaseId: "lease-healthy-r5-owner",
+      workerId: "healthy-r5-owner",
+    });
+    const before = {
+      source: readFileSync(runningPath, "utf8"),
+      map: readMigrationMapBytes(rootDir),
+      replacement: readFileSync(fixture.replacementPath, "utf8"),
+    };
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+
+    assert.equal(report.counts.actionConflict, 1);
+    assert.equal(report.counts.healthyRunningSkipped, 0);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_ACTION_CONFLICT");
+    assert.equal(readFileSync(runningPath, "utf8"), before.source);
+    assert.equal(readMigrationMapBytes(rootDir), before.map);
+    assert.equal(readFileSync(fixture.replacementPath, "utf8"), before.replacement);
+    const cli = spawnSync(process.execPath, [
+      path.resolve("scripts/migrate-codex-finalization-v1-jobs.mjs"),
+      `--root-dir=${rootDir}`,
+      "--queue=season",
+      "--action=fail",
+    ], { cwd: process.cwd(), encoding: "utf8", env: { ...process.env, TS_NODE_COMPILER_OPTIONS: process.env.TS_NODE_COMPILER_OPTIONS } });
+    assert.notEqual(cli.status, 0);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 preflight reports action conflict before skipping a terminal source without audit", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const fixture = await createActiveRequeueFixture(rootDir);
+    const failedPath = movePendingV1ToState(rootDir, ".tmp-season-pack-codex", fixture.season.id, "failed", {
+      errorCode: "LEGACY_FAILURE",
+      error: "Synthetic terminal source without migration audit.",
+    });
+    const before = snapshotFiles(rootDir);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+
+    assert.equal(report.counts.actionConflict, 1);
+    assert.equal(report.counts.terminalSkipped, 0);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_ACTION_CONFLICT");
+    assert.deepEqual(snapshotFiles(rootDir), before);
+    assert.ok(existsSync(failedPath));
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 preflight rejects a same-action map on a terminal source without migration audit", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const fixture = await createActiveRequeueFixture(rootDir);
+    movePendingV1ToState(rootDir, ".tmp-season-pack-codex", fixture.season.id, "completed", {
+      result: { synthetic: true },
+    });
+    const before = snapshotFiles(rootDir);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+
+    assert.equal(report.counts.stateConflict, 1);
+    assert.equal(report.counts.terminalSkipped, 0);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+    assert.deepEqual(snapshotFiles(rootDir), before);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 preflight preserves ordinary terminal jobs without map or migration audit", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Ordinary terminal legacy source.", episodeCount: 1 }, { rootDir });
+    movePendingV1ToState(rootDir, ".tmp-season-pack-codex", season.id, "failed", { errorCode: "LEGACY_FAILURE" });
+    const before = snapshotFiles(rootDir);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+
+    assert.equal(report.counts.terminalSkipped, 1);
+    assert.equal(report.counts.stateConflict, 0);
+    assert.equal(report.counts.actionConflict, 0);
+    assert.deepEqual(snapshotFiles(rootDir), before);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 preflight keeps healthy owner protection after validating a matching action", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const fixture = await createActiveRequeueFixture(rootDir);
+    writeHealthyWorkerHeartbeat(rootDir, "season-pack", "healthy-r5-same-action");
+    movePendingV1ToState(rootDir, ".tmp-season-pack-codex", fixture.season.id, "running", {
+      stage: "executing",
+      leaseId: "lease-healthy-r5-same-action",
+      workerId: "healthy-r5-same-action",
+    });
+    const before = snapshotFiles(rootDir);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+
+    assert.equal(report.counts.healthyRunningSkipped, 1);
+    assert.equal(report.counts.actionConflict, 0);
+    assert.equal(report.counts.stateConflict, 0);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 1);
+    assert.deepEqual(snapshotFiles(rootDir), before);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 preflight rejects migration map queue and source identity mismatches without mutation", async () => {
+  for (const mutation of ["queue", "oldJobId"]) {
+    const rootDir = makeTempRoot();
+    try {
+      const season = await createSeasonPackCodexJob({ script: `Invalid migration map ${mutation}.`, episodeCount: 1 }, { rootDir });
+      markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+      writeMigrationMap(rootDir, {
+        [`season:${season.id}`]: {
+          queue: mutation === "queue" ? "render" : "season",
+          oldJobId: mutation === "oldJobId" ? "different-source" : season.id,
+          newJobId: null,
+          action: "fail",
+          migratedAt: new Date().toISOString(),
+        },
+      });
+      const before = snapshotFiles(rootDir);
+      const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+      const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+
+      assert.equal(report.counts.stateConflict, 1);
+      assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+      assert.deepEqual(snapshotFiles(rootDir), before);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("v1 preflight rejects partial source migration audit without mutation", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Partial source audit.", episodeCount: 1 }, { rootDir });
+    const sourcePath = markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const source = JSON.parse(readFileSync(sourcePath, "utf8"));
+    writeFileSync(sourcePath, `${JSON.stringify({
+      ...source,
+      legacyMigrationAction: "requeue",
+      replacementJobId: `season-pack-job-${createHash("sha256")
+        .update(`finalization-v1:${season.id}`).digest("hex").slice(0, 32)}`,
+    }, null, 2)}\n`, "utf8");
+    const before = snapshotFiles(rootDir);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+
+    assert.equal(report.counts.stateConflict, 1);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+    assert.deepEqual(snapshotFiles(rootDir), before);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 dry-run reports malformed persisted state without mutating files", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Dry-run static preflight.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    writeMigrationMap(rootDir, {
+      [`season:${season.id}`]: {
+        queue: "season",
+        oldJobId: season.id,
+        action: "fail",
+        migratedAt: new Date().toISOString(),
+      },
+    });
+    const before = snapshotFiles(rootDir);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "dry-run" });
+
+    assert.equal(report.counts.stateConflict, 1);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+    assert.deepEqual(snapshotFiles(rootDir), before);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

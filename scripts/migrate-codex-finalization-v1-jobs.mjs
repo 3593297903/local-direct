@@ -82,11 +82,36 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
       decision: action === "dry-run" ? "would-review" : "skipped",
     };
     report.jobs.push(reportEntry);
-    if (action === "dry-run") continue;
-
     const mappingKey = `${record.queue.key}:${record.job.id}`;
-    const existing = migrationMap.entries[mappingKey] || null;
-    const sourceMigration = readSourceMigration(record.job);
+    const existing = hasOwn(migrationMap.entries, mappingKey) ? migrationMap.entries[mappingKey] : null;
+    const preflight = preflightMigrationRecord(record, existing, action === "dry-run" ? null : action);
+    if (preflight.status === "state-conflict") {
+      markMigrationConflict(
+        report,
+        reportEntry,
+        "stateConflict",
+        "FINALIZATION_V1_MIGRATION_STATE_CONFLICT",
+        preflight.error,
+      );
+      continue;
+    }
+    if (preflight.status === "action-conflict") {
+      markMigrationConflict(
+        report,
+        reportEntry,
+        "actionConflict",
+        "FINALIZATION_V1_ACTION_CONFLICT",
+        preflight.error,
+      );
+      continue;
+    }
+    if (preflight.status === "identity-mismatch") {
+      markIdentityMismatch(report, reportEntry, preflight.error);
+      continue;
+    }
+
+    const sourceMigration = preflight.sourceMigration;
+    if (action === "dry-run") continue;
     if ((record.status === "completed" || record.status === "failed") && !sourceMigration) {
       report.counts.terminalSkipped += 1;
       reportEntry.decision = "terminal-skipped";
@@ -113,36 +138,9 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
       }
     }
 
-    const intent = resolvePersistedMigrationIntent(record, existing, action);
-    if (intent.status === "state-conflict") {
-      markMigrationConflict(
-        report,
-        reportEntry,
-        "stateConflict",
-        "FINALIZATION_V1_MIGRATION_STATE_CONFLICT",
-        intent.error,
-      );
-      continue;
-    }
-    const persistedIdentityError = validatePersistedReplacementIdentity(record, existing, sourceMigration, intent);
-    if (persistedIdentityError) {
-      markIdentityMismatch(report, reportEntry, persistedIdentityError);
-      continue;
-    }
-    if (intent.status === "action-conflict") {
-      markMigrationConflict(
-        report,
-        reportEntry,
-        "actionConflict",
-        "FINALIZATION_V1_ACTION_CONFLICT",
-        intent.error,
-      );
-      continue;
-    }
-
     if (action === "requeue") {
       const expectedReplacementId = deterministicReplacementId(record);
-      const referencedReplacementId = existing?.newJobId || sourceMigration?.replacementJobId || null;
+      const referencedReplacementId = preflight.replacementJobId;
       if (referencedReplacementId && referencedReplacementId !== expectedReplacementId) {
         markIdentityMismatch(report, reportEntry, "Migration map or source references an unexpected replacement job");
         continue;
@@ -383,76 +381,148 @@ async function readJsonFile(target) {
   }
 }
 
-function readSourceMigration(job) {
-  if (job?.legacyMigrationState !== "source_terminalized") return null;
+function hasOwn(value, key) {
+  return value !== null && value !== undefined && Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateMigrationMapEntry(record, existingMapEntry) {
+  if (existingMapEntry === null || existingMapEntry === undefined) {
+    return { status: "absent", action: null, replacementJobId: null };
+  }
+  if (!isPlainObject(existingMapEntry)) {
+    return { status: "state-conflict", error: "Migration map entry must be an object" };
+  }
+  if (existingMapEntry.queue !== record.queue.key || existingMapEntry.oldJobId !== record.job.id) {
+    return { status: "state-conflict", error: "Migration map entry does not match its source queue and job" };
+  }
+  const action = normalizePersistedAction(existingMapEntry.action);
+  if (!action) {
+    return { status: "state-conflict", error: "Migration map entry contains an invalid or missing action" };
+  }
+  if (!hasOwn(existingMapEntry, "newJobId")) {
+    return { status: "state-conflict", error: "Migration map entry is missing newJobId" };
+  }
+  if (action === "fail" && existingMapEntry.newJobId !== null) {
+    return { status: "state-conflict", error: "Failed migration map must contain an explicit null newJobId" };
+  }
+  if (action === "requeue") {
+    const expectedReplacementId = deterministicReplacementId(record);
+    if (existingMapEntry.newJobId !== expectedReplacementId) {
+      return {
+        status: "identity-mismatch",
+        action,
+        replacementJobId: existingMapEntry.newJobId,
+        error: "Migration map does not reference the deterministic replacement job",
+      };
+    }
+  }
   return {
-    action: job.legacyMigrationAction,
-    replacementJobId: job.replacementJobId || null,
-    migratedAt: job.migratedAt || null,
+    status: "valid",
+    action,
+    replacementJobId: existingMapEntry.newJobId,
   };
 }
 
-export function resolvePersistedMigrationIntent(record, existingMapEntry, requestedAction) {
-  const sourceMigration = readSourceMigration(record?.job);
-  const rawSourceAction = record?.job?.legacyMigrationAction;
-  const sourceActionPresent = rawSourceAction !== undefined && rawSourceAction !== null && rawSourceAction !== "";
-  const sourceAction = normalizePersistedAction(rawSourceAction);
-  const mapAction = normalizePersistedAction(existingMapEntry?.action);
-
-  if ((sourceActionPresent && !sourceAction) || (existingMapEntry && !mapAction)) {
+function validateSourceMigrationAudit(record) {
+  const job = record?.job;
+  const declaresAudit = hasOwn(job, "legacyMigrationState")
+    || hasOwn(job, "legacyMigrationAction")
+    || hasOwn(job, "replacementJobId");
+  if (!declaresAudit) return { status: "absent", migration: null };
+  if (job.legacyMigrationState !== "source_terminalized") {
+    return { status: "state-conflict", error: "Source contains a partial migration audit" };
+  }
+  const action = normalizePersistedAction(job.legacyMigrationAction);
+  if (!action || !hasOwn(job, "replacementJobId")) {
+    return { status: "state-conflict", error: "Source migration audit is missing its action or replacement identity" };
+  }
+  const expectedErrorCode = action === "requeue"
+    ? "FINALIZATION_V1_REQUEUED"
+    : "FINALIZATION_V1_MIGRATED_FAILED";
+  if (job.errorCode !== expectedErrorCode) {
+    return { status: "state-conflict", error: "Source migration audit has an invalid error code" };
+  }
+  if (action === "fail" && job.replacementJobId !== null) {
+    return { status: "state-conflict", error: "Failed source migration audit must contain an explicit null replacementJobId" };
+  }
+  if (action === "requeue" && job.replacementJobId !== deterministicReplacementId(record)) {
     return {
-      status: "state-conflict",
-      persistedAction: sourceAction || mapAction,
-      replacementJobId: existingMapEntry?.newJobId || sourceMigration?.replacementJobId || null,
-      error: "Persisted migration state contains an invalid or missing action",
+      status: "identity-mismatch",
+      migration: {
+        action,
+        replacementJobId: job.replacementJobId,
+        migratedAt: job.migratedAt || null,
+      },
+      error: "Source audit does not reference the deterministic replacement job",
     };
   }
+  return {
+    status: "valid",
+    migration: {
+      action,
+      replacementJobId: job.replacementJobId,
+      migratedAt: job.migratedAt || null,
+    },
+  };
+}
+
+function preflightMigrationRecord(record, existingMapEntry, requestedAction) {
+  const map = validateMigrationMapEntry(record, existingMapEntry);
+  if (map.status === "state-conflict") return map;
+  const source = validateSourceMigrationAudit(record);
+  if (source.status === "state-conflict") return source;
+
+  const sourceMigration = source.migration || null;
+  const sourceAction = sourceMigration?.action || null;
+  const mapAction = map.action || null;
   if (sourceAction && mapAction && sourceAction !== mapAction) {
     return {
       status: "state-conflict",
-      persistedAction: null,
-      replacementJobId: existingMapEntry?.newJobId || sourceMigration?.replacementJobId || null,
       error: `Source migration action ${sourceAction} conflicts with map action ${mapAction}`,
     };
   }
 
   const persistedAction = sourceAction || mapAction || null;
-  if (persistedAction && persistedAction !== requestedAction) {
+  if (requestedAction && persistedAction && persistedAction !== requestedAction) {
     return {
       status: "action-conflict",
       persistedAction,
-      replacementJobId: existingMapEntry?.newJobId || sourceMigration?.replacementJobId || null,
+      sourceMigration,
+      replacementJobId: map.replacementJobId ?? sourceMigration?.replacementJobId ?? null,
       error: `Requested migration action ${requestedAction} conflicts with persisted action ${persistedAction}`,
+    };
+  }
+
+  if (map.status === "identity-mismatch") return map;
+  if (source.status === "identity-mismatch") return source;
+
+  const terminal = record.status === "completed" || record.status === "failed";
+  if (terminal && existingMapEntry !== null && existingMapEntry !== undefined && source.status === "absent") {
+    return {
+      status: "state-conflict",
+      persistedAction,
+      error: "Terminal source has a migration map but no source migration audit",
     };
   }
   return {
     status: persistedAction ? "same-action" : "new",
     persistedAction,
-    replacementJobId: existingMapEntry?.newJobId || sourceMigration?.replacementJobId || null,
+    sourceMigration,
+    replacementJobId: map.replacementJobId ?? sourceMigration?.replacementJobId ?? null,
   };
+}
+
+export function resolvePersistedMigrationIntent(record, existingMapEntry, requestedAction) {
+  return preflightMigrationRecord(record, existingMapEntry, requestedAction);
 }
 
 function normalizePersistedAction(value) {
   const action = String(value || "").trim().toLowerCase();
   return action === "requeue" || action === "fail" ? action : null;
-}
-
-function validatePersistedReplacementIdentity(record, existingMapEntry, sourceMigration, intent) {
-  if (!intent.persistedAction) return null;
-  const references = [];
-  if (existingMapEntry) references.push({ label: "migration map", value: existingMapEntry.newJobId ?? null });
-  if (sourceMigration) references.push({ label: "source audit", value: sourceMigration.replacementJobId ?? null });
-
-  if (intent.persistedAction === "fail") {
-    const invalid = references.find((reference) => reference.value !== null);
-    return invalid ? `${invalid.label} contains a replacement for a persisted fail action` : null;
-  }
-
-  const expectedReplacementId = deterministicReplacementId(record);
-  const invalid = references.find((reference) => reference.value !== expectedReplacementId);
-  return invalid
-    ? `${invalid.label} does not reference the deterministic replacement job`
-    : null;
 }
 
 function deterministicReplacementId(record) {
