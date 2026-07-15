@@ -331,7 +331,11 @@ export async function updateVideoPromptPackCodexJobStage(
 
 export async function finalizeVideoPromptPackCodexJobFiles(
   task: VideoPromptPackCodexJob,
-  options: QueueOptions & { codexExitCode: number; stabilityDelayMs?: number },
+  options: QueueOptions & {
+    codexExitCode: number;
+    stabilityDelayMs?: number;
+    afterFirstStabilitySnapshot?: () => void | Promise<void>;
+  },
 ) {
   const rootDir = resolveRootDir(options);
   if (!task.leaseId || !task.stagingDir) {
@@ -375,7 +379,11 @@ export async function finalizeVideoPromptPackCodexJobFiles(
     );
   }
 
-  const validated = await validateRenderPackStaging(job, options.stabilityDelayMs);
+  const validated = await validateRenderPackStaging(
+    job,
+    options.stabilityDelayMs,
+    options.afterFirstStabilitySnapshot,
+  );
   const segmentIndexes = validated.result.segments.map((segment) => segment.episodeIndex);
   const resultHash = hashCanonicalJson(renderPackResultProjection(validated.result));
   const identity = {
@@ -843,7 +851,11 @@ async function hasValidPackResult(job: VideoPromptPackCodexJob) {
   }
 }
 
-async function validateRenderPackStaging(job: VideoPromptPackCodexJob, stabilityDelayMs?: number) {
+async function validateRenderPackStaging(
+  job: VideoPromptPackCodexJob,
+  stabilityDelayMs?: number,
+  afterFirstStabilitySnapshot?: () => void | Promise<void>,
+) {
   if (!job.stagingDir) {
     throw new VideoPromptPackCodexQueueError("Render Pack staging directory is missing", "FINALIZATION_OUTPUT_MISSING");
   }
@@ -887,6 +899,7 @@ async function validateRenderPackStaging(job: VideoPromptPackCodexJob, stability
     directory: job.stagingDir,
     relativePaths: outputFiles.map((output) => output.relativePath),
     delayMs: stabilityDelayMs,
+    afterFirstSnapshot: afterFirstStabilitySnapshot,
   });
   return {
     outputFiles,

@@ -423,7 +423,11 @@ export async function updateSeasonPackCodexJobStage(
 
 export async function finalizeSeasonPackCodexJobFiles(
   task: SeasonPackCodexJob,
-  options: QueueOptions & { codexExitCode: number; stabilityDelayMs?: number },
+  options: QueueOptions & {
+    codexExitCode: number;
+    stabilityDelayMs?: number;
+    afterFirstStabilitySnapshot?: () => void | Promise<void>;
+  },
 ) {
   const rootDir = resolveRootDir(options);
   if (!task.leaseId || !task.stagingDir) {
@@ -472,6 +476,7 @@ export async function finalizeSeasonPackCodexJobFiles(
     directory: job.stagingDir,
     relativePaths: outputFiles.map((output) => output.relativePath),
     delayMs: options.stabilityDelayMs,
+    afterFirstSnapshot: options.afterFirstStabilitySnapshot,
   });
   const result = await readSeasonPackResult(job);
   const segmentIndexes = result.episodes.map((episode) => episode.episodeIndex);

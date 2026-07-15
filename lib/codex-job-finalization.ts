@@ -127,6 +127,7 @@ type StableFinalizationFilesInput = {
   directory: string;
   relativePaths: string[];
   delayMs?: number;
+  afterFirstSnapshot?: () => void | Promise<void>;
 };
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -389,6 +390,7 @@ export async function assertFinalizationFilesStable(input: StableFinalizationFil
     throw new CodexJobFinalizationError("FINALIZATION_OUTPUT_MISSING", "Finalization stability check has no outputs");
   }
   const first = await snapshotFinalizationFiles(directory, relativePaths);
+  await input.afterFirstSnapshot?.();
   await wait(Math.max(0, input.delayMs ?? 25));
   const second = await snapshotFinalizationFiles(directory, relativePaths);
   if (JSON.stringify(first) !== JSON.stringify(second)) {

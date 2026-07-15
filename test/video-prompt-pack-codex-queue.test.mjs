@@ -963,18 +963,21 @@ test("Render finalization rejects output changed after Codex close and before st
     mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
     writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("First parseable result"), null, 2), "utf8");
     const finalizing = await enterRenderPackFinalizing(claimed, rootDir);
-    const mutation = setTimeout(() => {
-      writeFileSync(claimed.segments[0].outputPath, JSON.stringify(sampleAnalysisResult("Rewritten final result"), null, 2), "utf8");
-    }, 10);
     await assert.rejects(
       () => finalizeVideoPromptPackCodexJobFiles(finalizing, {
         rootDir,
         codexExitCode: 0,
-        stabilityDelayMs: 75,
+        stabilityDelayMs: 0,
+        afterFirstStabilitySnapshot: () => {
+          writeFileSync(
+            claimed.segments[0].outputPath,
+            JSON.stringify(sampleAnalysisResult("Rewritten final result"), null, 2),
+            "utf8",
+          );
+        },
       }),
       /changed|stable|hash/i,
     );
-    clearTimeout(mutation);
     const observed = await getVideoPromptPackCodexJob(claimed.id, { rootDir });
     assert.equal(observed.status, "running");
     assert.equal(observed.resultAvailable, false);

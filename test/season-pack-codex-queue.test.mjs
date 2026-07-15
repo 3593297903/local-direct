@@ -1225,19 +1225,17 @@ test("season finalization rejects output changed between post-exit stability rea
     writeFileSync(episodePath, JSON.stringify(sampleEpisodeInput(1)), "utf8");
     await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "executing", { rootDir });
     const finalizing = await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "finalizing", { rootDir });
-    const mutation = setTimeout(() => {
-      try {
-        writeFileSync(episodePath, JSON.stringify(sampleEpisodeInput(1, { title: "Changed after exit" })), "utf8");
-      } catch {
-        // A premature publication is the behavior this red test is designed to expose.
-      }
-    }, 10);
-
     await assert.rejects(
-      () => finalizeSeasonPackCodexJobFiles(finalizing, { rootDir, codexExitCode: 0, stabilityDelayMs: 75 }),
+      () => finalizeSeasonPackCodexJobFiles(finalizing, {
+        rootDir,
+        codexExitCode: 0,
+        stabilityDelayMs: 0,
+        afterFirstStabilitySnapshot: () => {
+          writeFileSync(episodePath, JSON.stringify(sampleEpisodeInput(1, { title: "Changed after exit" })), "utf8");
+        },
+      }),
       /changed|stable|hash/i,
     );
-    clearTimeout(mutation);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
