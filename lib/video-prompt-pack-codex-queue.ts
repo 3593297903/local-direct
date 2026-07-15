@@ -1306,10 +1306,30 @@ async function persistRenderPackState(
 
 async function readLegacyVideoPromptPackJob(rootDir: string, jobId: string) {
   const legacyDir = path.join(rootDir, TASK_ROOT, LEGACY_JOB_DIR);
+  const legacyPath = path.join(legacyDir, `${fileSegment(jobId)}.json`);
   try {
-    return normalizeStoredRenderPackJob(
-      JSON.parse(await readFile(path.join(legacyDir, `${fileSegment(jobId)}.json`), "utf8")) as VideoPromptPackCodexJob,
+    const legacy = normalizeStoredRenderPackJob(
+      JSON.parse(await readFile(legacyPath, "utf8")) as VideoPromptPackCodexJob,
     );
+    if (legacy.status !== "running") return legacy;
+
+    const failedAt = new Date().toISOString();
+    const failed = {
+      ...legacy,
+      status: "failed" as const,
+      stage: "failed" as const,
+      leaseId: null,
+      workerId: null,
+      resultAvailable: false,
+      result: null,
+      error: "Legacy running Render Pack was not re-executed automatically; create a new idempotent job to retry.",
+      errorCode: "FINALIZATION_LEGACY_RUNNING_ABORTED",
+      failedAt,
+      updatedAt: failedAt,
+    };
+    await atomicReplaceJson(renderPackStatePath(rootDir, "failed", failed.id), failed, { rootDir });
+    await rm(legacyPath, { force: true });
+    return failed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       throw new VideoPromptPackCodexQueueError("Video prompt render pack Codex job not found", "JOB_NOT_FOUND");
