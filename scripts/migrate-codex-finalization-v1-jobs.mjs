@@ -9,7 +9,7 @@ const require = createRequire(import.meta.url);
 require("ts-node/register/transpile-only");
 
 const { atomicMoveFile, atomicReplaceJson } = require("../lib/file-job-store.ts");
-const { readCodexRuntimeHealth } = require("../lib/codex-runtime-health.ts");
+const { readCodexRuntimeHealthForOwner } = require("../lib/codex-runtime-health.ts");
 const { createSeasonPackCodexJob } = require("../lib/season-pack-codex-queue.ts");
 const { createVideoPromptPackCodexJob } = require("../lib/video-prompt-pack-codex-queue.ts");
 
@@ -44,6 +44,8 @@ export async function migrateCodexFinalizationV1Jobs(options = {}) {
       failedByMigration: 0,
       alreadyMigrated: 0,
       healthyRunningSkipped: 0,
+      unverifiableOwnerSkipped: 0,
+      invalidOwnerSkipped: 0,
       terminalSkipped: 0,
     },
     jobs: [],
@@ -73,10 +75,25 @@ export async function migrateCodexFinalizationV1Jobs(options = {}) {
       reportEntry.decision = "terminal-skipped";
       continue;
     }
-    if (record.status === "running" && await hasHealthyOriginalOwner(rootDir, record, heartbeatMaxAgeMs)) {
-      report.counts.healthyRunningSkipped += 1;
-      reportEntry.decision = "healthy-owner-skipped";
-      continue;
+    if (record.status === "running") {
+      const ownerDecision = await readOriginalOwnerDecision(rootDir, record, heartbeatMaxAgeMs);
+      reportEntry.ownerStatus = ownerDecision.status;
+      reportEntry.ownerMatchKind = ownerDecision.matchKind;
+      if (ownerDecision.status === "healthy") {
+        report.counts.healthyRunningSkipped += 1;
+        reportEntry.decision = "healthy-owner-skipped";
+        continue;
+      }
+      if (ownerDecision.status === "unverifiable") {
+        report.counts.unverifiableOwnerSkipped += 1;
+        reportEntry.decision = "unverifiable-owner-skipped";
+        continue;
+      }
+      if (ownerDecision.status === "invalid") {
+        report.counts.invalidOwnerSkipped += 1;
+        reportEntry.decision = "invalid-owner-skipped";
+        continue;
+      }
     }
 
     if (action === "requeue") {
@@ -165,14 +182,11 @@ async function readJsonEntries(directory) {
   return output;
 }
 
-async function hasHealthyOriginalOwner(rootDir, record, maxAgeMs) {
-  if (!record.job.workerId) return false;
-  const runtime = await readCodexRuntimeHealth(record.queue.workerName, {
+async function readOriginalOwnerDecision(rootDir, record, maxAgeMs) {
+  return readCodexRuntimeHealthForOwner(record.queue.workerName, record.job.workerId, {
     rootDir,
     maxAgeMs,
-    workerInstanceId: record.job.workerId,
   });
-  return runtime.status === "healthy";
 }
 
 async function createV2Replacement(rootDir, record) {

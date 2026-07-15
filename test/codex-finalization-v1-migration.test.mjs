@@ -166,6 +166,77 @@ test("v1 running migration skips an exact healthy owner and requeues only a stal
   }
 });
 
+test("v1 running migration protects exact legacy PID owners and conservatively skips unverifiable owners", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const runtimeRoot = path.join(rootDir, ".tmp-codex-runtime");
+    const workerRoot = path.join(runtimeRoot, "workers");
+    mkdirSync(workerRoot, { recursive: true });
+    const environment = {
+      schemaVersion: 1,
+      status: "healthy",
+      checkedAt: new Date().toISOString(),
+      codexVersion: "test",
+      runtimeFingerprint: "migration-legacy-runtime",
+      errors: [],
+    };
+    writeFileSync(path.join(runtimeRoot, "environment.json"), JSON.stringify(environment), "utf8");
+    for (const [workerName, pid] of [["season-pack", 710], ["video-prompt-pack", 810]]) {
+      writeFileSync(path.join(workerRoot, `${workerName}.${pid}.json`), JSON.stringify({
+        schemaVersion: 1,
+        workerName,
+        pid,
+        heartbeatAt: new Date().toISOString(),
+        runtimeFingerprint: environment.runtimeFingerprint,
+        status: "healthy",
+        environment,
+      }), "utf8");
+    }
+
+    const season = await createSeasonPackCodexJob({ script: "Legacy PID Season owner.", episodeCount: 1 }, { rootDir });
+    const render = await createVideoPromptPackCodexJob({
+      idempotencyKey: "legacy-pid-render-owner",
+      segments: [{
+        episodeIndex: 1,
+        title: "Legacy PID render",
+        script: "Legacy PID Render owner.",
+        renderInputScript: "The exact legacy Render worker still owns this task.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const custom = await createSeasonPackCodexJob({ script: "Unverifiable custom owner.", episodeCount: 1 }, { rootDir });
+    for (const [namespace, job, workerId] of [
+      [".tmp-season-pack-codex", season, "season-pack-710"],
+      [".tmp-video-prompt-pack-codex", render, "video-prompt-pack-810"],
+      [".tmp-season-pack-codex", custom, "legacy-custom-owner"],
+    ]) {
+      const pending = path.join(rootDir, namespace, "pending", `${job.id}.json`);
+      const runningDir = path.join(rootDir, namespace, "running");
+      mkdirSync(runningDir, { recursive: true });
+      const record = JSON.parse(readFileSync(pending, "utf8"));
+      writeFileSync(path.join(runningDir, `${job.id}.json`), `${JSON.stringify({
+        ...record,
+        protocolVersion: 1,
+        status: "running",
+        stage: "executing",
+        leaseId: `lease-${workerId}`,
+        workerId,
+      }, null, 2)}\n`, "utf8");
+      rmSync(pending, { force: true });
+    }
+
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, action: "requeue" });
+
+    assert.equal(report.counts.healthyRunningSkipped, 2);
+    assert.equal(report.counts.unverifiableOwnerSkipped, 1);
+    assert.equal(report.counts.requeued, 0);
+    assert.equal(report.modelCalls, 0);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 test("v1 fail migration is explicit, idempotent, and never calls Codex", async () => {
   const rootDir = makeTempRoot();
   try {
