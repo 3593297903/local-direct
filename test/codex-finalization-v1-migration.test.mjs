@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -39,6 +40,45 @@ function snapshotFiles(rootDir) {
   }
   visit(rootDir);
   return output.sort(([left], [right]) => left.localeCompare(right));
+}
+
+function readStateJobs(rootDir, namespace, state) {
+  const directory = path.join(rootDir, namespace, state);
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => JSON.parse(readFileSync(path.join(directory, name), "utf8")));
+}
+
+function countActiveV1Jobs(rootDir, namespace, jobId) {
+  const stateCount = ["pending", "running"]
+    .flatMap((state) => readStateJobs(rootDir, namespace, state))
+    .filter((job) => job.id === jobId && Number(job.protocolVersion) !== 2).length;
+  const legacyPath = path.join(rootDir, namespace, "jobs", `${jobId}.json`);
+  if (!existsSync(legacyPath)) return stateCount;
+  const legacy = JSON.parse(readFileSync(legacyPath, "utf8"));
+  return stateCount + (legacy.id === jobId && Number(legacy.protocolVersion) !== 2
+    && ["pending", "running"].includes(String(legacy.status || "pending")) ? 1 : 0);
+}
+
+function countV2Jobs(rootDir, namespace) {
+  return ["pending", "running", "completed", "failed"]
+    .flatMap((state) => readStateJobs(rootDir, namespace, state))
+    .filter((job) => Number(job.protocolVersion) === 2).length;
+}
+
+function readFailedJob(rootDir, namespace, jobId) {
+  return JSON.parse(readFileSync(path.join(rootDir, namespace, "failed", `${jobId}.json`), "utf8"));
+}
+
+function writeMigrationMap(rootDir, entries) {
+  const directory = path.join(rootDir, ".tmp-codex-finalization-migration");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(path.join(directory, "v1-migration-map.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: new Date().toISOString(),
+    entries,
+  }, null, 2)}\n`, "utf8");
 }
 
 test("v1 migration defaults to dry-run and does not modify queue files", async () => {
@@ -106,9 +146,254 @@ test("v1 requeue migration is idempotent and never calls Codex", async () => {
     assert.equal(second.counts.requeued, 0);
     assert.equal(second.counts.alreadyMigrated, 2);
     assert.equal(existsSync(path.join(rootDir, ".tmp-codex-finalization-migration", "v1-migration-map.json")), true);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 0);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-video-prompt-pack-codex", render.id), 0);
+    const failedSeason = readFailedJob(rootDir, ".tmp-season-pack-codex", season.id);
+    const failedRender = readFailedJob(rootDir, ".tmp-video-prompt-pack-codex", render.id);
+    for (const failed of [failedSeason, failedRender]) {
+      assert.equal(failed.status, "failed");
+      assert.equal(failed.errorCode, "FINALIZATION_V1_REQUEUED");
+      assert.equal(failed.legacyMigrationAction, "requeue");
+      assert.equal(failed.legacyMigrationState, "source_terminalized");
+      assert.ok(failed.replacementJobId);
+      assert.ok(failed.migratedAt);
+    }
   } finally {
     if (previous === undefined) delete process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED;
     else process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED = previous;
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 requeue resumes after replacement creation without creating a second replacement", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Crash after replacement creation.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    await assert.rejects(
+      migrateCodexFinalizationV1Jobs({
+        rootDir,
+        queue: "season",
+        action: "requeue",
+        testHooks: { afterReplacementCreated: () => { throw new Error("injected-after-replacement"); } },
+      }),
+      /injected-after-replacement/,
+    );
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 1);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 1);
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+    assert.equal(report.counts.requeued, 1);
+    assert.equal(report.modelCalls, 0);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 1);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 0);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 requeue resumes after source terminalization and backfills the migration map", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const render = await createVideoPromptPackCodexJob({
+      idempotencyKey: "legacy-render-terminalization-crash",
+      segments: [{
+        episodeIndex: 1,
+        title: "Terminalized source",
+        script: "Crash after the source becomes terminal.",
+        renderInputScript: "The replacement remains deterministic across recovery.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-video-prompt-pack-codex", render.id);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    await assert.rejects(
+      migrateCodexFinalizationV1Jobs({
+        rootDir,
+        queue: "render",
+        action: "requeue",
+        testHooks: { afterSourceTerminalized: () => { throw new Error("injected-after-terminalization"); } },
+      }),
+      /injected-after-terminalization/,
+    );
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-video-prompt-pack-codex", render.id), 0);
+    assert.equal(existsSync(path.join(rootDir, ".tmp-codex-finalization-migration", "v1-migration-map.json")), false);
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "render", action: "requeue" });
+    const migrationMap = JSON.parse(readFileSync(
+      path.join(rootDir, ".tmp-codex-finalization-migration", "v1-migration-map.json"),
+      "utf8",
+    ));
+    assert.equal(report.modelCalls, 0);
+    assert.ok(migrationMap.entries[`render:${render.id}`]?.newJobId);
+    assert.equal(countV2Jobs(rootDir, ".tmp-video-prompt-pack-codex"), 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 requeue reconciles a legacy map whose source is still active", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Map exists while source remains active.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const replacement = await createSeasonPackCodexJob(
+      { script: season.script, episodeCount: 1 },
+      { rootDir, bypassV2CreatePause: true, migrationSourceJobId: season.id },
+    );
+    writeMigrationMap(rootDir, {
+      [`season:${season.id}`]: {
+        queue: "season",
+        oldJobId: season.id,
+        newJobId: replacement.id,
+        action: "requeue",
+        migratedAt: new Date().toISOString(),
+      },
+    });
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+    assert.equal(report.counts.reconciled, 1);
+    assert.equal(report.modelCalls, 0);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 0);
+    assert.equal(readFailedJob(rootDir, ".tmp-season-pack-codex", season.id).replacementJobId, replacement.id);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 requeue preserves the active source when the deterministic replacement identity is invalid", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Identity mismatch must be rejected.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const replacement = await createSeasonPackCodexJob(
+      { script: season.script, episodeCount: 1 },
+      { rootDir, bypassV2CreatePause: true, migrationSourceJobId: season.id },
+    );
+    const replacementPath = path.join(rootDir, ".tmp-season-pack-codex", "pending", `${replacement.id}.json`);
+    writeFileSync(replacementPath, `${JSON.stringify({
+      ...JSON.parse(readFileSync(replacementPath, "utf8")),
+      sourceHash: "0".repeat(64),
+    }, null, 2)}\n`, "utf8");
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+    assert.equal(report.counts.identityMismatch, 1);
+    assert.equal(report.counts.requeued, 0);
+    assert.equal(report.modelCalls, 0);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 1);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_IDENTITY_MISMATCH");
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 requeue preserves the active source when a legacy map points to a missing replacement", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Missing mapped replacement.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const expectedReplacementId = `season-pack-job-${createHash("sha256")
+      .update(`finalization-v1:${season.id}`).digest("hex").slice(0, 32)}`;
+    writeMigrationMap(rootDir, {
+      [`season:${season.id}`]: {
+        queue: "season",
+        oldJobId: season.id,
+        newJobId: expectedReplacementId,
+        action: "requeue",
+        migratedAt: new Date().toISOString(),
+      },
+    });
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" });
+    assert.equal(report.counts.identityMismatch, 1);
+    assert.equal(report.counts.requeued, 0);
+    assert.equal(report.modelCalls, 0);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 1);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 0);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 requeue rejects a mismatched deterministic Render replacement", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const input = {
+      idempotencyKey: "legacy-render-identity-source",
+      segments: [{
+        episodeIndex: 1,
+        title: "Render identity",
+        script: "Render replacement identity must match.",
+        renderInputScript: "Do not accept a replacement with a different source hash.",
+        duration: "12 seconds",
+      }],
+    };
+    const render = await createVideoPromptPackCodexJob(input, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-video-prompt-pack-codex", render.id);
+    const replacement = await createVideoPromptPackCodexJob({
+      ...input,
+      idempotencyKey: `finalization-v1:${render.id}`,
+    }, { rootDir, bypassV2CreatePause: true });
+    const replacementPath = path.join(rootDir, ".tmp-video-prompt-pack-codex", "pending", `${replacement.id}.json`);
+    writeFileSync(replacementPath, `${JSON.stringify({
+      ...JSON.parse(readFileSync(replacementPath, "utf8")),
+      sourceHash: "f".repeat(64),
+    }, null, 2)}\n`, "utf8");
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "render", action: "requeue" });
+    assert.equal(report.counts.identityMismatch, 1);
+    assert.equal(report.counts.requeued, 0);
+    assert.equal(report.modelCalls, 0);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-video-prompt-pack-codex", render.id), 1);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_IDENTITY_MISMATCH");
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("only one v1 migration process can hold the migration singleton", async () => {
+  const rootDir = makeTempRoot();
+  let releaseFirst;
+  let enteredFirst;
+  const releaseBarrier = new Promise((resolve) => { releaseFirst = resolve; });
+  const enteredBarrier = new Promise((resolve) => { enteredFirst = resolve; });
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Migration singleton fixture.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+    const first = migrateCodexFinalizationV1Jobs({
+      rootDir,
+      queue: "season",
+      action: "requeue",
+      testHooks: {
+        afterLockAcquired: async () => {
+          enteredFirst();
+          await releaseBarrier;
+        },
+      },
+    });
+    const entered = await Promise.race([
+      enteredBarrier.then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 200)),
+    ]);
+    assert.equal(entered, true, "the exported test hook must run after the singleton is acquired");
+    await assert.rejects(
+      migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "requeue" }),
+      /migration.*already running/i,
+    );
+    releaseFirst();
+    const report = await first;
+    assert.equal(report.modelCalls, 0);
+  } finally {
+    releaseFirst?.();
     rmSync(rootDir, { recursive: true, force: true });
   }
 });

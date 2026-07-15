@@ -176,13 +176,6 @@ export async function createVideoPromptPackCodexJob(
   const jobId = idempotencyKey
     ? `video-prompt-pack-job-${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`
     : createId("video-prompt-pack-job");
-  if (idempotencyKey) {
-    try {
-      return await getFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, jobId);
-    } catch (error) {
-      if (!(error instanceof Error) || error.message !== "File job not found") throw error;
-    }
-  }
   const segments = input.segments.map((segment) => {
     const outputFileName = episodeFileName(segment.episodeIndex);
     return {
@@ -237,7 +230,32 @@ export async function createVideoPromptPackCodexJob(
     createdAt: now,
     updatedAt: now,
   };
-  return putPendingFileJob(rootDir, TASK_ROOT, job);
+  const stored = await putPendingFileJob(rootDir, TASK_ROOT, job);
+  if (idempotencyKey) assertRenderPackIdempotencyIdentity(stored, job);
+  return stored;
+}
+
+function assertRenderPackIdempotencyIdentity(
+  stored: VideoPromptPackCodexJob,
+  expected: VideoPromptPackCodexJob,
+) {
+  const storedIndexes = stored.segments.map((segment) => segment.episodeIndex);
+  const expectedIndexes = expected.segments.map((segment) => segment.episodeIndex);
+  if (
+    stored.id !== expected.id
+    || stored.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION
+    || stored.idempotencyKey !== expected.idempotencyKey
+    || stored.sourceHash !== expected.sourceHash
+    || stored.contractHash !== expected.contractHash
+    || stored.mode !== expected.mode
+    || stored.coverageSidecarEnabled !== expected.coverageSidecarEnabled
+    || JSON.stringify(storedIndexes) !== JSON.stringify(expectedIndexes)
+  ) {
+    throw new VideoPromptPackCodexQueueError(
+      "Existing Render Pack idempotency record does not match the requested input identity",
+      "FINALIZATION_IDENTITY_MISMATCH",
+    );
+  }
 }
 
 export async function getVideoPromptPackCodexJob(jobId: string, options: QueueOptions = {}) {

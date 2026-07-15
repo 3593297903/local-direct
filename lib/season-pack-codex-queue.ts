@@ -336,7 +336,28 @@ export async function createSeasonPackCodexJob(
 
   await ensureFileJobStore(rootDir, TASK_ROOT);
   await ensureQueueDirs(rootDir);
-  return putPendingFileJob(rootDir, TASK_ROOT, job);
+  const stored = await putPendingFileJob(rootDir, TASK_ROOT, job);
+  if (migrationSourceJobId) assertSeasonMigrationReplacementIdentity(stored, job);
+  return stored;
+}
+
+function assertSeasonMigrationReplacementIdentity(
+  stored: SeasonPackCodexJob,
+  expected: SeasonPackCodexJob,
+) {
+  if (
+    stored.id !== expected.id
+    || stored.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION
+    || stored.sourceHash !== expected.sourceHash
+    || stored.segmentCountMode !== expected.segmentCountMode
+    || stored.requestedEpisodeCount !== expected.requestedEpisodeCount
+    || stored.episodeCount !== expected.episodeCount
+  ) {
+    throw new SeasonPackCodexQueueError(
+      "Existing Season Pack migration replacement does not match the legacy source identity",
+      "FINALIZATION_IDENTITY_MISMATCH",
+    );
+  }
 }
 
 export async function getSeasonPackCodexJob(jobId: string, options: QueueOptions = {}) {

@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
 
 process.env.TS_NODE_COMPILER_OPTIONS ||= JSON.stringify({ module: "commonjs", moduleResolution: "node" });
 const require = createRequire(import.meta.url);
 require("ts-node/register/transpile-only");
 
-const { atomicMoveFile, atomicReplaceJson } = require("../lib/file-job-store.ts");
+const { atomicReplaceJson, getFileJob } = require("../lib/file-job-store.ts");
 const { readCodexRuntimeHealthForOwner } = require("../lib/codex-runtime-health.ts");
 const { createSeasonPackCodexJob } = require("../lib/season-pack-codex-queue.ts");
 const { createVideoPromptPackCodexJob } = require("../lib/video-prompt-pack-codex-queue.ts");
@@ -21,9 +22,23 @@ const QUEUES = [
   { key: "render", namespace: ".tmp-video-prompt-pack-codex", workerName: "video-prompt-pack" },
 ];
 const STATE_DIRS = ["pending", "running", "completed", "failed"];
+const MIGRATION_LOCK_NAME = "codex-finalization-v1-migration";
 
 export async function migrateCodexFinalizationV1Jobs(options = {}) {
   const rootDir = path.resolve(options.rootDir || process.cwd());
+  const fleetLock = await acquireWorkerFleetLock(MIGRATION_LOCK_NAME, { rootDir });
+  if (!fleetLock.acquired) {
+    throw new Error("Codex finalization v1 migration is already running");
+  }
+  try {
+    await options.testHooks?.afterLockAcquired?.();
+    return await migrateCodexFinalizationV1JobsWithLock(rootDir, options);
+  } finally {
+    await fleetLock.release();
+  }
+}
+
+async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
   const action = normalizeAction(options.action);
   const selectedQueue = normalizeQueue(options.queue);
   const heartbeatMaxAgeMs = positiveInteger(options.heartbeatMaxAgeMs, 90_000);
@@ -46,6 +61,8 @@ export async function migrateCodexFinalizationV1Jobs(options = {}) {
       healthyRunningSkipped: 0,
       unverifiableOwnerSkipped: 0,
       invalidOwnerSkipped: 0,
+      reconciled: 0,
+      identityMismatch: 0,
       terminalSkipped: 0,
     },
     jobs: [],
@@ -63,14 +80,9 @@ export async function migrateCodexFinalizationV1Jobs(options = {}) {
     if (action === "dry-run") continue;
 
     const mappingKey = `${record.queue.key}:${record.job.id}`;
-    const existing = migrationMap.entries[mappingKey];
-    if (existing) {
-      report.counts.alreadyMigrated += 1;
-      reportEntry.decision = "already-migrated";
-      if (existing.newJobId) reportEntry.newJobId = redactJobId(existing.newJobId);
-      continue;
-    }
-    if (record.status === "completed" || record.status === "failed") {
+    const existing = migrationMap.entries[mappingKey] || null;
+    const sourceMigration = readSourceMigration(record.job);
+    if ((record.status === "completed" || record.status === "failed") && !sourceMigration) {
       report.counts.terminalSkipped += 1;
       reportEntry.decision = "terminal-skipped";
       continue;
@@ -97,35 +109,68 @@ export async function migrateCodexFinalizationV1Jobs(options = {}) {
     }
 
     if (action === "requeue") {
-      const replacement = await createV2Replacement(rootDir, record);
-      migrationMap.entries[mappingKey] = {
-        queue: record.queue.key,
-        oldJobId: record.job.id,
-        newJobId: replacement.id,
-        action,
-        migratedAt: new Date().toISOString(),
-      };
-      report.counts.requeued += 1;
-      reportEntry.decision = "requeued";
+      const expectedReplacementId = deterministicReplacementId(record);
+      const referencedReplacementId = existing?.newJobId || sourceMigration?.replacementJobId || null;
+      if (referencedReplacementId && referencedReplacementId !== expectedReplacementId) {
+        markIdentityMismatch(report, reportEntry, "Migration map or source references an unexpected replacement job");
+        continue;
+      }
+
+      let replacement;
+      try {
+        if (existing || sourceMigration) {
+          await getFileJob(rootDir, record.queue.namespace, expectedReplacementId);
+        }
+        replacement = await createV2Replacement(rootDir, record);
+        if (replacement.id !== expectedReplacementId) {
+          throw identityMismatchError("Deterministic replacement ID does not match the legacy source");
+        }
+      } catch (error) {
+        if (isIdentityMismatch(error) || (error instanceof Error && error.message === "File job not found")) {
+          markIdentityMismatch(report, reportEntry, error instanceof Error ? error.message : String(error));
+          continue;
+        }
+        throw error;
+      }
+
+      await options.testHooks?.afterReplacementCreated?.({ record, replacement });
+      const sourceWasActive = record.status === "pending" || record.status === "running";
+      let terminalSource = record.job;
+      if (!sourceMigration || sourceWasActive) {
+        terminalSource = await terminalizeLegacyRecord(rootDir, record, "requeue", replacement.id);
+        await options.testHooks?.afterSourceTerminalized?.({ record, replacement, terminalSource });
+      }
+      migrationMap.entries[mappingKey] = migrationMapEntry(record, "requeue", replacement.id, terminalSource);
+      await persistMigrationMap(rootDir, mappingPath, migrationMap);
+      await verifyMigratedRecord(rootDir, record, replacement, migrationMap.entries[mappingKey]);
+
+      if ((existing && sourceWasActive) || (sourceMigration && !existing)) {
+        report.counts.reconciled += 1;
+        reportEntry.decision = "reconciled";
+      } else if (existing || sourceMigration) {
+        report.counts.alreadyMigrated += 1;
+        reportEntry.decision = "already-migrated";
+      } else {
+        report.counts.requeued += 1;
+        reportEntry.decision = "requeued";
+      }
       reportEntry.newJobId = redactJobId(replacement.id);
       continue;
     }
 
-    await failLegacyRecord(rootDir, record);
-    migrationMap.entries[mappingKey] = {
-      queue: record.queue.key,
-      oldJobId: record.job.id,
-      newJobId: null,
-      action,
-      migratedAt: new Date().toISOString(),
-    };
+    if (sourceMigration || existing) {
+      migrationMap.entries[mappingKey] = migrationMapEntry(record, "fail", null, record.job);
+      await persistMigrationMap(rootDir, mappingPath, migrationMap);
+      report.counts.alreadyMigrated += 1;
+      reportEntry.decision = "already-migrated";
+      continue;
+    }
+    const terminalSource = await terminalizeLegacyRecord(rootDir, record, "fail", null);
+    await options.testHooks?.afterSourceTerminalized?.({ record, replacement: null, terminalSource });
+    migrationMap.entries[mappingKey] = migrationMapEntry(record, "fail", null, terminalSource);
+    await persistMigrationMap(rootDir, mappingPath, migrationMap);
     report.counts.failedByMigration += 1;
     reportEntry.decision = "failed";
-  }
-
-  if (action !== "dry-run") {
-    migrationMap.updatedAt = new Date().toISOString();
-    await atomicReplaceJson(mappingPath, migrationMap, { rootDir });
   }
   return report;
 }
@@ -137,7 +182,7 @@ async function collectV1Jobs(rootDir, selectedQueue) {
       const directory = path.join(rootDir, queue.namespace, state);
       for (const entry of await readJsonEntries(directory)) {
         if (Number(entry.value?.protocolVersion) === 2 || !entry.value?.id) continue;
-        records.set(`${queue.key}:${entry.value.id}`, {
+        setPreferredRecord(records, `${queue.key}:${entry.value.id}`, {
           queue,
           status: normalizeStatus(entry.value.status, state),
           job: entry.value,
@@ -150,8 +195,7 @@ async function collectV1Jobs(rootDir, selectedQueue) {
     for (const entry of await readJsonEntries(legacyDirectory)) {
       if (Number(entry.value?.protocolVersion) === 2 || !entry.value?.id) continue;
       const key = `${queue.key}:${entry.value.id}`;
-      if (records.has(key)) continue;
-      records.set(key, {
+      setPreferredRecord(records, key, {
         queue,
         status: normalizeStatus(entry.value.status, "pending"),
         job: entry.value,
@@ -163,6 +207,19 @@ async function collectV1Jobs(rootDir, selectedQueue) {
   return [...records.values()].sort((left, right) => (
     `${left.queue.key}:${left.job.id}`.localeCompare(`${right.queue.key}:${right.job.id}`)
   ));
+}
+
+function setPreferredRecord(records, key, candidate) {
+  const existing = records.get(key);
+  if (!existing || recordPriority(candidate) > recordPriority(existing)) records.set(key, candidate);
+}
+
+function recordPriority(record) {
+  if (record.status === "running") return 50;
+  if (record.status === "pending") return 40;
+  if (record.job?.legacyMigrationState === "source_terminalized") return 30;
+  if (record.status === "failed") return 20;
+  return 10;
 }
 
 async function readJsonEntries(directory) {
@@ -228,7 +285,8 @@ async function createV2Replacement(rootDir, record) {
   }, { rootDir, bypassV2CreatePause: true });
 }
 
-async function failLegacyRecord(rootDir, record) {
+async function terminalizeLegacyRecord(rootDir, record, action, replacementJobId) {
+  const migratedAt = new Date().toISOString();
   const failed = {
     ...record.job,
     status: "failed",
@@ -236,16 +294,118 @@ async function failLegacyRecord(rootDir, record) {
     leaseId: null,
     workerId: null,
     heartbeatAt: new Date().toISOString(),
-    error: "Protocol v1 job was explicitly failed by the finalization migration tool.",
-    errorCode: "FINALIZATION_V1_MIGRATED_FAILED",
-    updatedAt: new Date().toISOString(),
-    failedAt: new Date().toISOString(),
+    error: action === "requeue"
+      ? "Protocol v1 job was replaced by a deterministic protocol v2 task."
+      : "Protocol v1 job was explicitly failed by the finalization migration tool.",
+    errorCode: action === "requeue" ? "FINALIZATION_V1_REQUEUED" : "FINALIZATION_V1_MIGRATED_FAILED",
+    legacyMigrationAction: action,
+    legacyMigrationState: "source_terminalized",
+    replacementJobId,
+    migratedAt,
+    updatedAt: migratedAt,
+    failedAt: migratedAt,
   };
-  await atomicReplaceJson(record.path, failed, { rootDir });
-  if (record.storage === "state" && record.status !== "failed") {
-    const destination = path.join(rootDir, record.queue.namespace, "failed", `${record.job.id}.json`);
-    await atomicMoveFile(record.path, destination, { rootDir });
+  const destination = path.join(rootDir, record.queue.namespace, "failed", `${record.job.id}.json`);
+  await atomicReplaceJson(destination, failed, { rootDir });
+  for (const activePath of legacyActivePaths(rootDir, record)) {
+    if (path.resolve(activePath) === path.resolve(destination)) continue;
+    const active = await readJsonFile(activePath);
+    if (
+      active?.id === record.job.id
+      && Number(active.protocolVersion) !== 2
+      && ["pending", "running"].includes(normalizeStatus(active.status, "pending"))
+    ) {
+      await rm(activePath, { force: true });
+    }
   }
+  return failed;
+}
+
+function legacyActivePaths(rootDir, record) {
+  const fileName = `${record.job.id}.json`;
+  return [...new Set([
+    record.path,
+    path.join(rootDir, record.queue.namespace, "pending", fileName),
+    path.join(rootDir, record.queue.namespace, "running", fileName),
+    path.join(rootDir, record.queue.namespace, "jobs", fileName),
+  ])];
+}
+
+async function readJsonFile(target) {
+  try {
+    return JSON.parse(await readFile(target, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function readSourceMigration(job) {
+  if (job?.legacyMigrationState !== "source_terminalized") return null;
+  return {
+    action: job.legacyMigrationAction,
+    replacementJobId: job.replacementJobId || null,
+    migratedAt: job.migratedAt || null,
+  };
+}
+
+function deterministicReplacementId(record) {
+  if (record.queue.key === "season") {
+    return `season-pack-job-${createHash("sha256").update(`finalization-v1:${record.job.id}`).digest("hex").slice(0, 32)}`;
+  }
+  return `video-prompt-pack-job-${createHash("sha256").update(`finalization-v1:${record.job.id}`).digest("hex").slice(0, 32)}`;
+}
+
+function migrationMapEntry(record, action, replacementJobId, terminalSource) {
+  return {
+    queue: record.queue.key,
+    oldJobId: record.job.id,
+    newJobId: replacementJobId,
+    action,
+    migratedAt: terminalSource.migratedAt || new Date().toISOString(),
+  };
+}
+
+async function persistMigrationMap(rootDir, mappingPath, migrationMap) {
+  migrationMap.updatedAt = new Date().toISOString();
+  await atomicReplaceJson(mappingPath, migrationMap, { rootDir });
+}
+
+async function verifyMigratedRecord(rootDir, record, replacement, mapEntry) {
+  if (mapEntry.newJobId !== replacement.id) throw identityMismatchError("Migration map replacement identity changed");
+  const failedPath = path.join(rootDir, record.queue.namespace, "failed", `${record.job.id}.json`);
+  const source = await readJsonFile(failedPath);
+  if (
+    source?.legacyMigrationState !== "source_terminalized"
+    || source.replacementJobId !== replacement.id
+    || source.errorCode !== "FINALIZATION_V1_REQUEUED"
+  ) {
+    throw new Error("Legacy migration source terminalization could not be verified");
+  }
+  for (const activePath of legacyActivePaths(rootDir, record)) {
+    if (path.resolve(activePath) === path.resolve(failedPath)) continue;
+    const active = await readJsonFile(activePath);
+    if (active?.id === record.job.id && Number(active.protocolVersion) !== 2) {
+      throw new Error("Legacy migration source remains active after terminalization");
+    }
+  }
+}
+
+function identityMismatchError(message) {
+  const error = new Error(message);
+  error.code = "FINALIZATION_IDENTITY_MISMATCH";
+  return error;
+}
+
+function isIdentityMismatch(error) {
+  return error?.code === "FINALIZATION_IDENTITY_MISMATCH";
+}
+
+function markIdentityMismatch(report, reportEntry, message) {
+  report.counts.identityMismatch += 1;
+  reportEntry.decision = "manual-review";
+  reportEntry.errorCode = "FINALIZATION_IDENTITY_MISMATCH";
+  reportEntry.error = String(message || "Replacement identity mismatch");
 }
 
 async function readMigrationMap(target) {
