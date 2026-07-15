@@ -131,6 +131,25 @@ function writeHealthyWorkerHeartbeat(rootDir, workerName, workerInstanceId, pid 
   }), "utf8");
 }
 
+function writeMigrationMapDocument(rootDir, document) {
+  const directory = path.join(rootDir, ".tmp-codex-finalization-migration");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(path.join(directory, "v1-migration-map.json"), `${JSON.stringify(document, null, 2)}\n`, "utf8");
+}
+
+function runMigrationCli(rootDir, queue = "season", action = "fail") {
+  return spawnSync(process.execPath, [
+    path.resolve("scripts/migrate-codex-finalization-v1-jobs.mjs"),
+    `--root-dir=${rootDir}`,
+    `--queue=${queue}`,
+    `--action=${action}`,
+  ], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: { ...process.env, TS_NODE_COMPILER_OPTIONS: process.env.TS_NODE_COMPILER_OPTIONS },
+  });
+}
+
 async function createActiveRequeueFixture(rootDir) {
   const season = await createSeasonPackCodexJob({
     script: "Persisted requeue intent must remain immutable.",
@@ -1080,6 +1099,174 @@ test("v1 dry-run reports malformed persisted state without mutating files", asyn
     assert.equal(report.counts.stateConflict, 1);
     assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
     assert.deepEqual(snapshotFiles(rootDir), before);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 map integrity rejects a present null entry before any mutation", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Null map entry must fail closed.", episodeCount: 1 }, { rootDir });
+    const sourcePath = markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    writeMigrationMap(rootDir, { [`season:${season.id}`]: null });
+    const before = snapshotFiles(rootDir);
+    const sourceBefore = readFileSync(sourcePath, "utf8");
+    const mapBefore = readMigrationMapBytes(rootDir);
+    const replacementsBefore = countV2Jobs(rootDir, ".tmp-season-pack-codex");
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+
+    assert.equal(report.counts.stateConflict, 1);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+    assert.equal(readFileSync(sourcePath, "utf8"), sourceBefore);
+    assert.equal(readMigrationMapBytes(rootDir), mapBefore);
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 1);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), replacementsBefore);
+    assert.equal(existsSync(path.join(rootDir, ".tmp-season-pack-codex", "failed", `${season.id}.json`)), false);
+    assert.deepEqual(snapshotFiles(rootDir), before);
+
+    const cli = runMigrationCli(rootDir);
+    assert.notEqual(cli.status, 0);
+    assert.equal(JSON.parse(cli.stdout).jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+    assert.deepEqual(snapshotFiles(rootDir), before);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 map integrity rejects a present null entry during dry-run", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Dry-run must expose null map entries.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    writeMigrationMap(rootDir, { [`season:${season.id}`]: null });
+    const before = snapshotFiles(rootDir);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "dry-run" });
+
+    assert.equal(report.counts.stateConflict, 1);
+    assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+    assert.deepEqual(snapshotFiles(rootDir), before);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 map integrity rejects every present non-object entry shape without mutation", async () => {
+  for (const entryValue of [null, [], "invalid", 0, false]) {
+    const rootDir = makeTempRoot();
+    try {
+      const season = await createSeasonPackCodexJob({ script: "Non-object map entries must fail closed.", episodeCount: 1 }, { rootDir });
+      markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+      writeMigrationMap(rootDir, { [`season:${season.id}`]: entryValue });
+      const before = snapshotFiles(rootDir);
+      const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+      const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+
+      assert.equal(report.counts.stateConflict, 1, `entry ${JSON.stringify(entryValue)} must conflict`);
+      assert.equal(report.jobs[0].errorCode, "FINALIZATION_V1_MIGRATION_STATE_CONFLICT");
+      assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 1);
+      assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 0);
+      assert.deepEqual(snapshotFiles(rootDir), before);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("v1 map integrity rejects an entries array root before terminalizing an active source", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "Array entries roots must fail closed.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    writeMigrationMapDocument(rootDir, { schemaVersion: 1, updatedAt: null, entries: [] });
+    const before = snapshotFiles(rootDir);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    await assert.rejects(
+      migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" }),
+      (error) => error?.code === "FINALIZATION_V1_MIGRATION_STATE_CONFLICT",
+    );
+
+    assert.equal(countActiveV1Jobs(rootDir, ".tmp-season-pack-codex", season.id), 1);
+    assert.equal(countV2Jobs(rootDir, ".tmp-season-pack-codex"), 0);
+    assert.equal(existsSync(path.join(rootDir, ".tmp-season-pack-codex", "failed", `${season.id}.json`)), false);
+    assert.deepEqual(snapshotFiles(rootDir), before);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 map integrity rejects invalid root documents even when no legacy jobs exist", async () => {
+  const invalidRoots = [
+    null,
+    [],
+    { schemaVersion: 2, entries: {} },
+    { schemaVersion: 1 },
+    { schemaVersion: 1, entries: null },
+    { schemaVersion: 1, entries: "invalid" },
+  ];
+
+  for (const document of invalidRoots) {
+    const rootDir = makeTempRoot();
+    try {
+      writeMigrationMapDocument(rootDir, document);
+      const before = snapshotFiles(rootDir);
+      const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+      await assert.rejects(
+        migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" }),
+        (error) => error?.code === "FINALIZATION_V1_MIGRATION_STATE_CONFLICT",
+        `root ${JSON.stringify(document)} must reject`,
+      );
+      assert.deepEqual(snapshotFiles(rootDir), before);
+
+      const cli = runMigrationCli(rootDir);
+      assert.notEqual(cli.status, 0);
+      assert.match(cli.stderr, /FINALIZATION_V1_MIGRATION_STATE_CONFLICT/);
+      assert.deepEqual(snapshotFiles(rootDir), before);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("v1 map integrity accepts a valid empty map document", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    writeMigrationMapDocument(rootDir, { schemaVersion: 1, entries: {} });
+    const before = snapshotFiles(rootDir);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+
+    assert.equal(report.counts.stateConflict, 0);
+    assert.equal(report.jobs.length, 0);
+    assert.deepEqual(snapshotFiles(rootDir), before);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("v1 map integrity still creates the first legal map after ENOENT", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const season = await createSeasonPackCodexJob({ script: "A missing map remains a valid first migration.", episodeCount: 1 }, { rootDir });
+    markPendingAsV1(rootDir, ".tmp-season-pack-codex", season.id);
+    const { migrateCodexFinalizationV1Jobs } = await loadMigrationModule();
+
+    const report = await migrateCodexFinalizationV1Jobs({ rootDir, queue: "season", action: "fail" });
+    const document = JSON.parse(readMigrationMapBytes(rootDir));
+
+    assert.equal(report.counts.failedByMigration, 1);
+    assert.equal(document.schemaVersion, 1);
+    assert.ok(document.entries && !Array.isArray(document.entries));
+    assert.equal(document.entries[`season:${season.id}`].action, "fail");
+    assert.equal(document.entries[`season:${season.id}`].newJobId, null);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

@@ -44,7 +44,9 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
   const heartbeatMaxAgeMs = positiveInteger(options.heartbeatMaxAgeMs, 90_000);
   const records = await collectV1Jobs(rootDir, selectedQueue);
   const mappingPath = path.join(rootDir, MIGRATION_ROOT, MIGRATION_MAP_FILE);
-  const migrationMap = await readMigrationMap(mappingPath);
+  const loadedMigrationMap = await readMigrationMap(mappingPath);
+  const migrationMap = loadedMigrationMap.document;
+  let mapPresent = loadedMigrationMap.present;
   const report = {
     schemaVersion: 1,
     action,
@@ -83,8 +85,13 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
     };
     report.jobs.push(reportEntry);
     const mappingKey = `${record.queue.key}:${record.job.id}`;
-    const existing = hasOwn(migrationMap.entries, mappingKey) ? migrationMap.entries[mappingKey] : null;
-    const preflight = preflightMigrationRecord(record, existing, action === "dry-run" ? null : action);
+    const entryPresent = hasOwn(migrationMap.entries, mappingKey);
+    const entryValue = entryPresent ? migrationMap.entries[mappingKey] : undefined;
+    const preflight = preflightMigrationRecord(record, {
+      mapPresent,
+      entryPresent,
+      value: entryValue,
+    }, action === "dry-run" ? null : action);
     if (preflight.status === "state-conflict") {
       markMigrationConflict(
         report,
@@ -111,6 +118,7 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
     }
 
     const sourceMigration = preflight.sourceMigration;
+    const existing = preflight.mapEntry;
     if (action === "dry-run") continue;
     if ((record.status === "completed" || record.status === "failed") && !sourceMigration) {
       report.counts.terminalSkipped += 1;
@@ -148,7 +156,7 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
 
       let replacement;
       try {
-        if (existing || sourceMigration) {
+        if (preflight.entryPresent || sourceMigration) {
           await getFileJob(rootDir, record.queue.namespace, expectedReplacementId);
         }
         replacement = await createV2Replacement(rootDir, record);
@@ -170,16 +178,18 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
         terminalSource = await terminalizeLegacyRecord(rootDir, record, "requeue", replacement.id);
         await options.testHooks?.afterSourceTerminalized?.({ record, replacement, terminalSource });
       }
-      if (!existing) {
+      if (!preflight.entryPresent) {
         migrationMap.entries[mappingKey] = migrationMapEntry(record, "requeue", replacement.id, terminalSource);
         await persistMigrationMap(rootDir, mappingPath, migrationMap);
+        mapPresent = true;
       }
-      await verifyMigratedRecord(rootDir, record, replacement, migrationMap.entries[mappingKey] || existing);
+      const verifiedMapEntry = preflight.entryPresent ? existing : migrationMap.entries[mappingKey];
+      await verifyMigratedRecord(rootDir, record, replacement, verifiedMapEntry);
 
-      if ((existing && sourceWasActive) || (sourceMigration && !existing)) {
+      if ((preflight.entryPresent && sourceWasActive) || (sourceMigration && !preflight.entryPresent)) {
         report.counts.reconciled += 1;
         reportEntry.decision = "reconciled";
-      } else if (existing || sourceMigration) {
+      } else if (preflight.entryPresent || sourceMigration) {
         report.counts.alreadyMigrated += 1;
         reportEntry.decision = "already-migrated";
       } else {
@@ -196,16 +206,18 @@ async function migrateCodexFinalizationV1JobsWithLock(rootDir, options) {
       terminalSource = await terminalizeLegacyRecord(rootDir, record, "fail", null);
       await options.testHooks?.afterSourceTerminalized?.({ record, replacement: null, terminalSource });
     }
-    if (!existing) {
+    if (!preflight.entryPresent) {
       migrationMap.entries[mappingKey] = migrationMapEntry(record, "fail", null, terminalSource);
       await persistMigrationMap(rootDir, mappingPath, migrationMap);
+      mapPresent = true;
     }
-    await verifyFailedMigrationRecord(rootDir, record, migrationMap.entries[mappingKey] || existing);
+    const verifiedMapEntry = preflight.entryPresent ? existing : migrationMap.entries[mappingKey];
+    await verifyFailedMigrationRecord(rootDir, record, verifiedMapEntry);
 
-    if ((existing && sourceWasActive) || (sourceMigration && !existing)) {
+    if ((preflight.entryPresent && sourceWasActive) || (sourceMigration && !preflight.entryPresent)) {
       report.counts.reconciled += 1;
       reportEntry.decision = "reconciled";
-    } else if (existing || sourceMigration) {
+    } else if (preflight.entryPresent || sourceMigration) {
       report.counts.alreadyMigrated += 1;
       reportEntry.decision = "already-migrated";
     } else {
@@ -389,30 +401,39 @@ function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function validateMigrationMapEntry(record, existingMapEntry) {
-  if (existingMapEntry === null || existingMapEntry === undefined) {
-    return { status: "absent", action: null, replacementJobId: null };
+function validateMigrationMapEntry(record, mapEntryState) {
+  const mapPresent = mapEntryState.mapPresent === true;
+  const entryPresent = mapEntryState.entryPresent === true;
+  const existingMapEntry = mapEntryState.value;
+  const context = {
+    mapPresent,
+    entryPresent,
+    mapEntry: entryPresent ? existingMapEntry : undefined,
+  };
+  if (!entryPresent) {
+    return { ...context, status: "absent", action: null, replacementJobId: null };
   }
   if (!isPlainObject(existingMapEntry)) {
-    return { status: "state-conflict", error: "Migration map entry must be an object" };
+    return { ...context, status: "state-conflict", error: "Migration map entry must be an object" };
   }
   if (existingMapEntry.queue !== record.queue.key || existingMapEntry.oldJobId !== record.job.id) {
-    return { status: "state-conflict", error: "Migration map entry does not match its source queue and job" };
+    return { ...context, status: "state-conflict", error: "Migration map entry does not match its source queue and job" };
   }
   const action = normalizePersistedAction(existingMapEntry.action);
   if (!action) {
-    return { status: "state-conflict", error: "Migration map entry contains an invalid or missing action" };
+    return { ...context, status: "state-conflict", error: "Migration map entry contains an invalid or missing action" };
   }
   if (!hasOwn(existingMapEntry, "newJobId")) {
-    return { status: "state-conflict", error: "Migration map entry is missing newJobId" };
+    return { ...context, status: "state-conflict", error: "Migration map entry is missing newJobId" };
   }
   if (action === "fail" && existingMapEntry.newJobId !== null) {
-    return { status: "state-conflict", error: "Failed migration map must contain an explicit null newJobId" };
+    return { ...context, status: "state-conflict", error: "Failed migration map must contain an explicit null newJobId" };
   }
   if (action === "requeue") {
     const expectedReplacementId = deterministicReplacementId(record);
     if (existingMapEntry.newJobId !== expectedReplacementId) {
       return {
+        ...context,
         status: "identity-mismatch",
         action,
         replacementJobId: existingMapEntry.newJobId,
@@ -421,6 +442,7 @@ function validateMigrationMapEntry(record, existingMapEntry) {
     }
   }
   return {
+    ...context,
     status: "valid",
     action,
     replacementJobId: existingMapEntry.newJobId,
@@ -470,17 +492,20 @@ function validateSourceMigrationAudit(record) {
   };
 }
 
-function preflightMigrationRecord(record, existingMapEntry, requestedAction) {
-  const map = validateMigrationMapEntry(record, existingMapEntry);
+function preflightMigrationRecord(record, mapEntryState, requestedAction) {
+  const map = validateMigrationMapEntry(record, mapEntryState);
   if (map.status === "state-conflict") return map;
   const source = validateSourceMigrationAudit(record);
-  if (source.status === "state-conflict") return source;
+  if (source.status === "state-conflict") return { ...map, ...source };
 
   const sourceMigration = source.migration || null;
   const sourceAction = sourceMigration?.action || null;
   const mapAction = map.action || null;
   if (sourceAction && mapAction && sourceAction !== mapAction) {
     return {
+      mapPresent: map.mapPresent,
+      entryPresent: map.entryPresent,
+      mapEntry: map.mapEntry,
       status: "state-conflict",
       error: `Source migration action ${sourceAction} conflicts with map action ${mapAction}`,
     };
@@ -489,35 +514,48 @@ function preflightMigrationRecord(record, existingMapEntry, requestedAction) {
   const persistedAction = sourceAction || mapAction || null;
   if (requestedAction && persistedAction && persistedAction !== requestedAction) {
     return {
+      mapPresent: map.mapPresent,
+      entryPresent: map.entryPresent,
+      mapEntry: map.mapEntry,
       status: "action-conflict",
       persistedAction,
       sourceMigration,
-      replacementJobId: map.replacementJobId ?? sourceMigration?.replacementJobId ?? null,
+      replacementJobId: map.entryPresent
+        ? map.replacementJobId
+        : sourceMigration?.replacementJobId ?? null,
       error: `Requested migration action ${requestedAction} conflicts with persisted action ${persistedAction}`,
     };
   }
 
   if (map.status === "identity-mismatch") return map;
-  if (source.status === "identity-mismatch") return source;
+  if (source.status === "identity-mismatch") return { ...map, ...source };
 
   const terminal = record.status === "completed" || record.status === "failed";
-  if (terminal && existingMapEntry !== null && existingMapEntry !== undefined && source.status === "absent") {
+  if (terminal && map.entryPresent && source.status === "absent") {
     return {
+      mapPresent: map.mapPresent,
+      entryPresent: map.entryPresent,
+      mapEntry: map.mapEntry,
       status: "state-conflict",
       persistedAction,
       error: "Terminal source has a migration map but no source migration audit",
     };
   }
   return {
+    mapPresent: map.mapPresent,
+    entryPresent: map.entryPresent,
+    mapEntry: map.mapEntry,
     status: persistedAction ? "same-action" : "new",
     persistedAction,
     sourceMigration,
-    replacementJobId: map.replacementJobId ?? sourceMigration?.replacementJobId ?? null,
+    replacementJobId: map.entryPresent
+      ? map.replacementJobId
+      : sourceMigration?.replacementJobId ?? null,
   };
 }
 
-export function resolvePersistedMigrationIntent(record, existingMapEntry, requestedAction) {
-  return preflightMigrationRecord(record, existingMapEntry, requestedAction);
+export function resolvePersistedMigrationIntent(record, mapEntryState, requestedAction) {
+  return preflightMigrationRecord(record, mapEntryState, requestedAction);
 }
 
 function normalizePersistedAction(value) {
@@ -543,6 +581,7 @@ function migrationMapEntry(record, action, replacementJobId, terminalSource) {
 }
 
 async function persistMigrationMap(rootDir, mappingPath, migrationMap) {
+  assertValidMigrationMapDocument(migrationMap);
   migrationMap.updatedAt = new Date().toISOString();
   await atomicReplaceJson(mappingPath, migrationMap, { rootDir });
 }
@@ -616,14 +655,42 @@ function markMigrationConflict(report, reportEntry, countKey, errorCode, message
 
 async function readMigrationMap(target) {
   try {
-    const parsed = JSON.parse(await readFile(target, "utf8"));
-    return parsed?.schemaVersion === 1 && parsed.entries && typeof parsed.entries === "object"
-      ? parsed
-      : { schemaVersion: 1, updatedAt: null, entries: {} };
+    const source = await readFile(target, "utf8");
+    let parsed;
+    try {
+      parsed = JSON.parse(source);
+    } catch {
+      throw migrationStateConflictError("Migration map contains invalid JSON");
+    }
+    assertValidMigrationMapDocument(parsed);
+    return { present: true, document: parsed };
   } catch (error) {
-    if (error?.code === "ENOENT") return { schemaVersion: 1, updatedAt: null, entries: {} };
+    if (error?.code === "ENOENT") {
+      return {
+        present: false,
+        document: { schemaVersion: 1, updatedAt: null, entries: {} },
+      };
+    }
     throw error;
   }
+}
+
+function assertValidMigrationMapDocument(value) {
+  if (!isPlainObject(value)) {
+    throw migrationStateConflictError("Migration map root must be an object");
+  }
+  if (!hasOwn(value, "schemaVersion") || value.schemaVersion !== 1) {
+    throw migrationStateConflictError("Migration map schemaVersion must equal 1");
+  }
+  if (!hasOwn(value, "entries") || !isPlainObject(value.entries)) {
+    throw migrationStateConflictError("Migration map entries must be an object");
+  }
+}
+
+function migrationStateConflictError(message) {
+  const error = new Error(`FINALIZATION_V1_MIGRATION_STATE_CONFLICT: ${message}`);
+  error.code = "FINALIZATION_V1_MIGRATION_STATE_CONFLICT";
+  return error;
 }
 
 function normalizeAction(value) {
