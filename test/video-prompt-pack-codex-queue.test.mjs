@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -1058,6 +1058,94 @@ test("legacy completed Render Pack jobs remain readable without protocol v2 publ
     assert.equal(observed.status, "completed");
     assert.equal(observed.resultAvailable, true);
     assert.equal(observed.result.segments[0].result.title, "Legacy completed segment");
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("Render Pack v2 creation pause rejects only new jobs while existing v2 work remains readable", async () => {
+  const rootDir = makeTempRoot();
+  const previous = process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED;
+  try {
+    delete process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED;
+    const existing = await createVideoPromptPackCodexJob({
+      idempotencyKey: "existing-during-create-pause",
+      segments: [{
+        episodeIndex: 1,
+        title: "Existing render",
+        script: "Existing protocol v2 Render Pack remains available.",
+        renderInputScript: "Render the existing task without creating another task.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED = "0";
+
+    await assert.rejects(
+      () => createVideoPromptPackCodexJob({
+        segments: [{
+          episodeIndex: 2,
+          title: "Paused render",
+          script: "This new Render Pack must be paused.",
+          renderInputScript: "Do not create this job while rollout is paused.",
+          duration: "12 seconds",
+        }],
+      }, { rootDir }),
+      (error) => error?.code === "FINALIZATION_V2_CREATE_PAUSED",
+    );
+    const observed = await getVideoPromptPackCodexJob(existing.id, { rootDir });
+    assert.equal(observed.id, existing.id);
+    assert.equal(observed.protocolVersion, 2);
+    const claimed = await claimNextVideoPromptPackCodexJob({ rootDir, workerId: "rollout-render-owner" });
+    assert.equal(claimed.id, existing.id);
+    mkdirSync(path.dirname(claimed.segments[0].outputPath), { recursive: true });
+    writeFileSync(
+      claimed.segments[0].outputPath,
+      JSON.stringify(sampleAnalysisResult(claimed.segments[0].title), null, 2),
+      "utf8",
+    );
+    const completed = await finalizeAndCompleteRenderPack(claimed, rootDir);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.resultAvailable, true);
+    assert.equal((await getVideoPromptPackCodexJob(existing.id, { rootDir })).status, "completed");
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED;
+    else process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED = previous;
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("Render Pack legacy GET is read-only and never silently migrates its job file", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const created = await createVideoPromptPackCodexJob({
+      segments: [{
+        episodeIndex: 1,
+        title: "Legacy read-only render",
+        script: "Legacy Render Pack remains readable in place.",
+        renderInputScript: "Read this completed legacy result without migration.",
+        duration: "12 seconds",
+      }],
+    }, { rootDir });
+    const pendingPath = path.join(rootDir, ".tmp-video-prompt-pack-codex", "pending", `${created.id}.json`);
+    const legacyDir = path.join(rootDir, ".tmp-video-prompt-pack-codex", "jobs");
+    const legacyPath = path.join(legacyDir, `${created.id}.json`);
+    mkdirSync(legacyDir, { recursive: true });
+    const legacy = {
+      ...JSON.parse(readFileSync(pendingPath, "utf8")),
+      protocolVersion: 1,
+      stage: "completed",
+      status: "completed",
+      resultAvailable: true,
+      result: { segments: [] },
+    };
+    const before = `${JSON.stringify(legacy, null, 2)}\n`;
+    writeFileSync(legacyPath, before, "utf8");
+    rmSync(pendingPath, { force: true });
+
+    const observed = await getVideoPromptPackCodexJob(created.id, { rootDir });
+    assert.equal(observed.protocolVersion, 1);
+    assert.equal(readFileSync(legacyPath, "utf8"), before);
+    assert.equal(existsSync(path.join(rootDir, ".tmp-video-prompt-pack-codex", "completed", `${created.id}.json`)), false);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

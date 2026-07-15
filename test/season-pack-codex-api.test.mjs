@@ -23,6 +23,9 @@ test("season pack Codex job API exposes create, poll, claim, complete, and fail 
   assert.match(createRoute, /segmentCountMode/);
   assert.match(createRoute, /auto/);
   assert.match(createRoute, /projectMemory/);
+  assert.match(createRoute, /assertCodexFinalizationV2CreateEnabled/);
+  assert.match(createRoute, /FINALIZATION_V2_CREATE_PAUSED/);
+  assert.match(createRoute, /status:\s*503/);
 
   const pollRoute = readFileSync(routes[1], "utf8");
   assert.match(pollRoute, /getSeasonPackCodexJob/);

@@ -1465,3 +1465,73 @@ test("quota circuit can atomically fail pending Season Pack work without bypassi
     rmSync(rootDir, { recursive: true, force: true });
   }
 });
+
+test("Season Pack v2 creation pause rejects only new jobs while existing v2 work remains readable", async () => {
+  const rootDir = makeTempRoot();
+  const previous = process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED;
+  try {
+    delete process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED;
+    const existing = await createSeasonPackCodexJob({
+      script: "Existing protocol v2 Season Pack remains available during a rollout pause.",
+      episodeCount: 1,
+    }, { rootDir });
+    process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED = "false";
+
+    await assert.rejects(
+      () => createSeasonPackCodexJob({ script: "Paused Season creation.", episodeCount: 1 }, { rootDir }),
+      (error) => error?.code === "FINALIZATION_V2_CREATE_PAUSED",
+    );
+    const observed = await getSeasonPackCodexJob(existing.id, { rootDir });
+    assert.equal(observed.id, existing.id);
+    assert.equal(observed.protocolVersion, 2);
+    const claimed = await claimNextSeasonPackCodexJob({ rootDir, workerId: "rollout-existing-owner" });
+    assert.equal(claimed.id, existing.id);
+    mkdirSync(claimed.episodesDir, { recursive: true });
+    writeLockedSeasonPlan(claimed, 1, {
+      titles: [sampleEpisodeInput(1).title],
+      sourceTexts: [sampleEpisodeInput(1).sourceText],
+    });
+    writeFileSync(
+      path.join(claimed.episodesDir, "episode-001.json"),
+      JSON.stringify(sampleEpisodeInput(1), null, 2),
+      "utf8",
+    );
+    const completed = await finalizeAndCompleteSeasonPack(claimed, rootDir);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.resultAvailable, true);
+    assert.equal((await getSeasonPackCodexJob(existing.id, { rootDir })).status, "completed");
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED;
+    else process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED = previous;
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("Season Pack legacy GET is read-only and never silently migrates its job file", async () => {
+  const rootDir = makeTempRoot();
+  try {
+    const created = await createSeasonPackCodexJob({ script: "Read-only legacy Season job.", episodeCount: 1 }, { rootDir });
+    const pendingPath = path.join(rootDir, ".tmp-season-pack-codex", "pending", `${created.id}.json`);
+    const legacyDir = path.join(rootDir, ".tmp-season-pack-codex", "jobs");
+    const legacyPath = path.join(legacyDir, `${created.id}.json`);
+    mkdirSync(legacyDir, { recursive: true });
+    const legacy = {
+      ...JSON.parse(readFileSync(pendingPath, "utf8")),
+      protocolVersion: 1,
+      stage: "completed",
+      status: "completed",
+      resultAvailable: true,
+      result: { seasonPlan: { projectTitle: "Legacy" }, episodes: [] },
+    };
+    const before = `${JSON.stringify(legacy, null, 2)}\n`;
+    writeFileSync(legacyPath, before, "utf8");
+    rmSync(pendingPath, { force: true });
+
+    const observed = await getSeasonPackCodexJob(created.id, { rootDir });
+    assert.equal(observed.protocolVersion, 1);
+    assert.equal(readFileSync(legacyPath, "utf8"), before);
+    assert.equal(existsSync(path.join(rootDir, ".tmp-season-pack-codex", "completed", `${created.id}.json`)), false);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});

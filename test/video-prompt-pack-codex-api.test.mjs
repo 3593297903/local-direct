@@ -20,6 +20,9 @@ test("video prompt render pack API exposes create, poll, claim, complete, and fa
   assert.match(createRoute, /segments/);
   assert.match(createRoute, /episodeIndex/);
   assert.match(createRoute, /renderInputScript/);
+  assert.match(createRoute, /assertCodexFinalizationV2CreateEnabled/);
+  assert.match(createRoute, /FINALIZATION_V2_CREATE_PAUSED/);
+  assert.match(createRoute, /status:\s*503/);
 
   const claimRoute = readFileSync(routes[2], "utf8");
   assert.match(claimRoute, /claimNextVideoPromptPackCodexJob/);

@@ -27,6 +27,7 @@ import {
   type CodexFinalizedResultRef,
   CodexJobFinalizationError,
   assertFinalizationFilesStable,
+  assertCodexFinalizationV2CreateEnabled,
   createJobStagingDirectory,
   hashCanonicalJson,
   publishFinalizedJob,
@@ -177,6 +178,8 @@ export type SeasonPackCodexJob = {
 
 type QueueOptions = {
   rootDir?: string;
+  bypassV2CreatePause?: boolean;
+  migrationSourceJobId?: string;
 };
 
 type ClaimOptions = QueueOptions & {
@@ -257,11 +260,15 @@ export async function createSeasonPackCodexJob(
   input: CreateSeasonPackCodexJobInput,
   options: QueueOptions = {},
 ) {
+  if (!options.bypassV2CreatePause) assertCodexFinalizationV2CreateEnabled();
   validateCreateInput(input);
 
   const rootDir = resolveRootDir(options);
   const now = new Date().toISOString();
-  const jobId = createId("season-pack-job");
+  const migrationSourceJobId = cleanString(options.migrationSourceJobId);
+  const jobId = migrationSourceJobId
+    ? `season-pack-job-${createHash("sha256").update(`finalization-v1:${migrationSourceJobId}`).digest("hex").slice(0, 32)}`
+    : createId("season-pack-job");
   const packDir = path.join(packRootDir(rootDir), jobId);
   const episodesDir = path.join(packDir, "episodes");
   const manifestPath = path.join(packDir, "manifest.json");
@@ -1164,8 +1171,7 @@ function resetRecoveredSeasonPackJob(job: SeasonPackCodexJob): SeasonPackCodexJo
 }
 
 async function readLegacySeasonPackJob(rootDir: string, jobId: string) {
-  const legacy = normalizeStoredSeasonPackJob(await readJob(rootDir, jobId));
-  return syncAndSaveJob(rootDir, legacy);
+  return normalizeStoredSeasonPackJob(await readJob(rootDir, jobId));
 }
 
 function mapSeasonFinalizationError(error: CodexJobFinalizationError) {

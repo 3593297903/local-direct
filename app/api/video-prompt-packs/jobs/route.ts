@@ -7,6 +7,10 @@ import {
 import { CODEX_QUOTA_EXHAUSTED_CODE, assertCodexRuntimeAvailable } from "@/lib/codex-runtime-state";
 import type { SegmentContract } from "@/lib/batch-segment-contract";
 import { fileJobRouteError } from "@/lib/file-job-route-error";
+import {
+  assertCodexFinalizationV2CreateEnabled,
+  CODEX_FINALIZATION_V2_CREATE_PAUSED_CODE,
+} from "@/lib/codex-job-finalization";
 
 export const runtime = "nodejs";
 
@@ -34,10 +38,17 @@ const RequestSchema = z.object({
 export async function POST(request: NextRequest) {
   try {
     const body = RequestSchema.parse(await request.json());
+    assertCodexFinalizationV2CreateEnabled();
     await assertCodexRuntimeAvailable();
     const job = await createVideoPromptPackCodexJob(body);
     return NextResponse.json({ ok: true, job: toVideoPromptPackCodexJobStatusDto(job) }, { status: 201 });
   } catch (error: any) {
+    if (error?.code === CODEX_FINALIZATION_V2_CREATE_PAUSED_CODE) {
+      return NextResponse.json(
+        { ok: false, code: CODEX_FINALIZATION_V2_CREATE_PAUSED_CODE, errorCode: CODEX_FINALIZATION_V2_CREATE_PAUSED_CODE, error: error.message },
+        { status: 503 },
+      );
+    }
     const isQuotaError = error?.code === CODEX_QUOTA_EXHAUSTED_CODE || String(error?.message || "").includes(CODEX_QUOTA_EXHAUSTED_CODE);
     if (isQuotaError) {
       return NextResponse.json(

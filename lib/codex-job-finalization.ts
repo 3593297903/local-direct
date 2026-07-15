@@ -12,6 +12,16 @@ import { atomicReplaceJson } from "./file-job-store";
 
 export const CODEX_FINALIZATION_PROTOCOL_VERSION = 2 as const;
 export const CODEX_FINAL_MANIFEST_FILE = "final-manifest.v2.json";
+export const CODEX_FINALIZATION_V2_CREATE_PAUSED_CODE = "FINALIZATION_V2_CREATE_PAUSED";
+
+export function assertCodexFinalizationV2CreateEnabled() {
+  const configured = String(process.env.CODEX_FINALIZATION_V2_CREATE_ENABLED ?? "true").trim().toLowerCase();
+  if (!["0", "false", "no", "off"].includes(configured)) return;
+  const error = new Error("Protocol v2 Codex finalization job creation is temporarily paused") as Error & { code: string };
+  error.name = "CodexFinalizationV2CreatePausedError";
+  error.code = CODEX_FINALIZATION_V2_CREATE_PAUSED_CODE;
+  throw error;
+}
 
 export type CodexFinalizationTaskClass = "season_pack" | "render_pack";
 export type CodexFinalizationOutputKind =

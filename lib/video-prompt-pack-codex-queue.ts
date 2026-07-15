@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
+import { readdir, readFile, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import type { AnalysisResult } from "../types";
 import type { SegmentContract, SegmentEvidenceField } from "./batch-segment-contract";
@@ -18,6 +18,7 @@ import { applyPromptSafetyPolicyDeep, type PromptSafetyDiff } from "./prompt-saf
 import { readCodexRuntimeHealth } from "./codex-runtime-health";
 import {
   assertFinalizationFilesStable,
+  assertCodexFinalizationV2CreateEnabled,
   buildFinalizedResultRef,
   CODEX_FINALIZATION_PROTOCOL_VERSION,
   CodexJobFinalizationError,
@@ -137,6 +138,7 @@ export type VideoPromptPackCodexMode = "standard" | "strictUtf8";
 
 type QueueOptions = {
   rootDir?: string;
+  bypassV2CreatePause?: boolean;
 };
 
 type ClaimOptions = QueueOptions & {
@@ -147,7 +149,6 @@ type ClaimOptions = QueueOptions & {
 
 const TASK_ROOT = ".tmp-video-prompt-pack-codex";
 const LEGACY_JOB_DIR = "jobs";
-const LEGACY_MIGRATION_LOCK_DIR = "legacy-migration.lock";
 const RESULT_DIR = "results";
 const MAX_PACK_SEGMENTS = 5;
 
@@ -165,11 +166,11 @@ export async function createVideoPromptPackCodexJob(
   input: CreateVideoPromptPackCodexJobInput,
   options: QueueOptions = {},
 ) {
+  if (!options.bypassV2CreatePause) assertCodexFinalizationV2CreateEnabled();
   validateCreateInput(input);
 
   const rootDir = resolveRootDir(options);
   await ensureFileJobStore(rootDir, TASK_ROOT);
-  await migrateLegacyVideoPromptPackJobs(rootDir);
   const now = new Date().toISOString();
   const idempotencyKey = normalizeRenderPackIdempotencyKey(input.idempotencyKey);
   const jobId = idempotencyKey
@@ -241,7 +242,6 @@ export async function createVideoPromptPackCodexJob(
 
 export async function getVideoPromptPackCodexJob(jobId: string, options: QueueOptions = {}) {
   const rootDir = resolveRootDir(options);
-  await migrateLegacyVideoPromptPackJobs(rootDir);
   try {
     const job = normalizeStoredRenderPackJob(await getFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, jobId));
     if (job.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION) return syncAndSaveJob(rootDir, job);
@@ -254,18 +254,15 @@ export async function getVideoPromptPackCodexJob(jobId: string, options: QueueOp
     if ((error as { code?: unknown } | null)?.code === "JOB_STORAGE_BUSY") {
       throw new VideoPromptPackCodexQueueError("Render Pack queue storage is temporarily busy", "JOB_STORAGE_BUSY");
     }
-    throw new VideoPromptPackCodexQueueError(
-      error instanceof Error && error.message === "File job not found"
-        ? "Video prompt render pack Codex job not found"
-        : "Video prompt render pack Codex job could not be read",
-      error instanceof Error && error.message === "File job not found" ? "JOB_NOT_FOUND" : "RENDER_PACK_JOB_INVALID",
-    );
+    if (error instanceof Error && error.message === "File job not found") {
+      return readLegacyVideoPromptPackJob(rootDir, jobId);
+    }
+    throw new VideoPromptPackCodexQueueError("Video prompt render pack Codex job could not be read", "RENDER_PACK_JOB_INVALID");
   }
 }
 
 export async function claimNextVideoPromptPackCodexJob(options: ClaimOptions = {}) {
   const rootDir = resolveRootDir(options);
-  await migrateLegacyVideoPromptPackJobs(rootDir);
   await recoverFinalizedVideoPromptPackCodexJobs(rootDir, options.runningTimeoutMs);
   const claimed = await claimNextFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, {
     order: options.order,
@@ -1294,67 +1291,17 @@ async function persistRenderPackState(
   }
 }
 
-async function migrateLegacyVideoPromptPackJobs(rootDir: string) {
-  await ensureFileJobStore(rootDir, TASK_ROOT);
-  const lockPath = path.join(rootDir, TASK_ROOT, LEGACY_MIGRATION_LOCK_DIR);
-  try {
-    await mkdir(lockPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      try {
-        const lockStat = await stat(lockPath);
-        if (Date.now() - lockStat.mtimeMs <= 60_000) return;
-        await rm(lockPath, { recursive: true, force: true });
-        return migrateLegacyVideoPromptPackJobs(rootDir);
-      } catch (lockError) {
-        if ((lockError as NodeJS.ErrnoException).code === "ENOENT") {
-          return migrateLegacyVideoPromptPackJobs(rootDir);
-        }
-        throw lockError;
-      }
-    }
-    throw error;
-  }
-  try {
-    await migrateLegacyVideoPromptPackJobsUnlocked(rootDir);
-  } finally {
-    await rm(lockPath, { recursive: true, force: true });
-  }
-}
-
-async function migrateLegacyVideoPromptPackJobsUnlocked(rootDir: string) {
+async function readLegacyVideoPromptPackJob(rootDir: string, jobId: string) {
   const legacyDir = path.join(rootDir, TASK_ROOT, LEGACY_JOB_DIR);
-  const entries = await readdir(legacyDir, { withFileTypes: true }).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  });
-  for (const entry of entries.filter((item) => item.isFile() && item.name.endsWith(".json"))) {
-    const legacyPath = path.join(legacyDir, entry.name);
-    let legacy: VideoPromptPackCodexJob;
-    try {
-      legacy = normalizeStoredRenderPackJob(JSON.parse(await readFile(legacyPath, "utf8")) as VideoPromptPackCodexJob);
-    } catch {
-      continue;
+  try {
+    return normalizeStoredRenderPackJob(
+      JSON.parse(await readFile(path.join(legacyDir, `${fileSegment(jobId)}.json`), "utf8")) as VideoPromptPackCodexJob,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new VideoPromptPackCodexQueueError("Video prompt render pack Codex job not found", "JOB_NOT_FOUND");
     }
-    try {
-      await getFileJob(rootDir, TASK_ROOT, legacy.id);
-      await rm(legacyPath, { force: true });
-      continue;
-    } catch (error) {
-      if (!(error instanceof Error) || error.message !== "File job not found") throw error;
-    }
-    const migrated = legacy.status === "running"
-      ? {
-          ...legacy,
-          status: "failed" as const,
-          leaseId: null,
-          workerId: null,
-          error: "Legacy running Render Pack was not re-executed automatically; create a new idempotent job to retry.",
-          updatedAt: new Date().toISOString(),
-        }
-      : legacy;
-    await atomicReplaceJson(renderPackStatePath(rootDir, migrated.status, migrated.id), migrated, { rootDir });
-    await rm(legacyPath, { force: true });
+    throw new VideoPromptPackCodexQueueError("Video prompt render pack legacy job could not be read", "RENDER_PACK_JOB_INVALID");
   }
 }
 
