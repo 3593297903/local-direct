@@ -82,7 +82,14 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
     ".tmp-batch-benchmark",
     `phase-0-fixture-${fixtureNumber}.json`,
   ));
-  const queueBenchmark = await benchmarkReadOnlyQueueScans(path.dirname(outputPath), iterations, warmups);
+  const skipQueueScan = args["skip-queue-scan"] === "true";
+  const queueBenchmark = await resolveQueueBenchmarkForMode({
+    skipQueueScan,
+    outputRoot: path.dirname(outputPath),
+    iterations,
+    warmups,
+    benchmarkQueueScans: benchmarkReadOnlyQueueScans,
+  });
   const baselineAggregate = aggregateTimedReplays(baselineRuns);
   const taskAggregate = aggregateTimedReplays(taskRuns);
   Object.assign(taskAggregate.timingsMs, queueBenchmark.timingsMs);
@@ -118,7 +125,7 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
       payloadBytes: baselineAggregate.payloadBytes,
     },
     comparison: compareAggregates(baselineAggregate, taskAggregate),
-    environment: await collectEnvironment(taskRoot),
+    environment: await collectEnvironment(taskRoot, { skipQueueScan }),
   };
   const fullPipelineComparison = finalReport.comparison.full_local_pipeline_total;
   if (fullPipelineComparison.p50Ratio > 1.05 || fullPipelineComparison.p95Ratio > 1.05) {
@@ -174,9 +181,38 @@ function createBenchmarkExtensions(adapter, quality, queueExtensions) {
     uniquePatchPaths: quality.uniquePatchPaths,
     routeDecisionCounts: quality.routeDecisionCounts,
     findingCounts: quality.findingCounts,
+    queueScanStatus: queueExtensions.queueScanStatus,
     queueScanSemantics: queueExtensions.queueScanSemantics,
     queueLayout: queueExtensions.queueLayout,
     queueCandidateScans: queueExtensions.layouts,
+  };
+}
+
+export async function resolveQueueBenchmarkForMode({
+  skipQueueScan,
+  outputRoot,
+  iterations,
+  warmups,
+  benchmarkQueueScans = benchmarkReadOnlyQueueScans,
+}) {
+  if (skipQueueScan) {
+    return {
+      timingsMs: {},
+      extensions: {
+        queueScanStatus: "skipped_unchanged_scope",
+        queueScanSemantics: "candidate_discovery_covered_once_by_the_full_test_suite",
+        queueLayout: [],
+        layouts: {},
+      },
+    };
+  }
+  const benchmark = await benchmarkQueueScans(outputRoot, iterations, warmups);
+  return {
+    ...benchmark,
+    extensions: {
+      ...benchmark.extensions,
+      queueScanStatus: "measured",
+    },
   };
 }
 
@@ -362,7 +398,7 @@ export async function scanQueueDirectoryReadOnly(directory, options = {}) {
   };
 }
 
-async function collectEnvironment(root) {
+async function collectEnvironment(root, options = {}) {
   const packageJson = JSON.parse(await (await import("node:fs/promises")).readFile(path.join(root, "package.json"), "utf8"));
   return {
     npmVersion: commandVersion("npm.cmd", ["--version"]),
@@ -387,7 +423,9 @@ async function collectEnvironment(root) {
         cliSlotWait: positiveInteger(process.env.CODEX_CLI_SLOT_WAIT_TIMEOUT_MS, 30 * 60_000),
       },
     },
-    queueFiles: await collectQueueFileStats(root),
+    queueFiles: options.skipQueueScan
+      ? { status: "skipped_unchanged_scope" }
+      : await collectQueueFileStats(root),
   };
 }
 
@@ -472,6 +510,7 @@ function assertReplayQualityNotRegressed(baseline, task) {
 
 function parseArgs(argv) {
   return Object.fromEntries(argv.map((argument) => {
+    if (argument === "--skip-queue-scan") return ["skip-queue-scan", "true"];
     const match = argument.match(/^--([^=]+)=(.*)$/);
     if (!match) throw new Error(`Unsupported argument: ${argument}`);
     return [match[1], match[2]];

@@ -1143,6 +1143,25 @@ test("queue benchmark parses 0/100/500/1000 candidates for both layouts and clea
   }
 });
 
+test("skip queue scan keeps quality replay scope and never invokes queue benchmarking", async () => {
+  const benchmark = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  let queueBenchmarkCalls = 0;
+  const result = await benchmark.resolveQueueBenchmarkForMode({
+    skipQueueScan: true,
+    outputRoot: "unused",
+    iterations: 400,
+    warmups: 30,
+    benchmarkQueueScans: async () => {
+      queueBenchmarkCalls += 1;
+      throw new Error("queue benchmark must not run in quality-only mode");
+    },
+  });
+  assert.equal(queueBenchmarkCalls, 0);
+  assert.deepEqual(result.timingsMs, {});
+  assert.equal(result.extensions.queueScanStatus, "skipped_unchanged_scope");
+  assert.deepEqual(result.extensions.layouts, {});
+});
+
 test("canonical prompt hashes are computed from live frozen output, not fixture archive hashes", () => {
   const adapter = createFrozenDashboardLocalAdapter(process.cwd());
   const originalFixture = cloneFixture(fixture20);

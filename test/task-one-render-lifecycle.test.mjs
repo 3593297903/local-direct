@@ -2,43 +2,76 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  runDeterministicRenderLifecycleScenario,
+  createPhase2LifecycleReport,
+  runPhase2RenderRecoveryHarness,
 } from "../scripts/benchmark-phase-2-render-lifecycle.mjs";
 
-test("23 minute queue plus 8 minute execution creates one job and no timeout fallback", () => {
-  const result = runDeterministicRenderLifecycleScenario({
-    segmentIndexes: [1, 2, 3, 4, 5],
-    queueWaitMs: 23 * 60_000,
-    executionMs: 8 * 60_000,
-    foregroundAttentionMs: 12 * 60_000,
-    pollIntervalMs: 30_000,
-  });
-  assert.equal(result.renderJobsCreated, 1);
-  assert.equal(result.singleGenerationCalls, 0);
-  assert.equal(result.lateMergeCount, 5);
-  assert.equal(result.duplicateLateMerges, 0);
-  assert.equal(result.qualityGateExecutions, 5);
-  assert.equal(result.observerCount, 1);
-  assert.equal(result.finalStatus, "merged");
+const passingPhysicalCoordinator = Object.freeze({
+  callers: 100,
+  elapsedMs: 12_000,
+  maxActive: 4,
+  maxNonOriginalWithOriginalDemand: 1,
+  starvationCount: 0,
+  lockTimeoutCount: 0,
+  remainingWaiters: 0,
+  remainingLeases: 0,
 });
 
-test("polling cardinality follows jobs rather than segment count", () => {
-  const one = runDeterministicRenderLifecycleScenario({ segmentIndexes: [1], queueWaitMs: 60_000, executionMs: 60_000 });
-  const five = runDeterministicRenderLifecycleScenario({ segmentIndexes: [1, 2, 3, 4, 5], queueWaitMs: 60_000, executionMs: 60_000 });
-  assert.equal(one.statusPolls, five.statusPolls);
-  assert.equal(one.observerCount, five.observerCount);
+test("23 minute queue plus 8 minute execution uses production recovery helpers and one Render job", async () => {
+  const scenario = await runPhase2RenderRecoveryHarness();
+  const report = createPhase2LifecycleReport({ scenario, physicalCoordinator: passingPhysicalCoordinator });
+  assert.equal(report.status, "accepted");
+  assert.equal(scenario.renderJobsCreated, 1);
+  assert.equal(scenario.durableOperationTokens.length, 1);
+  assert.equal(scenario.foregroundDetached, true);
+  assert.equal(scenario.observerStartsByJob["render-job-main"], 1);
+  assert.equal(scenario.mainScenarioMergedSegments, 5);
+  assert.equal(scenario.duplicateMergeCount, 0);
+  assert.equal(scenario.singleGenerationCalls, 0);
+  assert.equal(scenario.modelCalls, 0);
+  assert.equal(scenario.judgeCalls, 0);
+  assert.equal(scenario.repairCalls, 0);
+  assert.equal(scenario.fallbackCalls, 0);
+  for (const helper of [
+    "observeRenderPackJob",
+    "startConcurrentRenderRecoveryObservers",
+    "reconcileDetachedRenderPack",
+    "prepareRenderPackReconciliation",
+    "applyPreparedRenderPackReconciliation",
+  ]) {
+    assert.ok(report.productionHelpersUsed.includes(helper), helper);
+  }
 });
 
-test("stale result is ignored without model repair or fallback", () => {
-  const result = runDeterministicRenderLifecycleScenario({
-    segmentIndexes: [1, 2, 3],
-    queueWaitMs: 60_000,
-    executionMs: 60_000,
-    staleAtCompletion: true,
-  });
-  assert.equal(result.lateMergeCount, 0);
-  assert.equal(result.staleIgnoreCount, 3);
-  assert.equal(result.modelCalls, 0);
-  assert.equal(result.repairCalls, 0);
-  assert.equal(result.singleGenerationCalls, 0);
+test("refresh observers avoid head-of-line blocking and remount merges the same durable operation once", async () => {
+  const scenario = await runPhase2RenderRecoveryHarness();
+  assert.equal(scenario.refreshNoHeadOfLineBlocking, true);
+  assert.equal(scenario.statusPollsByJob["refresh-job-2"], 1);
+  assert.equal(scenario.statusPollsByJob["refresh-job-3"], 2);
+  assert.equal(scenario.remountMergeCount, 1);
+  assert.equal(scenario.abortedObservers, 2);
+  assert.equal(scenario.remainingTimers, 0);
+  assert.equal(scenario.remainingObserverEntries, 0);
+});
+
+test("malformed reconciliation context is rejected before mutation", async () => {
+  const scenario = await runPhase2RenderRecoveryHarness();
+  assert.equal(scenario.malformedContextRejected, true);
+  assert.equal(scenario.malformedContextMutationCount, 0);
+});
+
+test("lifecycle report rejects duplicate create missing merge and any model or repair call", async () => {
+  for (const faults of [
+    { duplicateCreate: true },
+    { omitMergeSegment: 3 },
+    { modelCalls: 1 },
+    { repairCalls: 1 },
+    { judgeCalls: 1 },
+    { fallbackCalls: 1 },
+  ]) {
+    const scenario = await runPhase2RenderRecoveryHarness({ faults });
+    const report = createPhase2LifecycleReport({ scenario, physicalCoordinator: passingPhysicalCoordinator });
+    assert.equal(report.status, "rejected", JSON.stringify(faults));
+    assert.ok(report.failedChecks.length > 0);
+  }
 });
