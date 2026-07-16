@@ -39,6 +39,9 @@ const {
 const {
   compileSegmentContractForPrompt,
 } = require("../lib/codex-prompt-input-compiler.ts");
+const {
+  createBatchInvocationLedger,
+} = require("../lib/batch-repair-scheduler.ts");
 
 function activeOperation(token = "refresh-token-1", jobId = "refresh-job-1") {
   const draft = createRenderOperationDraft({
@@ -324,6 +327,37 @@ test("creating recovery retries with one idempotency identity and resolves one j
   assert.equal(result.value.id, "one-created-job");
   assert.equal(attempts, 2);
   assert.equal(new Set(identities.map((identity) => identity.join(":"))).size, 1);
+});
+
+test("refresh-recovered durable Render creation is persisted once and transient attempts remain zero", () => {
+  const ledger = createBatchInvocationLedger();
+  const recordRecoveredCreate = ({ operationToken, jobId }) => ledger.record("renderPackCalls", {
+    count: 1,
+    fingerprint: `render:${operationToken}:${jobId}`,
+  });
+
+  recordRecoveredCreate({ operationToken: "recover-operation", jobId: "recover-job" });
+  recordRecoveredCreate({ operationToken: "recover-operation", jobId: "recover-job" });
+  assert.equal(ledger.summary().renderPackCalls, 1);
+  assert.deepEqual(ledger.summary().events.map((event) => event.fingerprint), [
+    "render:recover-operation:recover-job",
+  ]);
+
+  const untouched = createBatchInvocationLedger();
+  assert.equal(untouched.summary().renderPackCalls, 0);
+
+  const source = readFileSync(new URL("../components/DashboardClient.tsx", import.meta.url), "utf8");
+  const recoveryStart = source.indexOf("async function resumeCachedRenderOperations");
+  const createdBranch = source.indexOf('if (createResult.status === "created")', recoveryStart);
+  const durableJob = source.indexOf("const job = createResult.value", createdBranch);
+  const ledgerRecord = source.indexOf("recordRecoveredRenderPackCall?.({", durableJob);
+  const attachOperation = source.indexOf("const observing = attachRenderOperationJob", durableJob);
+  const persistOperation = source.indexOf("await persistRecoveryState()", attachOperation);
+  assert.ok(recoveryStart > 0 && createdBranch > recoveryStart);
+  assert.ok(durableJob > createdBranch && attachOperation > durableJob);
+  assert.ok(ledgerRecord > attachOperation && persistOperation > ledgerRecord);
+  assert.match(source, /recordRecoveredRenderPackCall:\s*\(\{ operationToken, jobId \}\) =>/);
+  assert.match(source, /fingerprint:\s*`render:\$\{operationToken\}:\$\{jobId\}`/);
 });
 
 test("recovery pointer remains while an active operation or unresolved segment exists", () => {

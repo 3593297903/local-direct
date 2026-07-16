@@ -2253,8 +2253,9 @@ export function DashboardClient() {
     cache: SegmentBatchCacheDocumentV2;
     stateByIndex: Map<number, SegmentStateRecord>;
     persist: () => Promise<void>;
+    recordRecoveredRenderPackCall?: (identity: { operationToken: string; jobId: string }) => void;
   }) {
-    const { cache, stateByIndex, persist } = input;
+    const { cache, stateByIndex, persist, recordRecoveredRenderPackCall } = input;
     let recoveryPersistChain = Promise.resolve();
     const persistRecoveryState = () => {
       const next = recoveryPersistChain.then(() => persist());
@@ -2349,6 +2350,10 @@ export function DashboardClient() {
           jobId: job.id,
           sourceHash: String(job.sourceHash || ""),
           aggregateContractHash: job.aggregateContractHash || null,
+        });
+        recordRecoveredRenderPackCall?.({
+          operationToken: observing.operationToken,
+          jobId: job.id,
         });
         replaceOperation(observing);
         for (const segmentIndex of observing.segmentIndexes) {
@@ -2732,6 +2737,12 @@ export function DashboardClient() {
         cache,
         stateByIndex,
         persist: persistRecoveryCache,
+        recordRecoveredRenderPackCall: ({ operationToken, jobId }) => {
+          invocationLedger.record("renderPackCalls", {
+            count: 1,
+            fingerprint: `render:${operationToken}:${jobId}`,
+          });
+        },
       });
       segments = (cache.segments as CachedRenderedEpisode[])
         .filter((segment) => Number.isInteger(Number(segment.episodeIndex)) && segment.result && segment.promptText && segment.sourceText)
