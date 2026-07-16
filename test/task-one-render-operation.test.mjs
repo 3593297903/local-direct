@@ -28,6 +28,10 @@ const {
   createVideoPromptPackCodexJob,
   toVideoPromptPackCodexJobStatusDto,
 } = require("../lib/video-prompt-pack-codex-queue.ts");
+const {
+  buildSegmentContractHash,
+  normalizeSegmentContract,
+} = require("../lib/batch-segment-contract.ts");
 
 function identityInput(overrides = {}) {
   const segmentIndexes = overrides.segmentIndexes || [3, 1, 2];
@@ -53,13 +57,31 @@ function identityInput(overrides = {}) {
 }
 
 function sampleSegment(index = 1) {
+  const sourceText = `Source text for segment ${index}.`;
+  const normalizedContract = normalizeSegmentContract({
+    segmentIndex: index,
+    title: `Segment ${index}`,
+    sourceText,
+    durationSeconds: 15,
+    shotCount: 4,
+  }, {
+    segmentIndex: index,
+    fallbackTitle: `Segment ${index}`,
+    fallbackSourceText: sourceText,
+    fallbackDurationSeconds: 15,
+    fallbackShotCount: 4,
+  });
+  const segmentContract = {
+    ...normalizedContract,
+    contractHash: buildSegmentContractHash(normalizedContract),
+  };
   return {
     episodeIndex: index,
     title: `Segment ${index}`,
-    script: `Source text for segment ${index}.`,
+    script: sourceText,
     renderInputScript: `Render segment ${index} as a complete executable prompt.`,
     duration: "15 seconds",
-    segmentContract: { contractHash: `contract-${index}` },
+    segmentContract,
   };
 }
 
@@ -98,15 +120,16 @@ test("operation draft is durable before POST and keeps one batch-level identity"
 
 test("lost create response reuses operation idempotency and creates one queue job", async () => {
   const rootDir = path.join(os.tmpdir(), `render-operation-queue-${Date.now()}-${Math.random()}`);
+  const segment = sampleSegment(1);
   const draft = createRenderOperationDraft(identityInput({
     segmentIndexes: [1],
-    contractHashes: { 1: "contract-1" },
+    contractHashes: { 1: segment.segmentContract.contractHash },
   }));
   const input = {
     batchId: draft.batchId,
     operationToken: draft.operationToken,
     idempotencyKey: draft.idempotencyKey,
-    segments: [sampleSegment(1)],
+    segments: [segment],
   };
   try {
     const first = await createVideoPromptPackCodexJob(input, { rootDir });
@@ -127,16 +150,21 @@ test("lost create response reuses operation idempotency and creates one queue jo
 
 test("create and status roundtrip preserve exact reconciliation identity", async () => {
   const rootDir = path.join(os.tmpdir(), `render-operation-status-${Date.now()}-${Math.random()}`);
+  const segments = [sampleSegment(1), sampleSegment(2)];
+  const contractHashes = Object.fromEntries(segments.map((segment) => [
+    String(segment.episodeIndex),
+    segment.segmentContract.contractHash,
+  ]));
   const draft = createRenderOperationDraft(identityInput({
     segmentIndexes: [2, 1],
-    contractHashes: { 1: "contract-1", 2: "contract-2" },
+    contractHashes,
   }));
   try {
     const job = await createVideoPromptPackCodexJob({
       batchId: draft.batchId,
       operationToken: draft.operationToken,
       idempotencyKey: draft.idempotencyKey,
-      segments: [sampleSegment(1), sampleSegment(2)],
+      segments,
     }, { rootDir });
     const status = toVideoPromptPackCodexJobStatusDto(job);
     assert.equal(status.batchId, draft.batchId);
@@ -144,7 +172,7 @@ test("create and status roundtrip preserve exact reconciliation identity", async
     assert.equal(status.sourceHash, job.sourceHash);
     assert.equal(status.aggregateContractHash, job.contractHash);
     assert.deepEqual(status.segmentIndexes, [1, 2]);
-    assert.deepEqual(status.contractHashes, { 1: "contract-1", 2: "contract-2" });
+    assert.deepEqual(status.contractHashes, contractHashes);
     assert.equal("prompt" in status, false);
     assert.equal("outputTemplate" in status, false);
   } finally {

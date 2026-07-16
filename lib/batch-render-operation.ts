@@ -1,4 +1,15 @@
 import type { SegmentContract } from "./batch-segment-contract";
+import {
+  CONTRACT_PROMPT_COMPILER_VERSION,
+  compileSegmentContractForPrompt,
+  type CompiledSegmentContractBlock,
+} from "./codex-prompt-input-compiler";
+import type { PreflightedRenderPack } from "./batch-contract-preflight";
+
+type SuccessfulCompiledSegmentContractBlock = Extract<
+  CompiledSegmentContractBlock,
+  { status: "ready" | "compacted" }
+>;
 
 export type RenderOperationState =
   | "creating"
@@ -20,6 +31,17 @@ export type RenderOperationReconciliationContext = {
   }>;
 };
 
+export type RenderOperationCreationContext = {
+  compilerVersion: typeof CONTRACT_PROMPT_COMPILER_VERSION;
+  segments: Array<{
+    episodeIndex: number;
+    sourceHash: string;
+    contractHash: string;
+    compiledContract: SuccessfulCompiledSegmentContractBlock;
+    compiledDigest: string;
+  }>;
+};
+
 export type RenderOperationRefV2 = {
   protocolVersion: 2;
   operationToken: string;
@@ -30,6 +52,8 @@ export type RenderOperationRefV2 = {
   sourceHash?: string;
   aggregateContractHash: string;
   contractHashes: Record<string, string>;
+  creationDigest?: string;
+  creationContext?: RenderOperationCreationContext;
   createdAt: string;
   state: RenderOperationState;
   detachedAt?: string;
@@ -47,6 +71,8 @@ export type CreateRenderOperationInput = {
   segmentIndexes: number[];
   sourceHash?: string;
   contractHashes: Record<string, string>;
+  creationDigest?: string;
+  creationContext?: RenderOperationCreationContext;
   reconciliationContext?: RenderOperationReconciliationContext;
   now?: string;
 };
@@ -76,6 +102,19 @@ export function createRenderOperationDraft(input: CreateRenderOperationInput): R
   const contractHashes = normalizeContractHashes(input.contractHashes, segmentIndexes);
   const aggregateContractHash = buildAggregateContractHash(segmentIndexes, contractHashes);
   const createdAt = validTimestamp(input.now || new Date().toISOString(), "createdAt");
+  const reconciliationContext = input.reconciliationContext
+    ? normalizeReconciliationContext(input.reconciliationContext, segmentIndexes)
+    : undefined;
+  const creationContext = input.creationContext
+    ? normalizeCreationContext(input.creationContext, segmentIndexes, contractHashes, reconciliationContext)
+    : undefined;
+  const computedCreationDigest = creationContext ? buildCreationDigest(creationContext) : undefined;
+  const creationDigest = input.creationDigest
+    ? requiredHash(input.creationDigest, "creationDigest")
+    : computedCreationDigest;
+  if (creationContext && creationDigest !== computedCreationDigest) {
+    throw new Error("Render operation creationDigest does not match creationContext");
+  }
   const draft = {
     protocolVersion: 2 as const,
     operationToken,
@@ -85,17 +124,68 @@ export function createRenderOperationDraft(input: CreateRenderOperationInput): R
     ...(input.sourceHash ? { sourceHash: requiredHash(input.sourceHash, "sourceHash") } : {}),
     aggregateContractHash,
     contractHashes,
+    ...(creationDigest ? { creationDigest } : {}),
+    ...(creationContext ? { creationContext } : {}),
     createdAt,
     state: "creating" as const,
-    ...(input.reconciliationContext
-      ? { reconciliationContext: normalizeReconciliationContext(input.reconciliationContext, segmentIndexes) }
-      : {}),
+    ...(reconciliationContext ? { reconciliationContext } : {}),
   };
   return { ...draft, idempotencyKey: buildRenderOperationIdempotencyKey(draft) };
 }
 
+export function createRenderOperationDraftFromPreflightPack<T>(input: {
+  batchId: string;
+  operationToken?: string;
+  sourceHash?: string;
+  pack: PreflightedRenderPack<T>;
+  reconciliationContext: RenderOperationReconciliationContext;
+  now?: string;
+}) {
+  if (!input.pack || input.pack.kind !== "render_pack" || !input.pack.entries.length) {
+    throw new Error("Render operation preflight pack is invalid");
+  }
+  const segments = input.pack.entries.map((entry) => {
+    const compiledContract = entry.preflight.compile;
+    if (compiledContract.status !== "ready" && compiledContract.status !== "compacted") {
+      throw new Error("Render operation preflight pack contains a non-renderable contract");
+    }
+    if (entry.preflight.disposition === "invalid") {
+      throw new Error("Render operation preflight pack contains an invalid disposition");
+    }
+    return {
+      episodeIndex: entry.preflight.segmentIndex,
+      sourceHash: entry.preflight.sourceHash,
+      contractHash: entry.preflight.contractHash,
+      compiledContract,
+      compiledDigest: buildCompiledContractDigest(compiledContract),
+    };
+  });
+  const segmentIndexes = segments.map((segment) => segment.episodeIndex);
+  const contractHashes = Object.fromEntries(
+    segments.map((segment) => [String(segment.episodeIndex), segment.contractHash]),
+  );
+  const creationContext: RenderOperationCreationContext = {
+    compilerVersion: CONTRACT_PROMPT_COMPILER_VERSION,
+    segments,
+  };
+  return createRenderOperationDraft({
+    batchId: input.batchId,
+    operationToken: input.operationToken,
+    segmentIndexes,
+    sourceHash: input.sourceHash,
+    contractHashes,
+    creationContext,
+    creationDigest: buildCreationDigest(creationContext),
+    reconciliationContext: input.reconciliationContext,
+    now: input.now,
+  });
+}
+
 export function buildRenderOperationIdempotencyKey(
-  operation: Pick<RenderOperationRefV2, "batchId" | "operationToken" | "segmentIndexes" | "contractHashes">,
+  operation: Pick<
+    RenderOperationRefV2,
+    "batchId" | "operationToken" | "segmentIndexes" | "contractHashes" | "creationDigest"
+  >,
 ) {
   const batchId = requiredIdentity(operation.batchId, "batchId", 240);
   const operationToken = requiredIdentity(operation.operationToken, "operationToken", 240);
@@ -106,6 +196,7 @@ export function buildRenderOperationIdempotencyKey(
     segmentIndexes,
     operationToken,
     contractHashes: segmentIndexes.map((index) => [String(index), contractHashes[String(index)]]),
+    creationDigest: operation.creationDigest || null,
   });
   return `render-operation:${sha256TextPortable(identity)}`;
 }
@@ -124,7 +215,14 @@ export function attachRenderOperationJob(
   if (normalized.jobId && normalized.jobId !== jobId) {
     throw new Error("Render operation already references a different jobId");
   }
-  return { ...normalized, jobId, sourceHash, aggregateContractHash, state: "observing" };
+  return {
+    ...normalized,
+    jobId,
+    sourceHash,
+    aggregateContractHash,
+    state: "observing",
+    creationContext: undefined,
+  };
 }
 
 export function detachRenderOperation(
@@ -154,6 +252,7 @@ export function terminateRenderOperation(
   const base: RenderOperationRefV2 = {
     ...normalized,
     state: input.state,
+    creationContext: undefined,
     reconciliationContext: undefined,
   };
   if (input.state === "merged") {
@@ -201,12 +300,31 @@ export function validateRenderOperation(value: RenderOperationRefV2): RenderOper
     operationToken,
     segmentIndexes,
     contractHashes,
+    creationDigest: value.creationDigest,
   });
   if (value.idempotencyKey !== expectedIdempotencyKey) {
     throw new Error("Render operation idempotencyKey is invalid");
   }
   if (!["creating", "observing", "detached", "merged", "ignored", "failed"].includes(value.state)) {
     throw new Error("Render operation state is invalid");
+  }
+  const reconciliationContext = value.reconciliationContext
+    ? normalizeReconciliationContext(value.reconciliationContext, segmentIndexes)
+    : undefined;
+  const creationDigest = value.creationDigest
+    ? requiredHash(value.creationDigest, "creationDigest")
+    : undefined;
+  const creationContext = value.creationContext
+    ? normalizeCreationContext(value.creationContext, segmentIndexes, contractHashes, reconciliationContext)
+    : undefined;
+  if (creationContext && !creationDigest) {
+    throw new Error("Render operation creationContext is missing creationDigest");
+  }
+  if (creationContext && buildCreationDigest(creationContext) !== creationDigest) {
+    throw new Error("Render operation creationContext does not match creationDigest");
+  }
+  if (value.state === "creating" && creationDigest && !creationContext) {
+    throw new Error("Render operation creating state is missing creationContext");
   }
   return {
     ...value,
@@ -215,13 +333,108 @@ export function validateRenderOperation(value: RenderOperationRefV2): RenderOper
     segmentIndexes,
     contractHashes,
     aggregateContractHash,
+    ...(creationDigest ? { creationDigest } : {}),
+    ...(creationContext ? { creationContext } : {}),
     createdAt: validTimestamp(value.createdAt, "createdAt"),
     ...(value.jobId ? { jobId: requiredIdentity(value.jobId, "jobId", 240) } : {}),
     ...(value.sourceHash ? { sourceHash: requiredHash(value.sourceHash, "sourceHash") } : {}),
-    ...(value.reconciliationContext
-      ? { reconciliationContext: normalizeReconciliationContext(value.reconciliationContext, segmentIndexes) }
-      : {}),
+    ...(reconciliationContext ? { reconciliationContext } : {}),
   };
+}
+
+function normalizeCreationContext(
+  value: RenderOperationCreationContext,
+  indexes: number[],
+  contractHashes: Record<string, string>,
+  reconciliationContext?: RenderOperationReconciliationContext,
+): RenderOperationCreationContext {
+  if (
+    !value
+    || typeof value !== "object"
+    || value.compilerVersion !== CONTRACT_PROMPT_COMPILER_VERSION
+    || !Array.isArray(value.segments)
+    || value.segments.length !== indexes.length
+  ) {
+    throw new Error("Render operation creationContext is invalid");
+  }
+  if (!reconciliationContext) {
+    throw new Error("Render operation creationContext requires reconciliationContext");
+  }
+
+  const normalizedSegments = value.segments.map((segment, offset) => {
+    const episodeIndex = Number(segment?.episodeIndex);
+    if (episodeIndex !== indexes[offset]) {
+      throw new Error("Render operation creationContext segments do not match segmentIndexes");
+    }
+    const sourceHash = requiredHash(segment.sourceHash, "creationContext.sourceHash");
+    const contractHash = requiredHash(segment.contractHash, "creationContext.contractHash");
+    if (contractHash !== contractHashes[String(episodeIndex)]) {
+      throw new Error("Render operation creationContext contractHash is invalid");
+    }
+    const compiledContract = segment.compiledContract;
+    if (
+      !compiledContract
+      || (compiledContract.status !== "ready" && compiledContract.status !== "compacted")
+      || compiledContract.compilerVersion !== CONTRACT_PROMPT_COMPILER_VERSION
+      || compiledContract.segmentIndex !== episodeIndex
+      || compiledContract.contractHash !== contractHash
+      || new TextEncoder().encode(compiledContract.text).byteLength !== compiledContract.byteLength
+      || compiledContract.byteLength > compiledContract.maxBytes
+    ) {
+      throw new Error("Render operation creationContext compiled contract is invalid");
+    }
+    const compiledDigest = requiredHash(segment.compiledDigest, "creationContext.compiledDigest");
+    if (compiledDigest !== buildCompiledContractDigest(compiledContract)) {
+      throw new Error("Render operation creationContext compiled digest is invalid");
+    }
+
+    const rawContract = reconciliationContext.segments[offset]?.segmentContract;
+    if (!rawContract || rawContract.sourceHash !== sourceHash || rawContract.contractHash !== contractHash) {
+      throw new Error("Render operation creationContext does not match reconciliation contract identity");
+    }
+    const authoritative = compileSegmentContractForPrompt(rawContract, { maxBytes: compiledContract.maxBytes });
+    if (
+      authoritative.status !== "ready"
+      && authoritative.status !== "compacted"
+    ) {
+      throw new Error("Render operation creationContext reconciliation contract is not renderable");
+    }
+    if (canonicalJson(authoritative) !== canonicalJson(compiledContract)) {
+      throw new Error("Render operation creationContext compiled contract was altered");
+    }
+    return {
+      episodeIndex,
+      sourceHash,
+      contractHash,
+      compiledContract,
+      compiledDigest,
+    };
+  });
+
+  return {
+    compilerVersion: CONTRACT_PROMPT_COMPILER_VERSION,
+    segments: normalizedSegments,
+  };
+}
+
+function buildCompiledContractDigest(contract: SuccessfulCompiledSegmentContractBlock) {
+  return sha256TextPortable(canonicalJson(contract));
+}
+
+function buildCreationDigest(context: RenderOperationCreationContext) {
+  return sha256TextPortable(canonicalJson({
+    compilerVersion: context.compilerVersion,
+    segments: context.segments.map((segment) => ({
+      episodeIndex: segment.episodeIndex,
+      sourceHash: segment.sourceHash,
+      contractHash: segment.contractHash,
+      compiledDigest: segment.compiledDigest,
+    })),
+  }));
+}
+
+function canonicalJson(value: unknown) {
+  return JSON.stringify(sortCanonicalValue(value));
 }
 
 function buildAggregateContractHash(indexes: number[], hashes: Record<string, string>) {

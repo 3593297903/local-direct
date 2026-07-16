@@ -32,6 +32,10 @@ const {
   createVideoPromptPackCodexJob,
   toVideoPromptPackCodexJobStatusDto,
 } = require("../lib/video-prompt-pack-codex-queue.ts");
+const {
+  buildSegmentContractHash,
+  normalizeSegmentContract,
+} = require("../lib/batch-segment-contract.ts");
 
 function activeOperation(token = "refresh-token-1", jobId = "refresh-job-1") {
   const draft = createRenderOperationDraft({
@@ -378,24 +382,56 @@ test("late reconciliation rollback flag defaults on and explicit zero is safe ro
 test("pending Render Pack status is smaller than 4 KiB", async () => {
   const rootDir = path.join(os.tmpdir(), `phase-2-status-${Date.now()}-${Math.random()}`);
   try {
+    const segments = Array.from({ length: 5 }, (_, offset) => {
+      const episodeIndex = offset + 1;
+      const sourceText = "source ".repeat(200);
+      const normalizedContract = normalizeSegmentContract({
+        segmentIndex: episodeIndex,
+        title: `Segment ${episodeIndex}`,
+        sourceText,
+        durationSeconds: 15,
+        shotCount: 4,
+        requiredEvents: [`Verify evidence for segment ${episodeIndex}`],
+        requiredShotBeats: Array.from({ length: 4 }, (_, shotOffset) => ({
+          shotNumber: shotOffset + 1,
+          timeRange: `${shotOffset * 3}s-${(shotOffset + 1) * 3}s`,
+          beat: `Evidence beat ${shotOffset + 1}`,
+          visualFocus: `Evidence focus ${shotOffset + 1}`,
+        })),
+      }, {
+        segmentIndex: episodeIndex,
+        fallbackTitle: `Segment ${episodeIndex}`,
+        fallbackSourceText: sourceText,
+        fallbackDurationSeconds: 15,
+        fallbackShotCount: 4,
+      });
+      return {
+        episodeIndex,
+        title: `Segment ${episodeIndex}`,
+        script: sourceText,
+        renderInputScript: "render instructions ".repeat(200),
+        duration: "15 seconds",
+        segmentContract: {
+          ...normalizedContract,
+          contractHash: buildSegmentContractHash(normalizedContract),
+        },
+      };
+    });
+    const contractHashes = Object.fromEntries(segments.map((segment) => [
+      String(segment.episodeIndex),
+      segment.segmentContract.contractHash,
+    ]));
     const draft = createRenderOperationDraft({
       batchId: "status-batch",
       operationToken: "status-token",
       segmentIndexes: [1, 2, 3, 4, 5],
-      contractHashes: { 1: "c1", 2: "c2", 3: "c3", 4: "c4", 5: "c5" },
+      contractHashes,
     });
     const job = await createVideoPromptPackCodexJob({
       batchId: draft.batchId,
       operationToken: draft.operationToken,
       idempotencyKey: draft.idempotencyKey,
-      segments: draft.segmentIndexes.map((episodeIndex) => ({
-        episodeIndex,
-        title: `Segment ${episodeIndex}`,
-        script: "source ".repeat(200),
-        renderInputScript: "render instructions ".repeat(200),
-        duration: "15 seconds",
-        segmentContract: { contractHash: draft.contractHashes[String(episodeIndex)] },
-      })),
+      segments,
     }, { rootDir });
     const bytes = Buffer.byteLength(JSON.stringify(toVideoPromptPackCodexJobStatusDto(job)), "utf8");
     assert.ok(bytes < 4096, `status payload was ${bytes} bytes`);
