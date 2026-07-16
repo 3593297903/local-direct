@@ -60,9 +60,13 @@ import {
   applyPreparedRenderPackReconciliation,
   createRenderPackObserverRegistry,
   listRecoverableRenderOperations,
+  observeRenderPackJob,
   prepareRenderPackReconciliation,
   reconcileDetachedRenderPack,
+  retryCreatingRenderOperation,
+  startConcurrentRenderRecoveryObservers,
   shouldRetainRenderRecoveryPointer,
+  type RenderObservationOutcome,
 } from "@/lib/batch-render-reconciliation";
 import {
   findInternalPromptToken,
@@ -1248,7 +1252,9 @@ export function DashboardClient() {
   const [batchRecoveryChecking, setBatchRecoveryChecking] = useState(false);
   const batchRecoveryLookupRef = useRef<Promise<BatchRecoveryDiscovery> | null>(null);
   const batchRecoveryLookupKeyRef = useRef("");
-  const renderRecoveryObserverRegistryRef = useRef(createRenderPackObserverRegistry<VideoPromptPackCodexJob>());
+  const renderRecoveryObserverRegistryRef = useRef(
+    createRenderPackObserverRegistry<RenderObservationOutcome<VideoPromptPackCodexJob>>(),
+  );
   const [batchProgressTick, setBatchProgressTick] = useState(0);
   const [episodeCountPickerOpen, setEpisodeCountPickerOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState("");
@@ -1902,58 +1908,49 @@ export function DashboardClient() {
     return Math.max(0, completedAt - startedAt);
   }
 
-  async function pollVideoPromptPackCodexJob(jobId: string, segmentCount: number) {
-    const startedAt = Date.now();
-    const timeoutMs = Math.max(30 * 60_000, segmentCount * 600_000);
-    let lastStatus = "";
-    let consecutiveTransportFailures = 0;
-
-    while (Date.now() - startedAt < timeoutMs) {
-      try {
-        const res = await fetch(`/api/video-prompt-packs/jobs/${jobId}`, { cache: "no-store" });
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data?.ok) {
-          const message = data?.error || `Codex render pack job read failed (${res.status})`;
-          if (res.status < 500 && ![408, 425, 429].includes(res.status)) {
-            throw new RenderPackPollingInfrastructureError(jobId, message);
-          }
-          throw new TypeError(message);
-        }
-
-        consecutiveTransportFailures = 0;
-        const currentJob = data.job as VideoPromptPackCodexJob;
-        if (currentJob.status !== lastStatus) {
-          lastStatus = currentJob.status;
-          setGenerationProgress(
-            currentJob.status === "running"
-              ? `Codex 正在本地生成 ${segmentCount} 段 Render Pack...`
-              : `Codex Render Pack 任务状态：${currentJob.status}`,
-          );
-        }
-        if (currentJob.status === "completed") return currentJob;
-        if (currentJob.status === "failed") {
-          throw new CodexVideoPromptJobFailedError(currentJob.error || "Codex render pack job failed");
-        }
-      } catch (error) {
-        if (error instanceof CodexVideoPromptJobFailedError || isRenderPackPollingInfrastructureError(error)) {
-          throw error;
-        }
-        consecutiveTransportFailures += 1;
-        const retryDelayMs = Math.min(10_000, 1_000 * (2 ** Math.min(consecutiveTransportFailures - 1, 3)));
-        if (consecutiveTransportFailures === 1 || consecutiveTransportFailures % 5 === 0) {
-          setGenerationProgress(
-            `Render Pack 状态读取短暂中断，正在继续等待原任务（第 ${consecutiveTransportFailures} 次重试）...`,
-          );
-        }
-        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-        continue;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 2500));
+  async function readVideoPromptPackCodexJob(jobId: string, signal?: AbortSignal) {
+    const response = await fetch(`/api/video-prompt-packs/jobs/${encodeURIComponent(jobId)}`, {
+      cache: "no-store",
+      signal,
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data?.ok || !data.job) {
+      throw Object.assign(
+        new Error(data?.error || `Codex render pack job read failed (${response.status})`),
+        { status: response.status, code: data?.errorCode || data?.code },
+      );
     }
+    return data.job as VideoPromptPackCodexJob;
+  }
 
+  async function pollVideoPromptPackCodexJob(jobId: string, segmentCount: number) {
+    const attentionMs = Math.max(30 * 60_000, segmentCount * 600_000);
+    let lastStatus = "";
+    const outcome = await observeRenderPackJob({
+      jobId,
+      mode: "foreground",
+      attentionMs,
+      readJob: readVideoPromptPackCodexJob,
+      sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+      onStage(currentJob) {
+        if (currentJob.status === lastStatus) return;
+        lastStatus = currentJob.status;
+        setGenerationProgress(
+          currentJob.status === "running"
+            ? `Codex 正在本地生成 ${segmentCount} 段 Render Pack...`
+            : `Codex Render Pack 任务状态：${currentJob.status}`,
+        );
+      },
+    });
+    if (outcome.status === "completed") return outcome.job;
+    if (outcome.status === "terminal_failed" && outcome.job?.status === "failed") {
+      throw new CodexVideoPromptJobFailedError(outcome.job.error || "Codex render pack job failed");
+    }
     throw new RenderPackPollingInfrastructureError(
       jobId,
-      "Codex Render Pack 状态等待超时；原任务仍保留，不会降级为逐段重新生成。",
+      outcome.status === "detached"
+        ? "Codex Render Pack 前台等待已结束；原任务仍保留，不会降级为逐段重新生成。"
+        : `Codex Render Pack 状态不可继续读取（${outcome.status === "terminal_failed" ? outcome.reasonCode : "aborted"}）。`,
     );
   }
 
@@ -2175,6 +2172,12 @@ export function DashboardClient() {
     persist: () => Promise<void>;
   }) {
     const { cache, stateByIndex, persist } = input;
+    let recoveryPersistChain = Promise.resolve();
+    const persistRecoveryState = () => {
+      const next = recoveryPersistChain.then(() => persist());
+      recoveryPersistChain = next.then(() => undefined, () => undefined);
+      return next;
+    };
     let operations = retainBoundedRenderOperationAudits(cache.renderOperations || []);
     const replaceOperation = (operation: RenderOperationRefV2) => {
       operations = retainBoundedRenderOperationAudits([
@@ -2205,49 +2208,55 @@ export function DashboardClient() {
           message: "原 Render Pack 无法继续读取，已保留批次现场，不会触发补生成。",
         });
       }
-      await persist();
+      await persistRecoveryState();
     };
 
     const creatingOperations = operations.filter((operation) => operation.state === "creating");
-    for (const draft of creatingOperations) {
+    await Promise.allSettled(creatingOperations.map(async (draft) => {
       const context = draft.reconciliationContext;
       if (!context?.segments.length) {
         await markInfrastructureFailure(draft, "RENDER_RECOVERY_CONTEXT_MISSING");
-        continue;
+        return;
       }
-      try {
-        const segments = context.segments.map((segment) => {
-          const episodeInput: SeasonPackEpisodeInput = {
-            episodeIndex: segment.episodeIndex,
-            title: segment.title,
-            sourceText: segment.sourceText,
-            duration: segment.duration,
-            contentType: "短剧",
-            style: "写实",
-            storyBible: null,
-            episodeChain: null,
-            blueprint: null,
-            shotCount: segment.shotCount || segment.segmentContract?.shotCount || 4,
-            renderInputScript: segment.sourceText,
-            segmentContract: segment.segmentContract,
-          };
-          return {
-            episodeIndex: segment.episodeIndex,
-            title: segment.title,
-            script: segment.sourceText,
-            renderInputScript: buildBatchEpisodeRenderScript(episodeInput, cache.resolvedSegmentCount),
-            duration: segment.duration,
-            shotCount: episodeInput.shotCount,
-            segmentContract: segment.segmentContract,
-          };
-        });
-        const job = await createVideoPromptPackCodexJob(
+      const segments = context.segments.map((segment) => {
+        const episodeInput: SeasonPackEpisodeInput = {
+          episodeIndex: segment.episodeIndex,
+          title: segment.title,
+          sourceText: segment.sourceText,
+          duration: segment.duration,
+          contentType: "短剧",
+          style: "写实",
+          storyBible: null,
+          episodeChain: null,
+          blueprint: null,
+          shotCount: segment.shotCount || segment.segmentContract?.shotCount || 4,
+          renderInputScript: segment.sourceText,
+          segmentContract: segment.segmentContract,
+        };
+        return {
+          episodeIndex: segment.episodeIndex,
+          title: segment.title,
+          script: segment.sourceText,
+          renderInputScript: buildBatchEpisodeRenderScript(episodeInput, cache.resolvedSegmentCount),
+          duration: segment.duration,
+          shotCount: episodeInput.shotCount,
+          segmentContract: segment.segmentContract,
+        };
+      });
+      const createResult = await retryCreatingRenderOperation({
+        operation: draft,
+        maxAttempts: 3,
+        create: () => createVideoPromptPackCodexJob(
           segments,
           cache.projectId || undefined,
           STRICT_UTF8_RENDER_PACK_MODE,
           true,
           draft,
-        );
+        ),
+        sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+      });
+      if (createResult.status === "created") {
+        const job = createResult.value;
         const observing = attachRenderOperationJob(draft, {
           jobId: job.id,
           sourceHash: String(job.sourceHash || ""),
@@ -2262,29 +2271,19 @@ export function DashboardClient() {
             expectedSourceHash: String(job.sourceHash || ""),
           });
         }
-        await persist();
-      } catch (error) {
-        await markInfrastructureFailure(
-          draft,
-          error instanceof Error && error.message ? "RENDER_RECOVERY_CREATE_FAILED" : "RENDER_RECOVERY_UNKNOWN",
-        );
+        await persistRecoveryState();
+        return;
       }
-    }
+      if (createResult.status === "transient") {
+        replaceOperation({ ...draft, lastErrorCode: createResult.errorCode });
+        await persistRecoveryState();
+        return;
+      }
+      await markInfrastructureFailure(draft, createResult.errorCode);
+    }));
 
-    const recoverable = listRecoverableRenderOperations(operations);
-    for (const operation of recoverable) {
-      const jobId = operation.jobId;
-      if (!jobId) continue;
-      let job: VideoPromptPackCodexJob;
-      try {
-        job = await renderRecoveryObserverRegistryRef.current.observe(
-          jobId,
-          () => pollVideoPromptPackCodexJob(jobId, operation.segmentIndexes.length),
-        );
-      } catch {
-        await markInfrastructureFailure(operation, "RENDER_RECOVERY_JOB_UNAVAILABLE");
-        continue;
-      }
+    async function reconcileRecoveredJob(operation: RenderOperationRefV2, job: VideoPromptPackCodexJob) {
+      const jobId = String(operation.jobId || job.id || "");
       const currentSegments = Object.fromEntries(operation.segmentIndexes.map((segmentIndex) => {
         const state = stateByIndex.get(segmentIndex);
         return [String(segmentIndex), {
@@ -2304,7 +2303,7 @@ export function DashboardClient() {
       });
       if (decision.status === "failed") {
         await markInfrastructureFailure(operation, decision.errorCode);
-        continue;
+        return;
       }
       if (decision.status === "ignored") {
         replaceOperation(terminateRenderOperation(operation, {
@@ -2318,10 +2317,10 @@ export function DashboardClient() {
             reasonCode: decision.reasonCode,
           });
         }
-        await persist();
-        continue;
+        await persistRecoveryState();
+        return;
       }
-      if (decision.status === "waiting") continue;
+      if (decision.status === "waiting") return;
       if (decision.status === "replay") {
         if (operation.state !== "merged") {
           replaceOperation(terminateRenderOperation(operation, {
@@ -2329,9 +2328,9 @@ export function DashboardClient() {
             finalManifestHash: String(job.resultHash),
             resultHashes: decision.resultHashes,
           }));
-          await persist();
+          await persistRecoveryState();
         }
-        continue;
+        return;
       }
 
       const context = operation.reconciliationContext;
@@ -2416,7 +2415,7 @@ export function DashboardClient() {
               finalManifestHash: String(job.resultHash),
               resultHashes: decision.resultHashes,
             }));
-            await persist();
+            await persistRecoveryState();
           },
         });
       } catch {
@@ -2431,9 +2430,38 @@ export function DashboardClient() {
             jobId,
           });
         }
-        await persist();
+        await persistRecoveryState();
       }
     }
+
+    const recoverable = listRecoverableRenderOperations(operations);
+    const recoveryObservers = startConcurrentRenderRecoveryObservers<
+      VideoPromptPackCodexJob,
+      RenderObservationOutcome<VideoPromptPackCodexJob>
+    >({
+      operations: recoverable,
+      registry: renderRecoveryObserverRegistryRef.current,
+      observe: (operation) => observeRenderPackJob({
+        jobId: String(operation.jobId),
+        mode: "background",
+        readJob: readVideoPromptPackCodexJob,
+        sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+      }),
+      async onOutcome(operation, outcome) {
+        if (outcome.status === "completed") {
+          await reconcileRecoveredJob(operation, outcome.job);
+          return;
+        }
+        if (outcome.status === "terminal_failed") {
+          if (outcome.job) {
+            await reconcileRecoveredJob(operation, outcome.job);
+          } else {
+            await markInfrastructureFailure(operation, outcome.reasonCode);
+          }
+        }
+      },
+    });
+    void recoveryObservers.settled;
 
     return shouldRetainRenderRecoveryPointer({
       operations,
@@ -5075,25 +5103,35 @@ export function DashboardClient() {
       const existing = renderPackObserverRegistry.get(jobId);
       if (existing) return existing;
       const observer = (async () => {
-        let transportFailures = 0;
-        while (true) {
-          try {
-            const response = await fetch(`/api/video-prompt-packs/jobs/${encodeURIComponent(jobId)}`, { cache: "no-store" });
-            const data = await response.json().catch(() => null);
-            if (!response.ok || !data?.ok) {
-              throw new TypeError(data?.error || `Render Pack status read failed (${response.status})`);
-            }
-            const job = data.job as VideoPromptPackCodexJob;
-            transportFailures = 0;
-            if (job.status === "completed" || job.status === "failed") {
-              await reconcileAndRouteRenderPackResult({ ...input, job });
-              return;
-            }
-          } catch {
-            transportFailures += 1;
+        const outcome = await observeRenderPackJob({
+          jobId,
+          mode: "background",
+          readJob: readVideoPromptPackCodexJob,
+          sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+        });
+        if (outcome.status === "completed") {
+          await reconcileAndRouteRenderPackResult({ ...input, job: outcome.job });
+          return;
+        }
+        if (outcome.status === "terminal_failed") {
+          if (outcome.job) {
+            await reconcileAndRouteRenderPackResult({ ...input, job: outcome.job });
+            return;
           }
-          const delayMs = Math.min(30_000, 2_500 * (2 ** Math.min(transportFailures, 3)));
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          const failed = terminateRenderOperation(input.operation, {
+            state: "failed",
+            errorCode: outcome.reasonCode,
+          });
+          replaceRenderOperationRecord(failed);
+          for (const episode of input.packEpisodes) {
+            dispatchSegmentStateEvent(episode.episodeIndex, {
+              type: "RENDER_OPERATION_FAILED",
+              operationToken: input.operation.operationToken,
+              errorCode: outcome.reasonCode,
+              message: "原 Render Pack 已确认不可读取，不会触发逐段补生成。",
+            });
+          }
+          await writeBatchSegmentCache();
         }
       })().finally(() => {
         renderPackObserverRegistry.delete(jobId);

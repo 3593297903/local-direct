@@ -1,4 +1,15 @@
 import type { RenderOperationRefV2 } from "./batch-render-operation";
+export {
+  classifyRenderObservationError,
+  observeRenderPackJob,
+  retryCreatingRenderOperation,
+  startConcurrentRenderRecoveryObservers,
+} from "./batch-render-recovery";
+export type {
+  RenderObservationErrorClass,
+  RenderObservationMode,
+  RenderObservationOutcome,
+} from "./batch-render-recovery";
 
 export type RenderReconciliationCurrentSegment = {
   operationToken?: string;
