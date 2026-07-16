@@ -342,6 +342,14 @@ function normalizeReconciliationContext(
     throw new Error("Render operation reconciliationContext is invalid");
   }
   const allowed = new Set(indexes);
+  const contextIndexes = value.segments.map((segment) => Number(segment?.episodeIndex));
+  if (
+    contextIndexes.length !== indexes.length
+    || new Set(contextIndexes).size !== contextIndexes.length
+    || contextIndexes.some((episodeIndex, index) => episodeIndex !== indexes[index])
+  ) {
+    throw new Error("Render operation reconciliationContext segments do not match segmentIndexes");
+  }
   const segments = value.segments.map((segment) => {
     if (!allowed.has(segment.episodeIndex)) throw new Error("Render operation reconciliationContext segment is invalid");
     return {

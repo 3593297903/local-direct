@@ -8,6 +8,8 @@ const require = createRequire(import.meta.url);
 require("ts-node/register/transpile-only");
 
 const {
+  applyPreparedRenderPackReconciliation,
+  prepareRenderPackReconciliation,
   reconcileDetachedRenderPack,
 } = require("../lib/batch-render-reconciliation.ts");
 const {
@@ -158,6 +160,115 @@ test("a completed result without a valid Phase 1 manifest cannot merge", () => {
     assert.equal(decision.status, "failed");
     assert.equal(decision.errorCode, "RENDER_RECONCILIATION_MANIFEST_INVALID");
   }
+});
+
+test("reconciliation preparation rejects missing context result or result hash before mutation", async () => {
+  const base = {
+    operation: operation(),
+    eligibleSegmentIndexes: [1, 2],
+    contexts: [
+      { episodeIndex: 1, title: "one" },
+      { episodeIndex: 2, title: "two" },
+    ],
+    results: completedJob().result.segments,
+    prepareSegment: ({ segmentIndex }) => ({ segmentIndex }),
+  };
+
+  for (const invalid of [
+    { contexts: base.contexts.slice(0, 1) },
+    { contexts: [...base.contexts, base.contexts[1]] },
+    { results: base.results.slice(0, 1) },
+    { results: base.results.map((item) => item.episodeIndex === 2 ? { ...item, resultHash: undefined } : item) },
+  ]) {
+    let applyCount = 0;
+    let finalizeCount = 0;
+    assert.throws(
+      () => prepareRenderPackReconciliation({ ...base, ...invalid }),
+      /reconciliation/i,
+    );
+    assert.equal(applyCount, 0);
+    assert.equal(finalizeCount, 0);
+  }
+});
+
+test("preparation is all-or-nothing and successful application finalizes after every segment", async () => {
+  const prepareCalls = [];
+  const applied = [];
+  let finalizeCount = 0;
+  const base = {
+    operation: operation(),
+    eligibleSegmentIndexes: [1, 2],
+    contexts: [
+      { episodeIndex: 1, title: "one" },
+      { episodeIndex: 2, title: "two" },
+    ],
+    results: completedJob().result.segments,
+  };
+
+  assert.throws(
+    () => prepareRenderPackReconciliation({
+      ...base,
+      prepareSegment(item) {
+        prepareCalls.push(item.segmentIndex);
+        if (item.segmentIndex === 2) throw new Error("quality preparation failed");
+        return { segmentIndex: item.segmentIndex };
+      },
+    }),
+    /quality preparation failed/,
+  );
+  assert.deepEqual(prepareCalls, [1, 2]);
+  assert.deepEqual(applied, []);
+  assert.equal(finalizeCount, 0);
+
+  const prepared = prepareRenderPackReconciliation({
+    ...base,
+    prepareSegment: ({ segmentIndex }) => ({ segmentIndex }),
+  });
+  await applyPreparedRenderPackReconciliation(prepared, {
+    async applySegment(action) {
+      assert.equal(finalizeCount, 0);
+      applied.push(action.segmentIndex);
+    },
+    async finalize() {
+      assert.deepEqual(applied, [1, 2]);
+      finalizeCount += 1;
+    },
+  });
+  assert.deepEqual(applied, [1, 2]);
+  assert.equal(finalizeCount, 1);
+});
+
+test("replay skips reconciliation preparation and quality work", () => {
+  const merged = terminateRenderOperation(operation(), {
+    state: "merged",
+    at: "2026-07-16T00:10:00.000Z",
+    finalManifestHash: "manifest-result-1",
+    resultHashes: { 1: "result-1", 2: "result-2" },
+  });
+  const decision = reconcileDetachedRenderPack({
+    operation: merged,
+    job: completedJob(),
+    manifestValidated: true,
+    currentSegments: {
+      1: { resultHash: "result-1" },
+      2: { resultHash: "result-2" },
+    },
+  });
+  let qualityPasses = 0;
+  if (decision.status === "merged") {
+    prepareRenderPackReconciliation({
+      operation: merged,
+      eligibleSegmentIndexes: decision.segmentIndexes,
+      contexts: [],
+      results: [],
+      prepareSegment() {
+        qualityPasses += 1;
+        return {};
+      },
+    });
+  }
+  assert.equal(decision.status, "replay");
+  assert.equal(qualityPasses, 0);
 });
 
 test("pending jobs remain waiting and blocking quality is left to the existing route", () => {

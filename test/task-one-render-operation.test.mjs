@@ -30,16 +30,23 @@ const {
 } = require("../lib/video-prompt-pack-codex-queue.ts");
 
 function identityInput(overrides = {}) {
+  const segmentIndexes = overrides.segmentIndexes || [3, 1, 2];
+  const reconciliationContext = overrides.reconciliationContext || {
+    sourceText: "source",
+    segments: [...new Set(segmentIndexes)].sort((left, right) => left - right).map((episodeIndex) => ({
+      episodeIndex,
+      title: `segment ${episodeIndex}`,
+      sourceText: `source ${episodeIndex}`,
+      duration: "15s",
+    })),
+  };
   return {
     batchId: "batch-operation-1",
     operationToken: "render-operation-token-1",
-    segmentIndexes: [3, 1, 2],
+    segmentIndexes,
     sourceHash: "source-hash-1",
     contractHashes: { 1: "contract-1", 2: "contract-2", 3: "contract-3" },
-    reconciliationContext: {
-      sourceText: "source",
-      segments: [{ episodeIndex: 1, title: "one", sourceText: "source one", duration: "15s" }],
-    },
+    reconciliationContext,
     now: "2026-07-16T00:00:00.000Z",
     ...overrides,
   };
@@ -189,6 +196,49 @@ test("malformed operation identity is rejected before queue creation", () => {
   assert.throws(
     () => createRenderOperationDraft(identityInput({ segmentIndexes: [1, 1] })),
     /segmentIndexes/i,
+  );
+});
+
+test("reconciliation context must cover every operation segment exactly once", () => {
+  assert.throws(
+    () => createRenderOperationDraft(identityInput({
+      reconciliationContext: {
+        sourceText: "source",
+        segments: [
+          { episodeIndex: 1, title: "one", sourceText: "source one", duration: "15s" },
+          { episodeIndex: 2, title: "two", sourceText: "source two", duration: "15s" },
+        ],
+      },
+    })),
+    /reconciliationContext.*segmentIndexes/i,
+  );
+
+  assert.throws(
+    () => createRenderOperationDraft(identityInput({
+      reconciliationContext: {
+        sourceText: "source",
+        segments: [
+          { episodeIndex: 1, title: "one", sourceText: "source one", duration: "15s" },
+          { episodeIndex: 2, title: "two", sourceText: "source two", duration: "15s" },
+          { episodeIndex: 2, title: "two again", sourceText: "source two again", duration: "15s" },
+        ],
+      },
+    })),
+    /reconciliationContext.*segmentIndexes/i,
+  );
+
+  assert.throws(
+    () => createRenderOperationDraft(identityInput({
+      reconciliationContext: {
+        sourceText: "source",
+        segments: [
+          { episodeIndex: 1, title: "one", sourceText: "source one", duration: "15s" },
+          { episodeIndex: 2, title: "two", sourceText: "source two", duration: "15s" },
+          { episodeIndex: 4, title: "four", sourceText: "source four", duration: "15s" },
+        ],
+      },
+    })),
+    /reconciliationContext.*segment/i,
   );
 });
 

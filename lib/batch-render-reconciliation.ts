@@ -36,6 +36,18 @@ export type ReconcileRenderResult =
   | { status: "ignored"; reasonCode: string; segmentIndexes: number[] }
   | { status: "failed"; errorCode: string; retryable: boolean };
 
+type IndexedReconciliationValue = { episodeIndex: number };
+type IndexedReconciliationResult = IndexedReconciliationValue & {
+  resultHash?: string;
+  result?: unknown;
+};
+
+export type PreparedRenderPackReconciliation<TAction> = {
+  segmentIndexes: number[];
+  actions: Array<{ segmentIndex: number; action: TAction }>;
+  resultHashes: Record<string, string>;
+};
+
 const ACTIVE_RENDER_OPERATION_STATES = new Set(["creating", "observing", "detached"]);
 
 export function listRecoverableRenderOperations(operations: RenderOperationRefV2[]) {
@@ -184,6 +196,94 @@ export function reconcileDetachedRenderPack(input: {
     segmentIndexes: operation.segmentIndexes.filter((segmentIndex) => !alreadyAccepted.includes(segmentIndex)),
     resultHashes,
   };
+}
+
+export function prepareRenderPackReconciliation<
+  TContext extends IndexedReconciliationValue,
+  TResult extends IndexedReconciliationResult,
+  TAction,
+>(input: {
+  operation: RenderOperationRefV2;
+  eligibleSegmentIndexes: number[];
+  contexts: TContext[];
+  results: TResult[];
+  prepareSegment: (input: {
+    segmentIndex: number;
+    context: TContext;
+    result: TResult;
+    resultHash: string;
+  }) => TAction;
+}): PreparedRenderPackReconciliation<TAction> {
+  const expectedIndexes = [...input.operation.segmentIndexes];
+  const contextByIndex = exactReconciliationMap(input.contexts, expectedIndexes, "context");
+  const resultByIndex = exactReconciliationMap(input.results, expectedIndexes, "result");
+  const eligibleSegmentIndexes = normalizeEligibleReconciliationIndexes(
+    input.eligibleSegmentIndexes,
+    expectedIndexes,
+  );
+  const resultHashes: Record<string, string> = {};
+
+  for (const segmentIndex of expectedIndexes) {
+    const result = resultByIndex.get(segmentIndex)!;
+    if (!requiredIdentity(result.resultHash) || result.result === undefined || result.result === null) {
+      throw new Error(`Render reconciliation result ${segmentIndex} is incomplete`);
+    }
+    resultHashes[String(segmentIndex)] = result.resultHash;
+  }
+
+  const actions = eligibleSegmentIndexes.map((segmentIndex) => {
+    const result = resultByIndex.get(segmentIndex)!;
+    return {
+      segmentIndex,
+      action: input.prepareSegment({
+        segmentIndex,
+        context: contextByIndex.get(segmentIndex)!,
+        result,
+        resultHash: result.resultHash!,
+      }),
+    };
+  });
+
+  return { segmentIndexes: eligibleSegmentIndexes, actions, resultHashes };
+}
+
+export async function applyPreparedRenderPackReconciliation<TAction>(
+  prepared: PreparedRenderPackReconciliation<TAction>,
+  input: {
+    applySegment: (action: TAction, segmentIndex: number) => void | Promise<void>;
+    finalize: (prepared: PreparedRenderPackReconciliation<TAction>) => void | Promise<void>;
+  },
+) {
+  for (const item of prepared.actions) {
+    await input.applySegment(item.action, item.segmentIndex);
+  }
+  await input.finalize(prepared);
+}
+
+function exactReconciliationMap<T extends IndexedReconciliationValue>(
+  values: T[],
+  expectedIndexes: number[],
+  label: string,
+) {
+  const actualIndexes = Array.isArray(values) ? values.map((value) => Number(value?.episodeIndex)) : [];
+  if (!sameOrderedUniqueIndexes(actualIndexes, expectedIndexes)) {
+    throw new Error(`Render reconciliation ${label} indexes do not match the operation`);
+  }
+  return new Map(values.map((value) => [Number(value.episodeIndex), value]));
+}
+
+function normalizeEligibleReconciliationIndexes(values: number[], expectedIndexes: number[]) {
+  if (!Array.isArray(values) || new Set(values).size !== values.length) {
+    throw new Error("Render reconciliation eligible indexes are invalid");
+  }
+  const expected = new Set(expectedIndexes);
+  if (
+    values.some((value) => !Number.isInteger(value) || !expected.has(value))
+    || values.some((value, index) => index > 0 && values[index - 1] >= value)
+  ) {
+    throw new Error("Render reconciliation eligible indexes are invalid");
+  }
+  return [...values];
 }
 
 function sameOrderedUniqueIndexes(actual: number[] | undefined, expected: number[]) {
