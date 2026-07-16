@@ -204,3 +204,11 @@ test("Dashboard persists the operation draft before the Render Pack POST", () =>
   assert.match(body, /operationToken:\s*durableRenderOperation\.operationToken/);
   assert.match(source, /renderOperations:\s*retainBoundedRenderOperationAudits\(renderOperationRecords\)/);
 });
+
+test("browser Render operation identity has no Node-only finalization dependency", () => {
+  const source = readFileSync(path.join(process.cwd(), "lib", "batch-render-operation.ts"), "utf8");
+  assert.doesNotMatch(source, /from\s+["']node:/);
+  assert.doesNotMatch(source, /codex-job-finalization/);
+  assert.match(source, /hashCanonicalJsonPortable/);
+  assert.match(source, /sha256TextPortable/);
+});

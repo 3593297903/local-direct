@@ -36,6 +36,51 @@ export type ReconcileRenderResult =
   | { status: "ignored"; reasonCode: string; segmentIndexes: number[] }
   | { status: "failed"; errorCode: string; retryable: boolean };
 
+const ACTIVE_RENDER_OPERATION_STATES = new Set(["creating", "observing", "detached"]);
+
+export function listRecoverableRenderOperations(operations: RenderOperationRefV2[]) {
+  const byJobId = new Map<string, RenderOperationRefV2>();
+  for (const operation of operations) {
+    if (!ACTIVE_RENDER_OPERATION_STATES.has(operation.state) || !operation.jobId) continue;
+    const current = byJobId.get(operation.jobId);
+    if (!current || Date.parse(operation.createdAt) >= Date.parse(current.createdAt)) {
+      byJobId.set(operation.jobId, operation);
+    }
+  }
+  return [...byJobId.values()].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+}
+
+export function createRenderPackObserverRegistry<T = unknown>() {
+  const observers = new Map<string, Promise<T>>();
+  return {
+    observe(jobId: string, factory: () => Promise<T>) {
+      const active = observers.get(jobId);
+      if (active) return active;
+      const observer = Promise.resolve().then(factory).finally(() => {
+        if (observers.get(jobId) === observer) observers.delete(jobId);
+      });
+      observers.set(jobId, observer);
+      return observer;
+    },
+    has(jobId: string) {
+      return observers.has(jobId);
+    },
+    size() {
+      return observers.size;
+    },
+  };
+}
+
+export function shouldRetainRenderRecoveryPointer(input: {
+  operations: RenderOperationRefV2[];
+  segmentStates: Array<{ generationStatus?: string; saveStatus?: string }>;
+}) {
+  if (input.operations.some((operation) => ACTIVE_RENDER_OPERATION_STATES.has(operation.state))) return true;
+  return input.segmentStates.some((state) => (
+    state.saveStatus !== "saved" && state.saveStatus !== "review_saved"
+  ));
+}
+
 export function reconcileDetachedRenderPack(input: {
   operation: RenderOperationRefV2;
   job: CompletedRenderPackForReconciliation;

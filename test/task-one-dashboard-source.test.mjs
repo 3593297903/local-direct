@@ -11,12 +11,12 @@ test("dashboard uses cache v2 and orthogonal state reducer", () => {
   assert.match(source, /deriveBatchPhaseFromSegmentStates/);
 });
 
-test("render pack completion signals repair scheduler without awaiting a per-pack repair pool", () => {
+test("render pack completion delegates routing without awaiting a per-pack repair pool", () => {
   const start = source.indexOf("async function renderPackedSegmentsWithQualityRepair");
   const end = source.indexOf("await restoreCachedRenderedSegments", start);
   const body = source.slice(start, end);
   assert.doesNotMatch(body, /await\s+runSegmentRepairPool\s*\(/);
-  assert.match(body, /repairScheduler\.enqueue|signalRepairScheduler/);
+  assert.match(body, /reconcileAndRouteRenderPackResult/);
 });
 
 test("transient render-pack polling failures keep the original job and never fan out into segment regeneration", () => {
