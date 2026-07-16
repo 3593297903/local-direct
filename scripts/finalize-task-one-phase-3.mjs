@@ -66,6 +66,7 @@ const ALLOWED_CHANGED_FILES = new Set([
   "test/codex-prompt-input-compiler.test.mjs",
   "test/episode-batch-dashboard.test.mjs",
   "test/task-one-contract-preflight.test.mjs",
+  "test/task-one-render-refresh-recovery.test.mjs",
   "test/task-one-render-operation.test.mjs",
   "test/task-one-state-reducer.test.mjs",
   "test/video-prompt-pack-codex-api.test.mjs",
@@ -214,6 +215,36 @@ function contractPreflightChecks(report, taskCommit, sourceFingerprint) {
     check("contract.noModelCalls", zeroCallObject(report?.calls)),
     check("contract.p95", finiteAtMost(report?.timingsMs?.p95, 100)),
     check("contract.cv", finiteAtMost(report?.timingsMs?.coefficientOfVariation, 0.15)),
+    ...representativeContractSetChecks(report, 20),
+    ...representativeContractSetChecks(report, 30),
+  ];
+}
+
+function representativeContractSetChecks(report, count) {
+  const representative = report?.representativeContractSets?.[String(count)];
+  const histogram = representative?.statusHistogram;
+  const ready = histogram?.ready;
+  const compacted = histogram?.compacted;
+  const invalid = histogram?.invalid;
+  const overflow = histogram?.overflow;
+  const histogramValues = [ready, compacted, invalid, overflow];
+  return [
+    check(`contract.representative${count}.report`, Boolean(representative && typeof representative === "object")),
+    check(`contract.representative${count}.count`, representative?.contractCount === count),
+    check(
+      `contract.representative${count}.histogram`,
+      histogramValues.every((value) => Number.isInteger(value) && value >= 0),
+    ),
+    check(`contract.representative${count}.invalid`, invalid === 0),
+    check(`contract.representative${count}.overflow`, overflow === 0),
+    check(`contract.representative${count}.resolved`, ready + compacted === count),
+    check(
+      `contract.representative${count}.maxBytes`,
+      Number.isInteger(representative?.maxByteLength)
+        && representative.maxByteLength > 0
+        && representative.maxByteLength <= 3_072,
+    ),
+    check(`contract.representative${count}.semanticDigest`, isSha256(representative?.semanticDigest)),
   ];
 }
 
@@ -268,7 +299,12 @@ function qualityChecks(report, count, taskCommit, baselineCommit) {
 }
 
 function summarizeContract(report) {
-  return report ? { metrics: report.metrics, timingsMs: report.timingsMs, calls: report.calls } : null;
+  return report ? {
+    metrics: report.metrics,
+    representativeContractSets: report.representativeContractSets,
+    timingsMs: report.timingsMs,
+    calls: report.calls,
+  } : null;
 }
 
 function summarizeLifecycle(report) {

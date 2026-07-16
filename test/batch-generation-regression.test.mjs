@@ -686,6 +686,20 @@ function createPhaseThreeAcceptanceFixture() {
         contracts: 30,
         iterations: 1000,
         metrics: { attempts: 30, invalid: 0 },
+        representativeContractSets: {
+          "20": {
+            contractCount: 20,
+            statusHistogram: { ready: 19, compacted: 1, invalid: 0, overflow: 0 },
+            maxByteLength: 2_400,
+            semanticDigest: "f".repeat(64),
+          },
+          "30": {
+            contractCount: 30,
+            statusHistogram: { ready: 28, compacted: 2, invalid: 0, overflow: 0 },
+            maxByteLength: 2_900,
+            semanticDigest: "1".repeat(64),
+          },
+        },
         calls: zeroCalls,
         operationCountBeforePreflight: 0,
         canceledValidNeighbors: 0,
@@ -785,6 +799,45 @@ test("phase-three acceptance rejects missing stale dirty or failed evidence", as
   const dirty = structuredClone(valid);
   dirty.git.statusShort = " M components/DashboardClient.tsx";
   assert.equal(evaluatePhaseThreeAcceptance(dirty).status, "rejected");
+
+  const missingQuality30 = structuredClone(valid);
+  delete missingQuality30.reports.benchmark30;
+  assert.equal(evaluatePhaseThreeAcceptance(missingQuality30).status, "rejected");
+});
+
+test("phase-three acceptance requires representative Contract evidence for 20 and 30 segments", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = createPhaseThreeAcceptanceFixture();
+  assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
+
+  const missing20 = structuredClone(valid);
+  delete missing20.reports.contractPreflight.representativeContractSets["20"];
+  assert.equal(evaluatePhaseThreeAcceptance(missing20).status, "rejected");
+
+  const invalid30 = structuredClone(valid);
+  invalid30.reports.contractPreflight.representativeContractSets["30"].statusHistogram.invalid = 1;
+  invalid30.reports.contractPreflight.representativeContractSets["30"].statusHistogram.ready -= 1;
+  assert.equal(evaluatePhaseThreeAcceptance(invalid30).status, "rejected");
+
+  const overflow20 = structuredClone(valid);
+  overflow20.reports.contractPreflight.representativeContractSets["20"].statusHistogram.overflow = 1;
+  overflow20.reports.contractPreflight.representativeContractSets["20"].statusHistogram.ready -= 1;
+  assert.equal(evaluatePhaseThreeAcceptance(overflow20).status, "rejected");
+
+  const incomplete30 = structuredClone(valid);
+  incomplete30.reports.contractPreflight.representativeContractSets["30"].statusHistogram.ready -= 1;
+  assert.equal(evaluatePhaseThreeAcceptance(incomplete30).status, "rejected");
+
+  const oversized20 = structuredClone(valid);
+  oversized20.reports.contractPreflight.representativeContractSets["20"].maxByteLength = 3_073;
+  assert.equal(evaluatePhaseThreeAcceptance(oversized20).status, "rejected");
+});
+
+test("phase-three acceptance allows the refresh recovery regression test in the Phase 3R diff", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = createPhaseThreeAcceptanceFixture();
+  valid.git.changedFiles.push("test/task-one-render-refresh-recovery.test.mjs");
+  assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
 });
 
 test("phase-three acceptance JSON is UTF-8 without BOM and self-parseable", async () => {
