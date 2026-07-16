@@ -14,6 +14,8 @@ const require = createRequire(import.meta.url);
 require("ts-node/register/transpile-only");
 const {
   finalizeSeasonPackCodexJobFiles,
+  heartbeatSeasonPackCodexJob,
+  markSeasonPackCodexJobExited,
   updateSeasonPackCodexJobStage,
 } = require("../lib/season-pack-codex-queue.ts");
 
@@ -22,6 +24,7 @@ const apiBaseUrl = (process.env.SEASON_PACK_CODEX_API_BASE_URL || "http://localh
 const pollMs = positiveInteger(process.env.SEASON_PACK_CODEX_POLL_MS, 2500);
 const idleLogMs = positiveInteger(process.env.SEASON_PACK_CODEX_IDLE_LOG_MS, 30_000);
 const taskTimeoutMs = positiveInteger(process.env.SEASON_PACK_CODEX_TASK_TIMEOUT_MS, 60 * 60_000);
+const fileJobHeartbeatMs = positiveInteger(process.env.SEASON_PACK_FILE_JOB_HEARTBEAT_MS, 10_000);
 const workerToken = process.env.SEASON_PACK_CODEX_WORKER_TOKEN || "";
 const workerInstanceId = `${
   process.env.SEASON_PACK_CODEX_WORKER_ID?.trim() || `season-pack-${process.pid}`
@@ -62,6 +65,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed season pack job ${task.id} (${task.episodeCount} episodes).`);
   let outputReady = false;
+  let stopFileJobHeartbeat = () => undefined;
   try {
     let activeTask = await updateSeasonPackCodexJobStage(
       task.id,
@@ -70,6 +74,12 @@ async function processTask(task) {
       "waiting_slot",
       { rootDir },
     );
+    stopFileJobHeartbeat = startFileJobHeartbeat(() => heartbeatSeasonPackCodexJob(
+      task.id,
+      task.leaseId,
+      task.fencingToken,
+      { rootDir },
+    ));
     await withCodexCliSlot("season_pack", task.id, async () => {
       activeTask = await updateSeasonPackCodexJobStage(
         task.id,
@@ -79,6 +89,12 @@ async function processTask(task) {
         { rootDir },
       );
       await runCodex(activeTask);
+      activeTask = await markSeasonPackCodexJobExited(
+        task.id,
+        task.leaseId,
+        task.fencingToken,
+        { rootDir },
+      );
     });
     await assertSeasonPackOutput(activeTask);
     activeTask = await updateSeasonPackCodexJobStage(
@@ -107,7 +123,30 @@ async function processTask(task) {
       console.error(`Could not report failed season pack job ${task.id}:`, failError);
     });
     console.error(`Season pack job ${task.id} failed: ${message}`);
+  } finally {
+    stopFileJobHeartbeat();
   }
+}
+
+function startFileJobHeartbeat(heartbeat) {
+  let stopped = false;
+  let inFlight = false;
+  const timer = setInterval(async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      await heartbeat();
+    } catch {
+      // Lease loss is handled by the main task transition.
+    } finally {
+      inFlight = false;
+    }
+  }, fileJobHeartbeatMs);
+  timer.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
 async function claimTask() {

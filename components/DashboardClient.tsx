@@ -4717,7 +4717,7 @@ export function DashboardClient() {
       }
     }
 
-    await Promise.all(Array.from({ length: renderPackConcurrency }, () => renderNextPack()));
+    await Promise.allSettled(Array.from({ length: renderPackConcurrency }, () => renderNextPack()));
     renderPhaseFinishedAtMs = Date.now();
     await runSegmentRepairPool();
     if (repairFirstQueuedAtMs) repairFinishedAtMs = Date.now();

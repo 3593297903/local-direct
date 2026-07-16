@@ -20,6 +20,8 @@ const {
   failPendingSeasonPackCodexJob,
   finalizeSeasonPackCodexJobFiles,
   getSeasonPackCodexJob,
+  heartbeatSeasonPackCodexJob,
+  markSeasonPackCodexJobExited,
   recoverFinalizedSeasonPackCodexJobs,
   toSeasonPackCodexJobStatusDto,
   updateSeasonPackCodexJobStage,
@@ -170,7 +172,13 @@ async function finalizeAndCompleteSeasonPack(claimed, rootDir) {
       "utf8",
     );
   }
-  await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "executing", { rootDir });
+  const executing = await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "executing", { rootDir });
+  const heartbeat = await heartbeatSeasonPackCodexJob(claimed.id, claimed.leaseId, claimed.fencingToken, { rootDir });
+  assert.equal(heartbeat.stage, "executing");
+  assert.ok(Date.parse(heartbeat.heartbeatAt) >= Date.parse(executing.heartbeatAt));
+  const exited = await markSeasonPackCodexJobExited(claimed.id, claimed.leaseId, claimed.fencingToken, { rootDir });
+  assert.ok(exited.codexExitedAt);
+  assert.ok(Date.parse(exited.codexExitedAt) >= Date.parse(exited.executingAt));
   const finalizing = await updateSeasonPackCodexJobStage(claimed.id, claimed.leaseId, claimed.fencingToken, "finalizing", { rootDir });
   const finalized = await finalizeSeasonPackCodexJobFiles(finalizing, { rootDir, codexExitCode: 0 });
   return completeSeasonPackCodexJob(

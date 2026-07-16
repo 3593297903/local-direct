@@ -347,6 +347,40 @@ export async function updateVideoPromptPackCodexJobStage(
   });
 }
 
+export async function heartbeatVideoPromptPackCodexJob(
+  jobId: string,
+  leaseId: string,
+  fencingToken: number,
+  options: QueueOptions = {},
+) {
+  const rootDir = resolveRootDir(options);
+  return updateRunningFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, jobId, leaseId, fencingToken, (current) => (
+    normalizeStoredRenderPackJob(current)
+  ));
+}
+
+export async function markVideoPromptPackCodexJobExited(
+  jobId: string,
+  leaseId: string,
+  fencingToken: number,
+  options: QueueOptions = {},
+) {
+  const rootDir = resolveRootDir(options);
+  return updateRunningFileJob<VideoPromptPackCodexJob>(rootDir, TASK_ROOT, jobId, leaseId, fencingToken, (current) => {
+    const normalized = normalizeStoredRenderPackJob(current);
+    if (normalized.stage !== "executing") {
+      throw new VideoPromptPackCodexQueueError(
+        `Render Pack cannot record Codex exit from ${normalized.stage}`,
+        "FINALIZATION_IDENTITY_MISMATCH",
+      );
+    }
+    return {
+      ...normalized,
+      codexExitedAt: normalized.codexExitedAt || new Date().toISOString(),
+    };
+  });
+}
+
 export async function finalizeVideoPromptPackCodexJobFiles(
   task: VideoPromptPackCodexJob,
   options: QueueOptions & {
@@ -427,7 +461,7 @@ export async function finalizeVideoPromptPackCodexJobFiles(
     stage: "finalizing",
     resultRef,
     resultAvailable: false,
-    codexExitedAt: new Date().toISOString(),
+    codexExitedAt: job.codexExitedAt || new Date().toISOString(),
   });
   return { resultRef, resultHash, contractHash: job.contractHash, segmentIndexes };
 }
@@ -550,6 +584,7 @@ export function toVideoPromptPackCodexJobStatusDto(job: VideoPromptPackCodexJob)
     ...(job.waitingSlotAt ? { waitingSlotAt: job.waitingSlotAt } : {}),
     ...(job.executingAt ? { executingAt: job.executingAt } : {}),
     ...(job.heartbeatAt ? { heartbeatAt: job.heartbeatAt } : {}),
+    ...(job.codexExitedAt ? { codexExitedAt: job.codexExitedAt } : {}),
     ...(job.finalizingAt ? { finalizingAt: job.finalizingAt } : {}),
     ...(job.completedAt ? { completedAt: job.completedAt } : {}),
     ...(job.errorCode ? { errorCode: job.errorCode } : {}),

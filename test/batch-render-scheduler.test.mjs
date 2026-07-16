@@ -47,7 +47,7 @@ test("ordinary segments use fast balanced packs without a delayed tail wave", ()
   const schedule = buildRenderPacks(makeSegments(19));
 
   assert.equal(schedule.profile, "FAST");
-  assert.equal(schedule.concurrency, 8);
+  assert.equal(schedule.concurrency, 4);
   assert.deepEqual(schedule.packs.map((pack) => pack.length), [5, 5, 5, 4]);
 });
 
@@ -55,7 +55,7 @@ test("low-risk batches can still balance into four clean packs", () => {
   const schedule = buildRenderPacks(makeSegments(16));
 
   assert.equal(schedule.profile, "FAST");
-  assert.equal(schedule.concurrency, 8);
+  assert.equal(schedule.concurrency, 4);
   assert.deepEqual(schedule.packs.map((pack) => pack.length), [4, 4, 4, 4]);
 });
 
@@ -85,7 +85,7 @@ test("investigative and compliance-risk material uses smaller packs without lowe
   );
 
   assert.equal(schedule.profile, "STRICT");
-  assert.equal(schedule.concurrency, 8);
+  assert.equal(schedule.concurrency, 4);
   assert.ok(schedule.packs.every((pack) => pack.length <= 2));
 });
 
@@ -118,7 +118,7 @@ test("heavy consistency requirements use single-segment rendering", () => {
 
   const schedule = buildRenderPacks(makeSegments(5, { input: { segmentContract: heavyContract } }));
   assert.equal(schedule.profile, "SINGLE");
-  assert.equal(schedule.concurrency, 8);
+  assert.equal(schedule.concurrency, 4);
   assert.deepEqual(schedule.packs.map((pack) => pack.length), [1, 1, 1, 1, 1]);
 });
 
@@ -126,7 +126,7 @@ test("failed render retry can force single-segment packs", () => {
   const schedule = buildRenderPacks(makeSegments(3), { forceProfile: "SINGLE" });
 
   assert.equal(schedule.profile, "SINGLE");
-  assert.equal(schedule.concurrency, 8);
+  assert.equal(schedule.concurrency, 4);
   assert.deepEqual(schedule.packs.map((pack) => pack.length), [1, 1, 1]);
 });
 
@@ -143,7 +143,7 @@ test("mixed-risk batches keep high-risk segments in small packs while allowing l
   const schedule = buildRenderPacks(segments);
   const packWithRiskSegment = schedule.packs.find((pack) => pack.some((segment) => segment.episodeIndex === 4));
 
-  assert.equal(schedule.concurrency, 8);
+  assert.equal(schedule.concurrency, 4);
   assert.ok(schedule.packs.every((pack) => pack.length <= 5));
   assert.ok(packWithRiskSegment);
   assert.ok(packWithRiskSegment.length <= 2);

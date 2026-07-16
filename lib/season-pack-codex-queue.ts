@@ -155,6 +155,7 @@ export type SeasonPackCodexJob = {
   claimedAt?: string;
   waitingSlotAt?: string;
   executingAt?: string;
+  codexExitedAt?: string;
   finalizingAt?: string;
   attempt: number;
   fencingToken: number;
@@ -442,6 +443,40 @@ export async function updateSeasonPackCodexJobStage(
   });
 }
 
+export async function heartbeatSeasonPackCodexJob(
+  jobId: string,
+  leaseId: string,
+  fencingToken: number,
+  options: QueueOptions = {},
+) {
+  const rootDir = resolveRootDir(options);
+  return updateRunningFileJob<SeasonPackCodexJob>(rootDir, TASK_ROOT, jobId, leaseId, fencingToken, (current) => (
+    normalizeStoredSeasonPackJob(current)
+  ));
+}
+
+export async function markSeasonPackCodexJobExited(
+  jobId: string,
+  leaseId: string,
+  fencingToken: number,
+  options: QueueOptions = {},
+) {
+  const rootDir = resolveRootDir(options);
+  return updateRunningFileJob<SeasonPackCodexJob>(rootDir, TASK_ROOT, jobId, leaseId, fencingToken, (current) => {
+    const normalized = normalizeStoredSeasonPackJob(current);
+    if (normalized.stage !== "executing") {
+      throw new SeasonPackCodexQueueError(
+        `Season Pack cannot record Codex exit from ${normalized.stage}`,
+        "FINALIZATION_IDENTITY_MISMATCH",
+      );
+    }
+    return {
+      ...normalized,
+      codexExitedAt: normalized.codexExitedAt || new Date().toISOString(),
+    };
+  });
+}
+
 export async function finalizeSeasonPackCodexJobFiles(
   task: SeasonPackCodexJob,
   options: QueueOptions & {
@@ -657,6 +692,7 @@ export function toSeasonPackCodexJobStatusDto(job: SeasonPackCodexJob) {
     ...(job.waitingSlotAt ? { waitingSlotAt: job.waitingSlotAt } : {}),
     ...(job.executingAt ? { executingAt: job.executingAt } : {}),
     ...(job.heartbeatAt ? { heartbeatAt: job.heartbeatAt } : {}),
+    ...(job.codexExitedAt ? { codexExitedAt: job.codexExitedAt } : {}),
     ...(job.finalizingAt ? { finalizingAt: job.finalizingAt } : {}),
     ...(job.completedAt ? { completedAt: job.completedAt } : {}),
     ...(job.errorCode ? { errorCode: job.errorCode } : {}),
@@ -1183,6 +1219,7 @@ function resetRecoveredSeasonPackJob(job: SeasonPackCodexJob): SeasonPackCodexJo
     claimedAt: undefined,
     waitingSlotAt: undefined,
     executingAt: undefined,
+    codexExitedAt: undefined,
     finalizingAt: undefined,
     completedAt: undefined,
     stagingDir: null,

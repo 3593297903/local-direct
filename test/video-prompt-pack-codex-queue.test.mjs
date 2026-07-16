@@ -19,6 +19,8 @@ const {
   failVideoPromptPackCodexJob,
   finalizeVideoPromptPackCodexJobFiles,
   getVideoPromptPackCodexJob,
+  heartbeatVideoPromptPackCodexJob,
+  markVideoPromptPackCodexJobExited,
   recoverFinalizedVideoPromptPackCodexJobs,
   updateVideoPromptPackCodexJobStage,
 } = require("../lib/video-prompt-pack-codex-queue.ts");
@@ -94,13 +96,29 @@ function writeWorkerHeartbeat(rootDir, workerName, workerInstanceId, pid = 777) 
 }
 
 async function enterRenderPackFinalizing(claimed, rootDir) {
-  await updateVideoPromptPackCodexJobStage(
+  const executing = await updateVideoPromptPackCodexJobStage(
     claimed.id,
     claimed.leaseId,
     claimed.fencingToken,
     "executing",
     { rootDir },
   );
+  const heartbeat = await heartbeatVideoPromptPackCodexJob(
+    claimed.id,
+    claimed.leaseId,
+    claimed.fencingToken,
+    { rootDir },
+  );
+  assert.equal(heartbeat.stage, "executing");
+  assert.ok(Date.parse(heartbeat.heartbeatAt) >= Date.parse(executing.heartbeatAt));
+  const exited = await markVideoPromptPackCodexJobExited(
+    claimed.id,
+    claimed.leaseId,
+    claimed.fencingToken,
+    { rootDir },
+  );
+  assert.ok(exited.codexExitedAt);
+  assert.ok(Date.parse(exited.codexExitedAt) >= Date.parse(exited.executingAt));
   return updateVideoPromptPackCodexJobStage(
     claimed.id,
     claimed.leaseId,
