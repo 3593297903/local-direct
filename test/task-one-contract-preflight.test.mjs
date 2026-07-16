@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { existsSync, readdirSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({ module: "commonjs", moduleResolution: "node" });
@@ -18,6 +21,9 @@ const {
   buildSegmentContractHash,
   normalizeSegmentContract,
 } = require("../lib/batch-segment-contract.ts");
+const {
+  createVideoPromptPackCodexJob,
+} = require("../lib/video-prompt-pack-codex-queue.ts");
 
 function makeContract(segmentIndex, overrides = {}) {
   const sourceText = overrides.sourceText || `Segment ${segmentIndex} source text with evidence verification.`;
@@ -209,4 +215,107 @@ test("operation draft persists exact compiled creation payload and rejects tampe
   const tampered = structuredClone(first);
   tampered.creationContext.segments[0].compiledContract.text += "tampered";
   assert.throws(() => validateRenderOperation(tampered), /creationContext|compiled/i);
+});
+
+function makeQueueRoot() {
+  return path.join(os.tmpdir(), `contract-preflight-queue-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+}
+
+function makeQueueInput(segmentIndex = 1) {
+  const contract = makeContract(segmentIndex);
+  const compiledContract = require("../lib/codex-prompt-input-compiler.ts")
+    .compileSegmentContractForPrompt(contract);
+  assert.ok(compiledContract.status === "ready" || compiledContract.status === "compacted");
+  return {
+    batchId: "batch-contract-preflight",
+    operationToken: `operation-contract-${segmentIndex}`,
+    idempotencyKey: `render-operation:contract-${segmentIndex}`,
+    segments: [{
+      episodeIndex: segmentIndex,
+      title: contract.title,
+      script: contract.sourceText,
+      renderInputScript: `Render segment ${segmentIndex} with the supplied contract.`,
+      duration: `${contract.durationSeconds} seconds`,
+      shotCount: contract.shotCount,
+      segmentContract: contract,
+      compiledContract,
+    }],
+  };
+}
+
+function pendingJobFiles(rootDir) {
+  const pendingDir = path.join(rootDir, ".tmp-video-prompt-pack-codex", "pending");
+  return existsSync(pendingDir) ? readdirSync(pendingDir).filter((name) => name.endsWith(".json")) : [];
+}
+
+test("queue rejects a missing compiled contract before creating a pending job", async () => {
+  const rootDir = makeQueueRoot();
+  const input = makeQueueInput();
+  delete input.segments[0].compiledContract;
+  try {
+    await assert.rejects(
+      createVideoPromptPackCodexJob(input, { rootDir }),
+      (error) => error?.code === "CONTRACT_PREFLIGHT_REQUIRED",
+    );
+    assert.deepEqual(pendingJobFiles(rootDir), []);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("queue rejects tampered or unauthorized compiled contract fields without persistence", async () => {
+  for (const mutate of [
+    (compiled) => ({ ...compiled, text: `${compiled.text}\ntampered` }),
+    (compiled) => ({ ...compiled, unauthorized: "field" }),
+  ]) {
+    const rootDir = makeQueueRoot();
+    const input = makeQueueInput();
+    input.segments[0].compiledContract = mutate(input.segments[0].compiledContract);
+    try {
+      await assert.rejects(
+        createVideoPromptPackCodexJob(input, { rootDir }),
+        (error) => error?.code === "CONTRACT_PREFLIGHT_MISMATCH",
+      );
+      assert.deepEqual(pendingJobFiles(rootDir), []);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("queue rejects stale compiler and contract identities before persistence", async () => {
+  for (const mutate of [
+    (input) => { input.segments[0].compiledContract.compilerVersion = "segment-contract-prompt-v1"; },
+    (input) => { input.segments[0].compiledContract.contractHash = "stale-contract-hash"; },
+  ]) {
+    const rootDir = makeQueueRoot();
+    const input = structuredClone(makeQueueInput());
+    mutate(input);
+    try {
+      await assert.rejects(
+        createVideoPromptPackCodexJob(input, { rootDir }),
+        (error) => ["CONTRACT_PREFLIGHT_MISMATCH", "CONTRACT_HASH_INVALID"].includes(error?.code),
+      );
+      assert.deepEqual(pendingJobFiles(rootDir), []);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("queue persists and replays one authoritative compiled projection", async () => {
+  const rootDir = makeQueueRoot();
+  const input = makeQueueInput();
+  try {
+    const first = await createVideoPromptPackCodexJob(input, { rootDir });
+    const retry = await createVideoPromptPackCodexJob(input, { rootDir });
+    assert.equal(retry.id, first.id);
+    assert.equal(first.contractCompilerVersion, "segment-contract-prompt-v2");
+    assert.match(first.compiledContractDigest, /^[a-f0-9]{64}$/);
+    assert.equal(first.segments[0].compiledContract.text, input.segments[0].compiledContract.text);
+    assert.equal(first.prompt.includes(input.segments[0].compiledContract.text), true);
+    assert.equal(pendingJobFiles(rootDir).length, 1);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
 });

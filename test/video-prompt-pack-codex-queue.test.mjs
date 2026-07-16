@@ -15,7 +15,7 @@ require("ts-node/register/transpile-only");
 const {
   claimNextVideoPromptPackCodexJob,
   completeVideoPromptPackCodexJob,
-  createVideoPromptPackCodexJob,
+  createVideoPromptPackCodexJob: createRawVideoPromptPackCodexJob,
   failVideoPromptPackCodexJob,
   finalizeVideoPromptPackCodexJobFiles,
   getVideoPromptPackCodexJob,
@@ -24,6 +24,67 @@ const {
   recoverFinalizedVideoPromptPackCodexJobs,
   updateVideoPromptPackCodexJobStage,
 } = require("../lib/video-prompt-pack-codex-queue.ts");
+const {
+  normalizeSegmentContract,
+} = require("../lib/batch-segment-contract.ts");
+const {
+  compileSegmentContractForPrompt,
+} = require("../lib/codex-prompt-input-compiler.ts");
+
+async function createVideoPromptPackCodexJob(input, options) {
+  return createRawVideoPromptPackCodexJob({
+    ...input,
+    segments: input.segments.map(withAuthoritativeContractPreflight),
+  }, options);
+}
+
+function withAuthoritativeContractPreflight(segment) {
+  const sourceText = String(segment.script || "");
+  const shotCount = Number(segment.shotCount || segment.segmentContract?.shotCount || 4);
+  const durationSeconds = Number.parseFloat(String(segment.segmentContract?.durationSeconds || segment.duration || 15)) || 15;
+  const originalContract = segment.segmentContract && typeof segment.segmentContract === "object"
+    ? segment.segmentContract
+    : null;
+  const contract = normalizeSegmentContract({
+    ...(originalContract || {}),
+    sourceHash: undefined,
+    segmentIndex: segment.episodeIndex,
+    title: segment.title,
+    sourceText,
+    durationSeconds,
+    shotCount,
+    requiredEvents: originalContract?.requiredEvents?.length
+      ? originalContract.requiredEvents
+      : [`Render segment ${segment.episodeIndex} source event`],
+    requiredShotBeats: originalContract?.requiredShotBeats?.length
+      ? originalContract.requiredShotBeats
+      : Array.from({ length: shotCount }, (_, offset) => ({
+          shotNumber: offset + 1,
+          timeRange: `${offset}s-${offset + 1}s`,
+          beat: `Segment ${segment.episodeIndex} beat ${offset + 1}`,
+          visualFocus: `Segment ${segment.episodeIndex} focus ${offset + 1}`,
+        })),
+  }, {
+    segmentIndex: segment.episodeIndex,
+    fallbackTitle: segment.title,
+    fallbackSourceText: sourceText,
+    fallbackDurationSeconds: durationSeconds,
+    fallbackShotCount: shotCount,
+  });
+  if (originalContract) {
+    for (const key of Object.keys(originalContract)) delete originalContract[key];
+    Object.assign(originalContract, contract);
+  }
+  const authoritativeContract = originalContract || contract;
+  const compiledContract = compileSegmentContractForPrompt(authoritativeContract);
+  assert.ok(compiledContract.status === "ready" || compiledContract.status === "compacted");
+  return {
+    ...segment,
+    shotCount,
+    segmentContract: authoritativeContract,
+    compiledContract,
+  };
+}
 
 function makeTempRoot() {
   return path.join(os.tmpdir(), `localdirector-video-prompt-pack-codex-${Date.now()}-${Math.random().toString(16).slice(2)}`);

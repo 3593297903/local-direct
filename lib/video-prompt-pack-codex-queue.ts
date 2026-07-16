@@ -2,12 +2,18 @@ import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import type { AnalysisResult } from "../types";
-import type { SegmentContract, SegmentEvidenceField } from "./batch-segment-contract";
+import {
+  buildSegmentContractSourceHash,
+  type SegmentContract,
+  type SegmentEvidenceField,
+} from "./batch-segment-contract";
 import {
   assertCleanCodexPromptInput,
   buildChinesePromptLexiconBlock,
   compileCodexPromptText,
-  segmentContractToChineseRenderBlock,
+  compileSegmentContractForPrompt,
+  CONTRACT_PROMPT_COMPILER_VERSION,
+  type CompiledSegmentContractBlock,
 } from "./codex-prompt-input-compiler";
 import { readVideoPromptOutputJson } from "./video-prompt-codex-queue";
 import {
@@ -64,6 +70,7 @@ export type VideoPromptPackSegmentInput = {
   duration: string;
   shotCount?: number;
   segmentContract?: SegmentContract;
+  compiledContract?: SuccessfulCompiledSegmentContractBlock;
 };
 
 export type CreateVideoPromptPackCodexJobInput = {
@@ -76,7 +83,18 @@ export type CreateVideoPromptPackCodexJobInput = {
   segments: VideoPromptPackSegmentInput[];
 };
 
-export type VideoPromptPackSegmentTask = VideoPromptPackSegmentInput & {
+type SuccessfulCompiledSegmentContractBlock = Extract<
+  CompiledSegmentContractBlock,
+  { status: "ready" | "compacted" }
+>;
+
+export type VideoPromptPackSegmentTask = Omit<
+  VideoPromptPackSegmentInput,
+  "segmentContract" | "compiledContract"
+> & {
+  segmentContract: SegmentContract;
+  compiledContract: SuccessfulCompiledSegmentContractBlock;
+  compiledContractDigest: string;
   outputFileName: string;
   outputPath: string;
   coverageOutputPath: string;
@@ -122,6 +140,8 @@ export type VideoPromptPackCodexJob = {
   sourceHash: string;
   contractHash: string | null;
   contractHashes: Record<string, string>;
+  contractCompilerVersion: typeof CONTRACT_PROMPT_COMPILER_VERSION | null;
+  compiledContractDigest: string | null;
   resultRef: CodexFinalizedResultRef | null;
   resultAvailable: boolean;
   result: VideoPromptPackCodexResult | null;
@@ -159,20 +179,25 @@ const MAX_PACK_SEGMENTS = 5;
 
 export class VideoPromptPackCodexQueueError extends Error {
   readonly code: string;
+  readonly segmentIndexes: number[];
 
-  constructor(message: string, code = "RENDER_PACK_JOB_INVALID") {
+  constructor(message: string, code = "RENDER_PACK_JOB_INVALID", segmentIndexes: number[] = []) {
     super(message);
     this.name = "VideoPromptPackCodexQueueError";
     this.code = code;
+    this.segmentIndexes = [...segmentIndexes];
   }
 }
+
+export const CONTRACT_PREFLIGHT_REQUIRED_CODE = "CONTRACT_PREFLIGHT_REQUIRED";
+export const CONTRACT_PREFLIGHT_MISMATCH_CODE = "CONTRACT_PREFLIGHT_MISMATCH";
 
 export async function createVideoPromptPackCodexJob(
   input: CreateVideoPromptPackCodexJobInput,
   options: QueueOptions = {},
 ) {
   if (!options.bypassV2CreatePause) assertCodexFinalizationV2CreateEnabled();
-  validateCreateInput(input);
+  const validatedPreflights = validateCreateInput(input);
 
   const rootDir = resolveRootDir(options);
   await ensureFileJobStore(rootDir, TASK_ROOT);
@@ -182,10 +207,13 @@ export async function createVideoPromptPackCodexJob(
   const jobId = idempotencyKey
     ? `video-prompt-pack-job-${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`
     : createId("video-prompt-pack-job");
-  const segments = input.segments.map((segment) => {
+  const segments: VideoPromptPackSegmentTask[] = input.segments.map((segment, index) => {
     const outputFileName = episodeFileName(segment.episodeIndex);
     return {
       ...segment,
+      segmentContract: validatedPreflights[index].contract,
+      compiledContract: validatedPreflights[index].compiledContract,
+      compiledContractDigest: validatedPreflights[index].compiledContractDigest,
       outputFileName,
       outputPath: path.join(resultDir(rootDir), fileSegment(jobId), outputFileName),
       coverageOutputPath: path.join(resultDir(rootDir), fileSegment(jobId), coverageFileName(segment.episodeIndex)),
@@ -193,8 +221,15 @@ export async function createVideoPromptPackCodexJob(
   });
   const mode = input.mode === "standard" ? "standard" : "strictUtf8";
   const coverageSidecarEnabled = input.coverageSidecarEnabled !== false;
-  const modelPrepass = applyPromptSafetyPolicyDeep(segments, { phase: "render" });
-  const prompt = buildVideoPromptPackCodexPrompt(jobId, modelPrepass.sourceTextForModel, mode, coverageSidecarEnabled);
+  const safetyInputs = segments.map(({ compiledContract, compiledContractDigest, ...segment }) => segment);
+  const modelPrepass = applyPromptSafetyPolicyDeep(safetyInputs, { phase: "render" });
+  const promptSegments: VideoPromptPackSegmentTask[] = modelPrepass.sourceTextForModel.map((segment, index) => ({
+    ...segments[index],
+    ...segment,
+    compiledContract: segments[index].compiledContract,
+    compiledContractDigest: segments[index].compiledContractDigest,
+  }));
+  const prompt = buildVideoPromptPackCodexPrompt(jobId, promptSegments, mode, coverageSidecarEnabled);
   assertCleanCodexPromptInput(prompt, "Video prompt render pack prompt");
   const sourceHash = hashCanonicalJson(segments.map((segment) => ({
     episodeIndex: segment.episodeIndex,
@@ -212,6 +247,12 @@ export async function createVideoPromptPackCodexJob(
     String(segment.episodeIndex),
     segment.segmentContract?.contractHash || "",
   ]));
+  const compiledContractDigest = hashCanonicalJson(segments.map((segment) => ({
+    episodeIndex: segment.episodeIndex,
+    contractHash: segment.segmentContract.contractHash,
+    compilerVersion: segment.compiledContract.compilerVersion,
+    compiledContractDigest: segment.compiledContractDigest,
+  })));
   const job: VideoPromptPackCodexJob = {
     id: jobId,
     protocolVersion: CODEX_FINALIZATION_PROTOCOL_VERSION,
@@ -235,6 +276,8 @@ export async function createVideoPromptPackCodexJob(
     sourceHash,
     contractHash,
     contractHashes,
+    contractCompilerVersion: CONTRACT_PROMPT_COMPILER_VERSION,
+    compiledContractDigest,
     resultRef: null,
     resultAvailable: false,
     result: null,
@@ -263,6 +306,8 @@ function assertRenderPackIdempotencyIdentity(
     || stored.sourceHash !== expected.sourceHash
     || stored.contractHash !== expected.contractHash
     || JSON.stringify(stored.contractHashes) !== JSON.stringify(expected.contractHashes)
+    || stored.contractCompilerVersion !== expected.contractCompilerVersion
+    || stored.compiledContractDigest !== expected.compiledContractDigest
     || stored.mode !== expected.mode
     || stored.coverageSidecarEnabled !== expected.coverageSidecarEnabled
     || JSON.stringify(storedIndexes) !== JSON.stringify(expectedIndexes)
@@ -601,6 +646,8 @@ export function toVideoPromptPackCodexJobStatusDto(job: VideoPromptPackCodexJob)
     ...(job.contractHash ? { aggregateContractHash: job.contractHash } : {}),
     segmentIndexes,
     contractHashes: job.contractHashes,
+    ...(job.contractCompilerVersion ? { contractCompilerVersion: job.contractCompilerVersion } : {}),
+    ...(job.compiledContractDigest ? { compiledContractDigest: job.compiledContractDigest } : {}),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     ...(job.claimedAt ? { claimedAt: job.claimedAt } : {}),
@@ -643,7 +690,7 @@ function buildVideoPromptPackCodexPrompt(
     `段落 ${segment.episodeIndex}：${compileCodexPromptText(segment.title)}`,
     `时长：${segment.duration}`,
     `镜头数量锁：${segment.shotCount || "按渲染稿锁定"}`,
-    segment.segmentContract ? segmentContractToChineseRenderBlock(segment.segmentContract) : "",
+    segment.compiledContract.text,
     `Output path: ${segment.outputPath}`,
     coverageSidecarEnabled ? `Optional internal coverage sidecar path: ${segment.coverageOutputPath}` : "",
     "渲染输入：",
@@ -1200,6 +1247,8 @@ function normalizeStoredRenderPackJob(job: VideoPromptPackCodexJob): VideoPrompt
       String(segment.episodeIndex),
       segment.segmentContract?.contractHash || "",
     ])),
+    contractCompilerVersion: job.contractCompilerVersion || null,
+    compiledContractDigest: job.compiledContractDigest || null,
     resultRef: job.resultRef || null,
     resultAvailable: protocolVersion === 1
       ? status === "completed" && Boolean(job.result)
@@ -1419,6 +1468,11 @@ function validateCreateInput(input: CreateVideoPromptPackCodexJobInput) {
   }
 
   const seen = new Set<number>();
+  const validated: Array<{
+    contract: SegmentContract;
+    compiledContract: SuccessfulCompiledSegmentContractBlock;
+    compiledContractDigest: string;
+  }> = [];
   for (const segment of input.segments) {
     if (!Number.isInteger(segment.episodeIndex) || segment.episodeIndex < 1) {
       throw new VideoPromptPackCodexQueueError("Render pack segment is missing episodeIndex");
@@ -1439,7 +1493,98 @@ function validateCreateInput(input: CreateVideoPromptPackCodexJobInput) {
     if (String(segment.duration || "").trim().length < 1) {
       throw new VideoPromptPackCodexQueueError(`Render pack segment ${segment.episodeIndex} is missing duration`);
     }
+    validated.push(validateSegmentContractPreflight(segment));
   }
+  return validated;
+}
+
+function validateSegmentContractPreflight(segment: VideoPromptPackSegmentInput) {
+  const segmentIndexes = [segment.episodeIndex];
+  if (!segment.segmentContract || !segment.compiledContract) {
+    throw new VideoPromptPackCodexQueueError(
+      `Render pack segment ${segment.episodeIndex} is missing authoritative contract preflight`,
+      CONTRACT_PREFLIGHT_REQUIRED_CODE,
+      segmentIndexes,
+    );
+  }
+  const contract = segment.segmentContract;
+  const supplied = segment.compiledContract as CompiledSegmentContractBlock & Record<string, unknown>;
+  if (supplied.compilerVersion !== CONTRACT_PROMPT_COMPILER_VERSION) {
+    throw new VideoPromptPackCodexQueueError(
+      `Render pack segment ${segment.episodeIndex} uses a stale contract compiler`,
+      CONTRACT_PREFLIGHT_MISMATCH_CODE,
+      segmentIndexes,
+    );
+  }
+  if (contract.segmentIndex !== segment.episodeIndex || supplied.segmentIndex !== segment.episodeIndex) {
+    throw new VideoPromptPackCodexQueueError(
+      `Render pack segment ${segment.episodeIndex} contract index does not match`,
+      CONTRACT_PREFLIGHT_MISMATCH_CODE,
+      segmentIndexes,
+    );
+  }
+  if (!Number.isInteger(segment.shotCount) || segment.shotCount !== contract.shotCount) {
+    throw new VideoPromptPackCodexQueueError(
+      `Render pack segment ${segment.episodeIndex} shot count does not match its contract`,
+      CONTRACT_PREFLIGHT_MISMATCH_CODE,
+      segmentIndexes,
+    );
+  }
+  if (normalizeLineEndings(segment.script) !== normalizeLineEndings(contract.sourceText)) {
+    throw new VideoPromptPackCodexQueueError(
+      `Render pack segment ${segment.episodeIndex} script does not match its contract source`,
+      CONTRACT_PREFLIGHT_MISMATCH_CODE,
+      segmentIndexes,
+    );
+  }
+  if (contract.sourceHash !== buildSegmentContractSourceHash(contract.sourceText)) {
+    throw new VideoPromptPackCodexQueueError(
+      `Render pack segment ${segment.episodeIndex} source hash is invalid`,
+      "CONTRACT_HASH_INVALID",
+      segmentIndexes,
+    );
+  }
+
+  const authoritative = compileSegmentContractForPrompt(contract);
+  if (authoritative.status === "invalid") {
+    throw new VideoPromptPackCodexQueueError(authoritative.message, authoritative.errorCode, segmentIndexes);
+  }
+  if (authoritative.status === "overflow") {
+    throw new VideoPromptPackCodexQueueError(
+      `Render pack segment ${segment.episodeIndex} contract exceeds the prompt budget`,
+      authoritative.errorCode,
+      segmentIndexes,
+    );
+  }
+  if (
+    supplied.status !== "ready"
+    && supplied.status !== "compacted"
+  ) {
+    throw new VideoPromptPackCodexQueueError(
+      `Render pack segment ${segment.episodeIndex} compiled contract is not renderable`,
+      CONTRACT_PREFLIGHT_MISMATCH_CODE,
+      segmentIndexes,
+    );
+  }
+  if (
+    supplied.contractHash !== contract.contractHash
+    || hashCanonicalJson(supplied) !== hashCanonicalJson(authoritative)
+  ) {
+    throw new VideoPromptPackCodexQueueError(
+      `Render pack segment ${segment.episodeIndex} compiled contract does not match the authoritative projection`,
+      CONTRACT_PREFLIGHT_MISMATCH_CODE,
+      segmentIndexes,
+    );
+  }
+  return {
+    contract,
+    compiledContract: authoritative,
+    compiledContractDigest: hashCanonicalJson(authoritative),
+  };
+}
+
+function normalizeLineEndings(value: unknown) {
+  return String(value ?? "").replace(/\r\n?/g, "\n");
 }
 
 function resolveRootDir(options: QueueOptions) {

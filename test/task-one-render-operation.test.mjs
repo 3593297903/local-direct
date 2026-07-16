@@ -32,6 +32,9 @@ const {
   buildSegmentContractHash,
   normalizeSegmentContract,
 } = require("../lib/batch-segment-contract.ts");
+const {
+  compileSegmentContractForPrompt,
+} = require("../lib/codex-prompt-input-compiler.ts");
 
 function identityInput(overrides = {}) {
   const segmentIndexes = overrides.segmentIndexes || [3, 1, 2];
@@ -75,13 +78,17 @@ function sampleSegment(index = 1) {
     ...normalizedContract,
     contractHash: buildSegmentContractHash(normalizedContract),
   };
+  const compiledContract = compileSegmentContractForPrompt(segmentContract);
+  assert.ok(compiledContract.status === "ready" || compiledContract.status === "compacted");
   return {
     episodeIndex: index,
     title: `Segment ${index}`,
     script: sourceText,
     renderInputScript: `Render segment ${index} as a complete executable prompt.`,
     duration: "15 seconds",
+    shotCount: segmentContract.shotCount,
     segmentContract,
+    compiledContract,
   };
 }
 

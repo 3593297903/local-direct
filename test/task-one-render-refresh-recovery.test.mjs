@@ -36,6 +36,9 @@ const {
   buildSegmentContractHash,
   normalizeSegmentContract,
 } = require("../lib/batch-segment-contract.ts");
+const {
+  compileSegmentContractForPrompt,
+} = require("../lib/codex-prompt-input-compiler.ts");
 
 function activeOperation(token = "refresh-token-1", jobId = "refresh-job-1") {
   const draft = createRenderOperationDraft({
@@ -384,7 +387,7 @@ test("pending Render Pack status is smaller than 4 KiB", async () => {
   try {
     const segments = Array.from({ length: 5 }, (_, offset) => {
       const episodeIndex = offset + 1;
-      const sourceText = "source ".repeat(200);
+      const sourceText = "source ".repeat(200).trim();
       const normalizedContract = normalizeSegmentContract({
         segmentIndex: episodeIndex,
         title: `Segment ${episodeIndex}`,
@@ -405,16 +408,21 @@ test("pending Render Pack status is smaller than 4 KiB", async () => {
         fallbackDurationSeconds: 15,
         fallbackShotCount: 4,
       });
+      const segmentContract = {
+        ...normalizedContract,
+        contractHash: buildSegmentContractHash(normalizedContract),
+      };
+      const compiledContract = compileSegmentContractForPrompt(segmentContract);
+      assert.ok(compiledContract.status === "ready" || compiledContract.status === "compacted");
       return {
         episodeIndex,
         title: `Segment ${episodeIndex}`,
         script: sourceText,
         renderInputScript: "render instructions ".repeat(200),
         duration: "15 seconds",
-        segmentContract: {
-          ...normalizedContract,
-          contractHash: buildSegmentContractHash(normalizedContract),
-        },
+        shotCount: segmentContract.shotCount,
+        segmentContract,
+        compiledContract,
       };
     });
     const contractHashes = Object.fromEntries(segments.map((segment) => [

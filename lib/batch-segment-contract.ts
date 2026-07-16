@@ -116,7 +116,7 @@ export function normalizeSegmentContract(raw: unknown, fallback: SegmentContract
     coveragePolicyVersion: cleanString(fallback.coveragePolicyVersion)
       || cleanString(record.coveragePolicyVersion)
       || DEFAULT_COVERAGE_POLICY_VERSION,
-    sourceHash: cleanString(record.sourceHash) || buildSourceHash(sourceText),
+    sourceHash: cleanString(record.sourceHash) || buildSegmentContractSourceHash(sourceText),
     segmentIndex,
     title,
     sourceText,
@@ -530,7 +530,7 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function buildSourceHash(sourceText: string) {
+export function buildSegmentContractSourceHash(sourceText: string) {
   return buildStableHash("src", sourceText);
 }
 
