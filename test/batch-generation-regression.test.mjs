@@ -840,6 +840,32 @@ test("phase-three acceptance allows the refresh recovery regression test in the 
   assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
 });
 
+test("phase-three acceptance permits only the exact Phase 3R-F test fixture files", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = createPhaseThreeAcceptanceFixture();
+  valid.git.changedFiles.push(
+    "test/helpers/authoritative-render-pack-fixture.mjs",
+    "test/codex-finalization-v1-compatibility.test.mjs",
+    "test/codex-finalization-v1-migration.test.mjs",
+    "test/task-two-render-pack-atomic-claim.test.mjs",
+  );
+  assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
+
+  const arbitraryTest = structuredClone(valid);
+  arbitraryTest.git.changedFiles.push("test/unrelated-phase-three-file.test.mjs");
+  assert.equal(evaluatePhaseThreeAcceptance(arbitraryTest).status, "rejected");
+
+  const unauthorizedProduction = structuredClone(valid);
+  unauthorizedProduction.git.changedFiles.push("lib/unrelated-production-change.ts");
+  assert.equal(evaluatePhaseThreeAcceptance(unauthorizedProduction).status, "rejected");
+
+  const failedFullTests = structuredClone(valid);
+  const fullTests = failedFullTests.commandResults.commands.find((item) => item.commandId === "full-tests");
+  fullTests.exitCode = 1;
+  fullTests.passed = false;
+  assert.equal(evaluatePhaseThreeAcceptance(failedFullTests).status, "rejected");
+});
+
 test("phase-three acceptance JSON is UTF-8 without BOM and self-parseable", async () => {
   const { writePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
   const root = path.join(process.cwd(), ".tmp-batch-benchmark", `phase-three-json-${process.pid}-${Date.now()}`);
