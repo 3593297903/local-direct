@@ -201,12 +201,50 @@ test("dashboard limits duplicate segment repair attempts and can restore cached 
 test("dashboard balances render packs so tail segments do not wait for a second wave", async () => {
   const dashboardSource = await readFile(join(process.cwd(), "components", "DashboardClient.tsx"), "utf8");
 
-  assert.match(dashboardSource, /buildRenderPacks\(episodes/);
+  assert.match(dashboardSource, /buildPreflightedRenderPacks\(contractPreflightPlan/);
   assert.match(dashboardSource, /renderSchedule\.packs/);
   assert.match(dashboardSource, /renderSchedule\.concurrency/);
   assert.match(dashboardSource, /forceProfile: "SINGLE"/);
   assert.match(dashboardSource, /调度策略/);
   assert.doesNotMatch(dashboardSource, /const renderPacks = chunkEpisodesForRenderPacks/);
+});
+
+test("dashboard preflights contracts before operations and never routes contract failures to prompt repair", async () => {
+  const dashboardSource = await readFile(join(process.cwd(), "components", "DashboardClient.tsx"), "utf8");
+  const restoreIndex = dashboardSource.indexOf("await restoreCachedRenderedSegments()");
+  const preflightIndex = dashboardSource.indexOf("preflightSegmentContracts(", restoreIndex);
+  const scheduleIndex = dashboardSource.indexOf("buildPreflightedRenderPacks(", preflightIndex);
+  const renderInvocationIndex = dashboardSource.indexOf(
+    "await renderPackedSegmentsWithQualityRepair(renderPacks[packIndex]",
+    scheduleIndex,
+  );
+
+  assert.ok(restoreIndex >= 0);
+  assert.ok(preflightIndex > restoreIndex);
+  assert.ok(scheduleIndex > preflightIndex);
+  assert.ok(renderInvocationIndex > scheduleIndex);
+  assert.match(dashboardSource, /createRenderOperationDraftFromPreflightPack\(/);
+  assert.match(dashboardSource, /CONTRACT_PREFLIGHT_STARTED/);
+  assert.match(dashboardSource, /CONTRACT_PREFLIGHT_READY/);
+  assert.match(dashboardSource, /CONTRACT_PREFLIGHT_INVALID/);
+  assert.match(dashboardSource, /CONTRACT_PREFLIGHT_V2_CREATE_PAUSED/);
+  assert.match(dashboardSource, /contractPreflightAttempts/);
+  assert.match(dashboardSource, /contractPreflightCompacted/);
+  assert.match(dashboardSource, /contractPreflightIsolated/);
+  assert.match(dashboardSource, /contractPreflightInvalid/);
+
+  const invalidRouterStart = dashboardSource.indexOf("function markContractPreflightInvalid");
+  const invalidRouterEnd = dashboardSource.indexOf("\n    }", invalidRouterStart);
+  const invalidRouterSource = dashboardSource.slice(invalidRouterStart, invalidRouterEnd);
+  assert.ok(invalidRouterStart >= 0);
+  assert.doesNotMatch(invalidRouterSource, /queueSegmentRepair|requestAnalysisWithContext|runCoverageJudgeWave/);
+
+  const runRenderPackStart = dashboardSource.indexOf("async function runRenderPack");
+  const durableCreateIndex = dashboardSource.indexOf("await createVideoPromptPackCodexJob", runRenderPackStart);
+  const renderMetricIndex = dashboardSource.indexOf('invocationLedger.record("renderPackCalls"', runRenderPackStart);
+  assert.ok(durableCreateIndex > runRenderPackStart);
+  assert.ok(renderMetricIndex > durableCreateIndex);
+  assert.match(dashboardSource, /fingerprint:\s*`render:/);
 });
 
 test("dashboard records lightweight batch quality reports without changing the render path", async () => {

@@ -616,6 +616,181 @@ test("benchmark commit or production fingerprint mismatch forces rejected", asyn
   ]);
 });
 
+const PHASE_THREE_COMMAND_IDS = [
+  "phase-three-focused-tests",
+  "phase-two-regression-tests",
+  "contract-preflight-benchmark",
+  "phase-two-lifecycle-benchmark",
+  "benchmark-20",
+  "benchmark-30",
+  "typecheck",
+  "api-typecheck",
+  "full-tests",
+  "api-build",
+  "frontend-build",
+  "git-diff-check",
+  "git-status-clean",
+  "git-ancestor",
+  "git-merge-tree",
+];
+
+function createPhaseThreeAcceptanceFixture() {
+  const taskCommit = "a".repeat(40);
+  const baselineCommit = "b".repeat(40);
+  const replay20 = replayFixture(fixture20);
+  const replay30 = replayFixture(fixture30);
+  const zeroCalls = {
+    model: 0,
+    judge: 0,
+    repair: 0,
+    fallback: 0,
+    singleGeneration: 0,
+  };
+  const qualityReport = (count, fixtureHash, canonicalPromptHashes, localPatchOperations) => ({
+    schemaVersion: 1,
+    gitCommit: taskCommit,
+    fixtureHash,
+    baseline: { gitCommit: baselineCommit },
+    quality: {
+      accepted: count,
+      blocked: 0,
+      needsReview: 0,
+      localPatchOperations,
+      promptLengths: { min: 1_800 },
+    },
+    extensions: {
+      canonicalPromptHashes,
+      localPatchOperations,
+      queueScanStatus: "skipped_unchanged_scope",
+    },
+    invocationCounters: Object.fromEntries(MODEL_KINDS.map((kind) => [kind, {
+      planned: 0,
+      created: 0,
+      executing: 0,
+      completed: 0,
+      failed: 0,
+    }])),
+    timingsMs: { full_local_pipeline_total: { p50: 10, p95: 12, coefficientOfVariation: 0.1 } },
+    comparison: { full_local_pipeline_total: { p50Ratio: 1, p95Ratio: 1 } },
+    environment: { queueScan: "skipped" },
+  });
+  return {
+    taskCommit,
+    baselineCommit,
+    sourceFingerprint: "e".repeat(64),
+    reports: {
+      contractPreflight: {
+        schemaVersion: 1,
+        gitCommit: taskCommit,
+        sourceFingerprint: "e".repeat(64),
+        contracts: 30,
+        iterations: 1000,
+        metrics: { attempts: 30, invalid: 0 },
+        calls: zeroCalls,
+        operationCountBeforePreflight: 0,
+        canceledValidNeighbors: 0,
+        tamperedQueueCreates: 0,
+        semanticDigestStable: true,
+        sourceMutationCount: 0,
+        timingsMs: { p50: 5, p95: 8, coefficientOfVariation: 0.1 },
+      },
+      lifecycle: {
+        status: "accepted",
+        maxActive: 4,
+        starvationCount: 0,
+        lockTimeoutCount: 0,
+        calls: zeroCalls,
+      },
+      benchmark20: qualityReport(
+        20,
+        FIXTURE_20_SHA256,
+        replay20.canonicalPromptHashes,
+        57,
+      ),
+      benchmark30: qualityReport(
+        30,
+        FIXTURE_30_SHA256,
+        replay30.canonicalPromptHashes,
+        147,
+      ),
+    },
+    commandResults: {
+      schemaVersion: 1,
+      taskCommit,
+      baselineCommit,
+      commands: PHASE_THREE_COMMAND_IDS.map((commandId) => ({
+        commandId,
+        exitCode: 0,
+        passed: true,
+        summary: commandId === "git-merge-tree" ? { treeHash: "c".repeat(40) } : {},
+      })),
+    },
+    git: {
+      branch: "task-quality-pipeline-fix",
+      statusShort: "",
+      diffCheckExitCode: 0,
+      ancestorExitCode: 0,
+      mergeTreeExitCode: 0,
+      mergeTreeHash: "c".repeat(40),
+      changedFiles: ["scripts/finalize-task-one-phase-3.mjs"],
+    },
+  };
+}
+
+test("phase-three contract benchmark runs the production preflight without mutation", async () => {
+  const { runContractPreflightBenchmark } = await import("../scripts/benchmark-phase-3-contract-preflight.mjs");
+  const report = await runContractPreflightBenchmark({ contracts: 30, iterations: 5, warmups: 1 });
+  assert.equal(report.contracts, 30);
+  assert.equal(report.metrics.attempts, 30);
+  assert.equal(report.metrics.invalid, 0);
+  assert.equal(report.semanticDigestStable, true);
+  assert.equal(report.sourceMutationCount, 0);
+  assert.deepEqual(report.calls, {
+    model: 0,
+    judge: 0,
+    repair: 0,
+    fallback: 0,
+    singleGeneration: 0,
+  });
+});
+
+test("phase-three acceptance rejects missing stale dirty or failed evidence", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = createPhaseThreeAcceptanceFixture();
+  assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
+
+  const missingReport = structuredClone(valid);
+  delete missingReport.reports.contractPreflight;
+  assert.equal(evaluatePhaseThreeAcceptance(missingReport).status, "rejected");
+
+  const staleReport = structuredClone(valid);
+  staleReport.reports.benchmark20.gitCommit = "d".repeat(40);
+  assert.equal(evaluatePhaseThreeAcceptance(staleReport).status, "rejected");
+
+  const failedCommand = structuredClone(valid);
+  failedCommand.commandResults.commands.find((item) => item.commandId === "full-tests").exitCode = 1;
+  assert.equal(evaluatePhaseThreeAcceptance(failedCommand).status, "rejected");
+
+  const dirty = structuredClone(valid);
+  dirty.git.statusShort = " M components/DashboardClient.tsx";
+  assert.equal(evaluatePhaseThreeAcceptance(dirty).status, "rejected");
+});
+
+test("phase-three acceptance JSON is UTF-8 without BOM and self-parseable", async () => {
+  const { writePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const root = path.join(process.cwd(), ".tmp-batch-benchmark", `phase-three-json-${process.pid}-${Date.now()}`);
+  const target = path.join(root, "acceptance.json");
+  try {
+    const acceptance = await writePhaseThreeAcceptance(target, createPhaseThreeAcceptanceFixture());
+    assert.equal(acceptance.status, "accepted");
+    const bytes = await readFile(target);
+    assert.notDeepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+    assert.equal(JSON.parse(bytes.toString("utf8")).taskCommit, "a".repeat(40));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("missing external verification forces phase-zero acceptance to rejected", async () => {
   const fixture = await createExternalVerificationFixture();
   try {

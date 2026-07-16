@@ -20,8 +20,30 @@ test("batch event feature flags use conservative rollout defaults", () => {
   assert.equal(snapshot.emergencyStop, false);
   assert.equal(snapshot.localGate, false);
   assert.equal(snapshot.judge, false);
+  assert.equal(snapshot.contractPreflightV2, true);
   assert.equal(snapshot.capturedAt, capturedAt);
   assert.ok(snapshot.coveragePolicyVersion);
+});
+
+test("contract preflight v2 is frozen once and defaults on for compatible snapshots", () => {
+  const capturedAt = "2026-07-16T00:00:00.000Z";
+  const disabled = createBatchEventFeatureSnapshot({
+    BATCH_CONTRACT_PREFLIGHT_V2: "0",
+  }, capturedAt);
+  assert.equal(disabled.contractPreflightV2, false);
+  assert.equal(normalizeBatchEventFeatureSnapshot(disabled, "2026-07-17T00:00:00.000Z").contractPreflightV2, false);
+
+  const compatible = normalizeBatchEventFeatureSnapshot({
+    contractV2: true,
+    coverageSidecar: true,
+    coverageStage: "shadow",
+    emergencyStop: false,
+    localGate: false,
+    judge: false,
+    coveragePolicyVersion: "coverage-v1",
+    capturedAt,
+  }, capturedAt);
+  assert.equal(compatible.contractPreflightV2, true);
 });
 
 test("batch event feature snapshot is normalized once and does not read later environment changes", () => {

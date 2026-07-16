@@ -17,6 +17,9 @@ const {
   progressStatusFromSegmentState,
 } = require("../lib/batch-segment-progress.ts");
 const {
+  createBatchInvocationLedger,
+} = require("../lib/batch-repair-scheduler.ts");
+const {
   migrateSegmentBatchCacheDocument,
   readSegmentBatchCache,
   writeSegmentBatchCache,
@@ -42,6 +45,97 @@ test("illegal SAVE_SUCCEEDED and unrelated REPAIR_COMPLETED events are ignored",
     at: 3,
   });
   assert.deepEqual(unrelatedRepair, initial);
+});
+
+test("contract preflight states are orthogonal and contract invalid cannot enter repair", () => {
+  let ready = createInitialSegmentState(1, { contractHash: "contract-ready", updatedAt: 1 });
+  ready = reduceSegmentState(ready, {
+    type: "CONTRACT_PREFLIGHT_STARTED",
+    baseRevision: 0,
+    at: 2,
+  });
+  assert.equal(ready.generationStatus, "preparing_input");
+  assert.equal(ready.qualityStatus, "unknown");
+  assert.equal(progressStatusFromSegmentState(ready), "validating");
+
+  ready = reduceSegmentState(ready, {
+    type: "CONTRACT_PREFLIGHT_READY",
+    baseRevision: 1,
+    at: 3,
+  });
+  assert.equal(ready.generationStatus, "pending");
+  assert.equal(ready.lastErrorCode, undefined);
+
+  let invalid = createInitialSegmentState(2, { contractHash: "contract-invalid", updatedAt: 1 });
+  invalid = reduceSegmentState(invalid, {
+    type: "CONTRACT_PREFLIGHT_STARTED",
+    baseRevision: 0,
+    at: 2,
+  });
+  invalid = reduceSegmentState(invalid, {
+    type: "CONTRACT_PREFLIGHT_INVALID",
+    baseRevision: 1,
+    errorCode: "CONTRACT_BUDGET_EXCEEDED",
+    message: "Contract input requires review",
+    at: 3,
+  });
+  assert.equal(invalid.generationStatus, "contract_invalid");
+  assert.equal(invalid.qualityStatus, "unknown");
+  assert.equal(invalid.saveStatus, "not_ready");
+  assert.equal(invalid.resultHash, undefined);
+  assert.equal(invalid.lastErrorCode, "CONTRACT_BUDGET_EXCEEDED");
+  assert.equal(progressStatusFromSegmentState(invalid), "failed");
+
+  const repairAttempt = reduceSegmentState(invalid, {
+    type: "REPAIR_QUEUED",
+    baseRevision: invalid.revision,
+    fingerprint: "must-not-run",
+    at: 4,
+  });
+  assert.deepEqual(repairAttempt, invalid);
+});
+
+test("one contract-invalid segment does not stop an active valid neighbor", () => {
+  let invalid = createInitialSegmentState(1);
+  invalid = reduceSegmentState(invalid, { type: "CONTRACT_PREFLIGHT_STARTED", baseRevision: 0, at: 1 });
+  invalid = reduceSegmentState(invalid, {
+    type: "CONTRACT_PREFLIGHT_INVALID",
+    baseRevision: 1,
+    errorCode: "CONTRACT_SCHEMA_INVALID",
+    at: 2,
+  });
+
+  let valid = createInitialSegmentState(2);
+  valid = reduceSegmentState(valid, { type: "CONTRACT_PREFLIGHT_STARTED", baseRevision: 0, at: 1 });
+  valid = reduceSegmentState(valid, { type: "CONTRACT_PREFLIGHT_READY", baseRevision: 1, at: 2 });
+  valid = reduceSegmentState(valid, { type: "RENDER_STARTED", baseRevision: 2, at: 3 });
+  assert.equal(deriveBatchPhaseFromSegmentStates([invalid, valid]), "rendering");
+
+  valid = reduceSegmentState(valid, {
+    type: "RENDER_SUCCEEDED",
+    baseRevision: 3,
+    resultHash: "valid-result",
+    at: 4,
+  });
+  valid = reduceSegmentState(valid, { type: "QUALITY_PASSED", baseRevision: 4, at: 5 });
+  valid = reduceSegmentState(valid, { type: "CACHE_READY", baseRevision: 5, at: 6 });
+  assert.equal(deriveBatchPhaseFromSegmentStates([invalid, valid]), "failed");
+});
+
+test("invocation ledger deduplicates durable render creates and retains local preflight metrics", () => {
+  const ledger = createBatchInvocationLedger();
+  ledger.record("renderPackCalls", { fingerprint: "render:operation-1:job-1" });
+  ledger.record("renderPackCalls", { fingerprint: "render:operation-1:job-1" });
+  ledger.record("contractPreflightAttempts", { count: 3, fingerprint: "preflight:batch-1:attempts" });
+  ledger.record("contractPreflightCompacted", { count: 1, fingerprint: "preflight:batch-1:compacted" });
+  ledger.record("contractPreflightInvalid", { count: 1, fingerprint: "preflight:batch-1:invalid" });
+
+  const summary = ledger.summary();
+  assert.equal(summary.renderPackCalls, 1);
+  assert.equal(summary.contractPreflightAttempts, 3);
+  assert.equal(summary.contractPreflightCompacted, 1);
+  assert.equal(summary.contractPreflightIsolated, 0);
+  assert.equal(summary.contractPreflightInvalid, 1);
 });
 
 test("orthogonal reducer preserves quality while save fails and resumes", () => {
@@ -174,6 +268,55 @@ test("cache v2 preserves the invocation ledger without adding calls", async () =
     await writeSegmentBatchCache(document, { rootDir });
     const restored = await readSegmentBatchCache(document.batchId, { rootDir });
     assert.deepEqual(restored.invocationEvents, document.invocationEvents);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("cache v2 preserves contract preflight state error and frozen feature flag", async () => {
+  const rootDir = path.join(os.tmpdir(), `task-one-contract-cache-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  let invalid = createInitialSegmentState(1, { contractHash: "contract-invalid", updatedAt: 1 });
+  invalid = reduceSegmentState(invalid, {
+    type: "CONTRACT_PREFLIGHT_STARTED",
+    baseRevision: invalid.revision,
+    at: 2,
+  });
+  invalid = reduceSegmentState(invalid, {
+    type: "CONTRACT_PREFLIGHT_INVALID",
+    baseRevision: invalid.revision,
+    errorCode: "CONTRACT_PROMPT_BUDGET_EXCEEDED",
+    message: "Contract input requires review",
+    at: 3,
+  });
+  const document = {
+    schemaVersion: 2,
+    revision: 1,
+    batchId: "task-one-contract-cache",
+    durableBatchId: "task-one-contract-cache",
+    sourceHash: "src",
+    contractHash: "contract",
+    resolvedSegmentCount: 1,
+    updatedAt: new Date().toISOString(),
+    featureFlags: {
+      contractV2: true,
+      contractPreflightV2: false,
+      coverageSidecar: true,
+      coverageStage: "shadow",
+      emergencyStop: false,
+      capturedAt: new Date(0).toISOString(),
+    },
+    segmentStates: [invalid],
+    activeJobIds: [],
+    qualityReports: [],
+    needsReviewSegments: [],
+    segments: [],
+  };
+  try {
+    await writeSegmentBatchCache(document, { rootDir });
+    const restored = await readSegmentBatchCache(document.batchId, { rootDir });
+    assert.equal(restored.segmentStates[0].generationStatus, "contract_invalid");
+    assert.equal(restored.segmentStates[0].lastErrorCode, "CONTRACT_PROMPT_BUDGET_EXCEEDED");
+    assert.equal(restored.featureFlags.contractPreflightV2, false);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

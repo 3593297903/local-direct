@@ -164,6 +164,7 @@ export type VideoPromptPackCodexMode = "standard" | "strictUtf8";
 type QueueOptions = {
   rootDir?: string;
   bypassV2CreatePause?: boolean;
+  bypassContractPreflightV2CreatePause?: boolean;
 };
 
 type ClaimOptions = QueueOptions & {
@@ -191,12 +192,14 @@ export class VideoPromptPackCodexQueueError extends Error {
 
 export const CONTRACT_PREFLIGHT_REQUIRED_CODE = "CONTRACT_PREFLIGHT_REQUIRED";
 export const CONTRACT_PREFLIGHT_MISMATCH_CODE = "CONTRACT_PREFLIGHT_MISMATCH";
+export const CONTRACT_PREFLIGHT_V2_CREATE_PAUSED_CODE = "CONTRACT_PREFLIGHT_V2_CREATE_PAUSED";
 
 export async function createVideoPromptPackCodexJob(
   input: CreateVideoPromptPackCodexJobInput,
   options: QueueOptions = {},
 ) {
   if (!options.bypassV2CreatePause) assertCodexFinalizationV2CreateEnabled();
+  if (!options.bypassContractPreflightV2CreatePause) assertContractPreflightV2CreateEnabled();
   const validatedPreflights = validateCreateInput(input);
 
   const rootDir = resolveRootDir(options);
@@ -289,6 +292,14 @@ export async function createVideoPromptPackCodexJob(
   const stored = await putPendingFileJob(rootDir, TASK_ROOT, job);
   if (idempotencyKey) assertRenderPackIdempotencyIdentity(stored, job);
   return stored;
+}
+
+function assertContractPreflightV2CreateEnabled() {
+  if (String(process.env.BATCH_CONTRACT_PREFLIGHT_V2 || "1").trim() !== "0") return;
+  throw new VideoPromptPackCodexQueueError(
+    "Contract preflight v2 creation is paused",
+    CONTRACT_PREFLIGHT_V2_CREATE_PAUSED_CODE,
+  );
 }
 
 function assertRenderPackIdempotencyIdentity(

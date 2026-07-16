@@ -3,6 +3,7 @@ import type { BatchEventCoverageStage } from "./batch-segment-outcome-router";
 
 export type BatchEventFeatureSnapshot = {
   contractV2: boolean;
+  contractPreflightV2: boolean;
   coverageSidecar: boolean;
   coverageStage: BatchEventCoverageStage;
   emergencyStop: boolean;
@@ -26,6 +27,7 @@ export function createBatchEventFeatureSnapshot(
   const coverageStage = emergencyStop ? "shadow" : requestedStage;
   return {
     contractV2: readBoolean(environment.BATCH_EVENT_CONTRACT_V2, true),
+    contractPreflightV2: readBoolean(environment.BATCH_CONTRACT_PREFLIGHT_V2, true),
     coverageSidecar: readBoolean(environment.BATCH_EVENT_COVERAGE_SIDECAR, true),
     coverageStage,
     emergencyStop,
@@ -48,6 +50,9 @@ export function normalizeBatchEventFeatureSnapshot(
   const coverageStage = emergencyStop ? "shadow" : normalizedStage;
   return {
     contractV2: typeof value.contractV2 === "boolean" ? value.contractV2 : defaults.contractV2,
+    contractPreflightV2: typeof value.contractPreflightV2 === "boolean"
+      ? value.contractPreflightV2
+      : defaults.contractPreflightV2,
     coverageSidecar: typeof value.coverageSidecar === "boolean" ? value.coverageSidecar : defaults.coverageSidecar,
     coverageStage,
     emergencyStop,

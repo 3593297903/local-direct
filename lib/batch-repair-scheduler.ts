@@ -166,7 +166,11 @@ export type BatchInvocationMetricName =
   | "pathPatchJobCreated"
   | "pathPatchCompleted"
   | "judgeCalls"
-  | "localPatchOperations";
+  | "localPatchOperations"
+  | "contractPreflightAttempts"
+  | "contractPreflightCompacted"
+  | "contractPreflightIsolated"
+  | "contractPreflightInvalid";
 
 export type BatchInvocationLedgerEvent = {
   name: BatchInvocationMetricName;
@@ -182,7 +186,13 @@ export function createBatchInvocationLedger(initialEvents: readonly BatchInvocat
     name: BatchInvocationMetricName,
     input: Omit<BatchInvocationLedgerEvent, "name" | "at" | "count"> & { at?: number; count?: number } = {},
   ) {
+    if (input.fingerprint && events.some((event) => (
+      event.name === name && event.fingerprint === input.fingerprint
+    ))) {
+      return false;
+    }
     events.push({ name, at: input.at ?? Date.now(), count: input.count || 1, ...input });
+    return true;
   }
   function summary() {
     const counts: Record<BatchInvocationMetricName, number> = {
@@ -192,6 +202,10 @@ export function createBatchInvocationLedger(initialEvents: readonly BatchInvocat
       pathPatchCompleted: 0,
       judgeCalls: 0,
       localPatchOperations: 0,
+      contractPreflightAttempts: 0,
+      contractPreflightCompacted: 0,
+      contractPreflightIsolated: 0,
+      contractPreflightInvalid: 0,
     };
     for (const event of events) counts[event.name] += event.count;
     return { ...counts, events: events.map((event) => ({ ...event })) };

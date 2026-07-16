@@ -154,6 +154,33 @@ test("valid A and C create operations while invalid B creates none", () => {
   assert.equal(operations.flatMap((operation) => operation.segmentIndexes).includes(2), false);
 });
 
+test("invalid B is isolated without model, repair, judge, or fallback calls", () => {
+  const plan = preflightSegmentContracts(
+    [makeItem(1), makeItem(2, makeOverflowContract(2)), makeItem(3)],
+    preflightOptions,
+  );
+  const schedule = buildPreflightedRenderPacks(plan, preflightOptions);
+  const counters = {
+    renderOperations: schedule.packs.length,
+    queueJobs: 0,
+    singleGeneration: 0,
+    pathRepair: 0,
+    judge: 0,
+    safetyRewrite: 0,
+  };
+
+  assert.deepEqual(schedule.packs.map((pack) => pack.entries.map((entry) => entry.item.episodeIndex)), [[1], [3]]);
+  assert.deepEqual(schedule.invalid.map((entry) => entry.item.episodeIndex), [2]);
+  assert.deepEqual(counters, {
+    renderOperations: 2,
+    queueJobs: 0,
+    singleGeneration: 0,
+    pathRepair: 0,
+    judge: 0,
+    safetyRewrite: 0,
+  });
+});
+
 test("compacted contracts remain in their contiguous eligible run", () => {
   const compacted = makeContract(2, {
     sourceText: "Source text already travels independently in the render script. ".repeat(180),
@@ -220,6 +247,23 @@ test("operation draft persists exact compiled creation payload and rejects tampe
 function makeQueueRoot() {
   return path.join(os.tmpdir(), `contract-preflight-queue-${Date.now()}-${Math.random().toString(16).slice(2)}`);
 }
+
+test("server rollback switch rejects new Phase 3 creates without a pending job", async () => {
+  const rootDir = makeQueueRoot();
+  const previous = process.env.BATCH_CONTRACT_PREFLIGHT_V2;
+  process.env.BATCH_CONTRACT_PREFLIGHT_V2 = "0";
+  try {
+    await assert.rejects(
+      () => createVideoPromptPackCodexJob(makeQueueInput(1), { rootDir }),
+      (error) => error?.code === "CONTRACT_PREFLIGHT_V2_CREATE_PAUSED",
+    );
+    assert.equal(existsSync(path.join(rootDir, ".tmp-video-prompt-pack-codex")), false);
+  } finally {
+    if (previous === undefined) delete process.env.BATCH_CONTRACT_PREFLIGHT_V2;
+    else process.env.BATCH_CONTRACT_PREFLIGHT_V2 = previous;
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
 
 function makeQueueInput(segmentIndex = 1) {
   const contract = makeContract(segmentIndex);

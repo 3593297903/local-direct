@@ -4,6 +4,10 @@ import { randomUUID } from "node:crypto";
 import type { SegmentStateRecord } from "./batch-segment-progress";
 import type { BatchInvocationLedgerEvent } from "./batch-repair-scheduler";
 import {
+  normalizeBatchEventFeatureSnapshot,
+  type BatchEventFeatureSnapshot,
+} from "./batch-event-feature-flags";
+import {
   retainBoundedRenderOperationAudits,
   type RenderOperationRefV2,
 } from "./batch-render-operation";
@@ -64,6 +68,7 @@ export type SegmentBatchCacheDocumentV2 = {
   duration?: string;
   invocationEvents?: BatchInvocationLedgerEvent[];
   renderOperations?: RenderOperationRefV2[];
+  featureFlags?: BatchEventFeatureSnapshot;
 };
 
 export type SegmentBatchCacheDocument = SegmentBatchCacheDocumentV1 | SegmentBatchCacheDocumentV2;
@@ -146,6 +151,9 @@ function validateCacheDocument(value: SegmentBatchCacheDocument) {
   return {
     ...value,
     batchId,
+    ...(value.schemaVersion === 2
+      ? { featureFlags: normalizeBatchEventFeatureSnapshot(value.featureFlags, value.updatedAt) }
+      : {}),
     ...(value.schemaVersion === 2 && value.renderOperations
       ? { renderOperations: retainBoundedRenderOperationAudits(value.renderOperations) }
       : {}),
@@ -195,6 +203,7 @@ export function migrateSegmentBatchCacheDocument(
     activeJobIds: [],
     invocationEvents: [],
     renderOperations: [],
+    featureFlags: normalizeBatchEventFeatureSnapshot(undefined, validated.updatedAt),
   };
 }
 

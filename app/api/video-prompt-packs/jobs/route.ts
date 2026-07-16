@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   CONTRACT_PREFLIGHT_MISMATCH_CODE,
   CONTRACT_PREFLIGHT_REQUIRED_CODE,
+  CONTRACT_PREFLIGHT_V2_CREATE_PAUSED_CODE,
   createVideoPromptPackCodexJob,
   toVideoPromptPackCodexJobStatusDto,
 } from "@/lib/video-prompt-pack-codex-queue";
@@ -50,6 +51,7 @@ const CONTRACT_PREFLIGHT_ERROR_CODES = new Set([
   "CONTRACT_BUDGET_EXCEEDED",
   "CONTRACT_HASH_INVALID",
   "CONTRACT_SCHEMA_INVALID",
+  CONTRACT_PREFLIGHT_V2_CREATE_PAUSED_CODE,
 ]);
 
 const SegmentSchema = z.object({
@@ -105,7 +107,7 @@ export async function POST(request: NextRequest) {
           segmentIndexes: Array.isArray(error?.segmentIndexes) ? error.segmentIndexes : [],
           error: error.message,
         },
-        { status: 400 },
+        { status: error.code === CONTRACT_PREFLIGHT_V2_CREATE_PAUSED_CODE ? 503 : 400 },
       );
     }
     if (error?.code === CODEX_FINALIZATION_V2_CREATE_PAUSED_CODE) {

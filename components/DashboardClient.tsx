@@ -10,10 +10,17 @@ import { DEFAULT_COVERAGE_POLICY_VERSION, type SegmentContract } from "@/lib/bat
 import {
   coverageStageInvokesJudge,
   coverageStageUsesLocalGate,
+  normalizeBatchEventFeatureSnapshot,
   type BatchEventFeatureSnapshot,
 } from "@/lib/batch-event-feature-flags";
 import { applyPromptSafetyPolicyDeep } from "@/lib/prompt-safety-policy";
+import type { CompiledSegmentContractBlock } from "@/lib/codex-prompt-input-compiler";
 import { buildRenderPacks } from "@/lib/batch-render-scheduler";
+import {
+  buildPreflightedRenderPacks,
+  preflightSegmentContracts,
+  type PreflightedRenderPack,
+} from "@/lib/batch-contract-preflight";
 import {
   collectContiguousBatchSaveIndexes,
   createInitialSegmentStates,
@@ -50,7 +57,7 @@ import {
 import type { SegmentBatchCacheDocumentV2 } from "@/lib/segment-batch-cache";
 import {
   attachRenderOperationJob,
-  createRenderOperationDraft,
+  createRenderOperationDraftFromPreflightPack,
   detachRenderOperation,
   retainBoundedRenderOperationAudits,
   terminateRenderOperation,
@@ -356,6 +363,32 @@ class RenderPackPollingInfrastructureError extends Error {
   }
 }
 
+class ContractPreflightCreateError extends Error {
+  readonly code: string;
+  readonly segmentIndexes: number[];
+
+  constructor(code: string, message: string, segmentIndexes: number[] = []) {
+    super(message);
+    this.name = "ContractPreflightCreateError";
+    this.code = code;
+    this.segmentIndexes = [...segmentIndexes];
+  }
+}
+
+const CONTRACT_PREFLIGHT_ERROR_CODES = new Set([
+  "CONTRACT_PREFLIGHT_V2_CREATE_PAUSED",
+  "CONTRACT_PREFLIGHT_REQUIRED",
+  "CONTRACT_PREFLIGHT_MISMATCH",
+  "CONTRACT_BUDGET_EXCEEDED",
+  "CONTRACT_HASH_INVALID",
+  "CONTRACT_SCHEMA_INVALID",
+]);
+
+function isContractPreflightCreateError(error: unknown): error is ContractPreflightCreateError {
+  return error instanceof ContractPreflightCreateError
+    || Boolean(error && typeof error === "object" && CONTRACT_PREFLIGHT_ERROR_CODES.has(String((error as { code?: unknown }).code || "")));
+}
+
 class StaleSegmentOperationError extends Error {
   readonly code = "STALE_SEGMENT_OPERATION";
 
@@ -442,6 +475,10 @@ type BatchGenerationProgress = {
     pathPatchCompleted: number;
     judgeCalls: number;
     localPatchOperations: number;
+    contractPreflightAttempts: number;
+    contractPreflightCompacted: number;
+    contractPreflightIsolated: number;
+    contractPreflightInvalid: number;
   };
   timingMetrics?: {
     renderWallMs: number;
@@ -1813,6 +1850,7 @@ export function DashboardClient() {
       duration: string;
       shotCount: number;
       segmentContract?: SegmentContract;
+      compiledContract: Extract<CompiledSegmentContractBlock, { status: "ready" | "compacted" }>;
     }>,
     projectId: string | undefined,
     mode: RenderPackCodexMode = STRICT_UTF8_RENDER_PACK_MODE,
@@ -1845,6 +1883,14 @@ export function DashboardClient() {
       }
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.ok) {
+        const code = String(data?.errorCode || data?.code || "");
+        if (CONTRACT_PREFLIGHT_ERROR_CODES.has(code)) {
+          throw new ContractPreflightCreateError(
+            code,
+            data?.error || "Contract preflight rejected Render Pack creation",
+            Array.isArray(data?.segmentIndexes) ? data.segmentIndexes : [],
+          );
+        }
         throw new Error(data?.error || "Codex render pack job creation failed");
       }
       return data.job as VideoPromptPackCodexJob;
@@ -2250,11 +2296,15 @@ export function DashboardClient() {
     const creatingOperations = operations.filter((operation) => operation.state === "creating");
     await Promise.allSettled(creatingOperations.map(async (draft) => {
       const context = draft.reconciliationContext;
-      if (!context?.segments.length) {
-        await markInfrastructureFailure(draft, "RENDER_RECOVERY_CONTEXT_MISSING");
+      const creationContext = draft.creationContext;
+      if (!context?.segments.length || !creationContext?.segments.length) {
+        await markInfrastructureFailure(draft, "CONTRACT_PREFLIGHT_REQUIRED");
         return;
       }
+      const compiledBySegment = new Map(creationContext.segments.map((segment) => [segment.episodeIndex, segment]));
       const segments = context.segments.map((segment) => {
+        const compiledContract = compiledBySegment.get(segment.episodeIndex)?.compiledContract;
+        if (!compiledContract) throw new Error(`Segment ${segment.episodeIndex} is missing its persisted compiled Contract`);
         const episodeInput: SeasonPackEpisodeInput = {
           episodeIndex: segment.episodeIndex,
           title: segment.title,
@@ -2277,6 +2327,7 @@ export function DashboardClient() {
           duration: segment.duration,
           shotCount: episodeInput.shotCount,
           segmentContract: segment.segmentContract,
+          compiledContract,
         };
       });
       const createResult = await retryCreatingRenderOperation({
@@ -2661,6 +2712,10 @@ export function DashboardClient() {
             pathPatchCompleted: invocationMetrics.pathPatchCompleted,
             judgeCalls: invocationMetrics.judgeCalls,
             localPatchOperations: invocationMetrics.localPatchOperations,
+            contractPreflightAttempts: invocationMetrics.contractPreflightAttempts,
+            contractPreflightCompacted: invocationMetrics.contractPreflightCompacted,
+            contractPreflightIsolated: invocationMetrics.contractPreflightIsolated,
+            contractPreflightInvalid: invocationMetrics.contractPreflightInvalid,
           },
           timingMetrics: {
             renderWallMs: 0,
@@ -2928,6 +2983,10 @@ export function DashboardClient() {
           pathPatchCompleted: invocationMetrics.pathPatchCompleted,
           judgeCalls: invocationMetrics.judgeCalls,
           localPatchOperations: invocationMetrics.localPatchOperations,
+          contractPreflightAttempts: invocationMetrics.contractPreflightAttempts,
+          contractPreflightCompacted: invocationMetrics.contractPreflightCompacted,
+          contractPreflightIsolated: invocationMetrics.contractPreflightIsolated,
+          contractPreflightInvalid: invocationMetrics.contractPreflightInvalid,
         },
         timingMetrics: {
           renderWallMs: renderPhaseStartedAtMs
@@ -3091,8 +3150,9 @@ export function DashboardClient() {
     }
 
     const seasonPackJob = await runSeasonPackPlanningWithLockedRetry();
-    const batchEventFeatures: BatchEventFeatureSnapshot = seasonPackJob.featureFlags || {
+    let batchEventFeatures: BatchEventFeatureSnapshot = normalizeBatchEventFeatureSnapshot(seasonPackJob.featureFlags || {
       contractV2: true,
+      contractPreflightV2: true,
       coverageSidecar: true,
       coverageStage: "shadow",
       emergencyStop: false,
@@ -3100,9 +3160,9 @@ export function DashboardClient() {
       judge: false,
       coveragePolicyVersion: DEFAULT_COVERAGE_POLICY_VERSION,
       capturedAt: new Date().toISOString(),
-    };
-    const batchCoverageStage: BatchEventCoverageStage = batchEventFeatures.coverageStage;
-    const batchCoverageMode = batchEventFeatures.contractV2 && coverageStageUsesLocalGate(batchCoverageStage)
+    });
+    let batchCoverageStage: BatchEventCoverageStage = batchEventFeatures.coverageStage;
+    let batchCoverageMode: "active" | "shadow" = batchEventFeatures.contractV2 && coverageStageUsesLocalGate(batchCoverageStage)
       ? "active" as const
       : "shadow" as const;
     const episodes = [...(seasonPackJob.result?.episodes || [])].sort((left, right) => left.episodeIndex - right.episodeIndex);
@@ -3308,6 +3368,7 @@ export function DashboardClient() {
         duration: requestedDuration,
         invocationEvents: invocationLedger.summary().events,
         renderOperations: retainBoundedRenderOperationAudits(renderOperationRecords),
+        featureFlags: batchEventFeatures,
         segments: cachedSegments,
       };
       try {
@@ -3731,6 +3792,24 @@ export function DashboardClient() {
       }
     }
 
+    function markContractPreflightInvalid(
+      episodeIndex: number,
+      errorCode: string,
+      message = "分段 Contract 输入需要检查，不会触发视频提示词修复。",
+    ) {
+      const current = segmentStateRecords.find((item) => item.index === episodeIndex);
+      if (!current || current.generationStatus === "contract_invalid") return;
+      if (current.generationStatus === "pending") {
+        dispatchSegmentStateEvent(episodeIndex, { type: "CONTRACT_PREFLIGHT_STARTED" });
+      }
+      dispatchSegmentStateEvent(episodeIndex, {
+        type: "CONTRACT_PREFLIGHT_INVALID",
+        errorCode,
+        message,
+      });
+      updateSegmentProgress(episodeIndex, "failed", message);
+    }
+
     const batchSaveController = createResumableBatchSaveController<RenderedEpisode>({
       durableBatchId,
       segmentCount: resolvedSegmentCount,
@@ -3897,6 +3976,7 @@ export function DashboardClient() {
           repairAttempts?: Array<[string, number]>;
           invocationEvents?: BatchInvocationLedgerEvent[];
           renderOperations?: RenderOperationRefV2[];
+          featureFlags?: BatchEventFeatureSnapshot;
           mode?: SegmentCountMode;
           requestedCount?: number | null;
           duration?: string;
@@ -3944,6 +4024,13 @@ export function DashboardClient() {
         if (cache.projectId) {
           activeProjectId = cache.projectId;
           batchProjectId = cache.projectId;
+        }
+        if (cache.featureFlags) {
+          batchEventFeatures = normalizeBatchEventFeatureSnapshot(cache.featureFlags, cache.featureFlags.capturedAt);
+          batchCoverageStage = batchEventFeatures.coverageStage;
+          batchCoverageMode = batchEventFeatures.contractV2 && coverageStageUsesLocalGate(batchCoverageStage)
+            ? "active"
+            : "shadow";
         }
         if (Array.isArray(cache.invocationEvents)) invocationLedger.restore(cache.invocationEvents);
         if (Array.isArray(cache.renderOperations)) {
@@ -5173,40 +5260,30 @@ export function DashboardClient() {
     }
 
     async function renderPackedSegmentsWithQualityRepair(
-      packEpisodes: SeasonPackEpisodeResult[],
+      renderPack: PreflightedRenderPack<SeasonPackEpisodeResult>,
       allowSplitFallback = true,
       packIndex?: number,
       renderRound = 1,
     ) {
-      packEpisodes = packEpisodes.filter(
-        (episode) => !renderedEpisodes[episode.episodeIndex - 1]
+      const packEntries = renderPack.entries.filter(
+        ({ item: episode }) => !renderedEpisodes[episode.episodeIndex - 1]
           && !needsReviewEpisodes.has(episode.episodeIndex)
-          && !queuedRepairIndexes.has(episode.episodeIndex),
+          && !queuedRepairIndexes.has(episode.episodeIndex)
+          && segmentStateRecords.find((state) => state.index === episode.episodeIndex)?.generationStatus !== "contract_invalid",
       );
+      const packEpisodes = packEntries.map((entry) => entry.item);
       if (!packEpisodes.length) return;
+      const effectiveRenderPack: PreflightedRenderPack<SeasonPackEpisodeResult> = {
+        ...renderPack,
+        entries: packEntries,
+      };
       const renderOperations = new Map<number, RenderOperation>();
       const packLabel = packEpisodes.map((episode) => episode.episodeIndex).join(", ");
-      const packSegments = packEpisodes.map((episode) => {
-        const episodeInput = episode.input;
-        return {
-          episodeIndex: episode.episodeIndex,
-          title: episodeInput.title,
-          script: episodeInput.sourceText || script,
-          renderInputScript: buildBatchEpisodeRenderScript(episodeInput, resolvedSegmentCount || episodes.length),
-          duration: episodeInput.duration || selectedDurationValue(),
-          shotCount: episodeInput.shotCount,
-          segmentContract: episodeInput.segmentContract,
-        };
-      });
 
-      let durableRenderOperation = createRenderOperationDraft({
+      let durableRenderOperation = createRenderOperationDraftFromPreflightPack({
         batchId: durableBatchId,
-        segmentIndexes: packEpisodes.map((episode) => episode.episodeIndex),
-        contractHashes: Object.fromEntries(packEpisodes.map((episode) => {
-          const contractHash = episode.input.segmentContract?.contractHash;
-          if (!contractHash) throw new Error(`Segment ${episode.episodeIndex} is missing its Render Contract hash`);
-          return [String(episode.episodeIndex), contractHash];
-        })),
+        sourceHash: batchSourceHash,
+        pack: effectiveRenderPack,
         reconciliationContext: {
           sourceText: script,
           segments: packEpisodes.map((episode) => ({
@@ -5218,6 +5295,24 @@ export function DashboardClient() {
             segmentContract: episode.input.segmentContract,
           })),
         },
+      });
+      const compiledBySegment = new Map(
+        (durableRenderOperation.creationContext?.segments || []).map((segment) => [segment.episodeIndex, segment]),
+      );
+      const packSegments = packEpisodes.map((episode) => {
+        const episodeInput = episode.input;
+        const compiled = compiledBySegment.get(episode.episodeIndex)?.compiledContract;
+        if (!compiled) throw new Error(`Segment ${episode.episodeIndex} is missing its persisted compiled Contract`);
+        return {
+          episodeIndex: episode.episodeIndex,
+          title: episodeInput.title,
+          script: episodeInput.sourceText || script,
+          renderInputScript: buildBatchEpisodeRenderScript(episodeInput, resolvedSegmentCount || episodes.length),
+          duration: episodeInput.duration || selectedDurationValue(),
+          shotCount: episodeInput.shotCount,
+          segmentContract: episodeInput.segmentContract,
+          compiledContract: compiled,
+        };
       });
       replaceRenderOperationRecord(durableRenderOperation);
 
@@ -5242,7 +5337,6 @@ export function DashboardClient() {
 
       try {
         async function runRenderPack(mode: RenderPackCodexMode) {
-          invocationLedger.record("renderPackCalls", { count: 1 });
           const packJob = await createVideoPromptPackCodexJob(
             packSegments,
             activeProjectId || undefined,
@@ -5250,6 +5344,10 @@ export function DashboardClient() {
             batchEventFeatures.contractV2 && batchEventFeatures.coverageSidecar,
             durableRenderOperation,
           );
+          invocationLedger.record("renderPackCalls", {
+            count: 1,
+            fingerprint: `render:${durableRenderOperation.operationToken}:${packJob.id}`,
+          });
           durableRenderOperation = attachRenderOperationJob(durableRenderOperation, {
             jobId: packJob.id,
             sourceHash: String(packJob.sourceHash || ""),
@@ -5272,8 +5370,39 @@ export function DashboardClient() {
         try {
           renderPackJob = await runRenderPack(STRICT_UTF8_RENDER_PACK_MODE);
         } catch (strictError) {
+          if (isContractPreflightCreateError(strictError)) {
+            const affected = strictError.segmentIndexes.length
+              ? new Set(strictError.segmentIndexes)
+              : new Set(packEpisodes.map((episode) => episode.episodeIndex));
+            durableRenderOperation = terminateRenderOperation(durableRenderOperation, {
+              state: "failed",
+              errorCode: strictError.code,
+            });
+            replaceRenderOperationRecord(durableRenderOperation);
+            for (const episode of packEpisodes) {
+              if (!affected.has(episode.episodeIndex)) continue;
+              markContractPreflightInvalid(episode.episodeIndex, strictError.code, strictError.message);
+              finishRenderOperation(renderOperations.get(episode.episodeIndex));
+            }
+            await writeBatchSegmentCache();
+            return;
+          }
           if (allowSplitFallback && packEpisodes.length > 1 && isRecoverableRenderPackError(strictError)) {
-            const splitRenderPacks = buildRenderPacks(packEpisodes, { forceProfile: "SINGLE" }).packs;
+            const splitSchedule = buildRenderPacks(packEntries, {
+              forceProfile: "SINGLE",
+              getSegment: (entry) => ({
+                sourceText: entry.item.input.sourceText,
+                shotCount: entry.item.input.shotCount,
+                segmentContract: entry.item.input.segmentContract,
+              }),
+            });
+            const splitRenderPacks = splitSchedule.packs.map((entries) => ({
+              ...effectiveRenderPack,
+              isolated: true,
+              profile: "SINGLE" as const,
+              packSize: 1,
+              entries,
+            }));
             const reason = strictError instanceof Error ? strictError.message : "Render Pack strict UTF-8 generation failed";
             publishBatchProgress(
               "repairing",
@@ -5354,13 +5483,98 @@ export function DashboardClient() {
 
     await restoreCachedRenderedSegments();
 
-    const renderSchedule = buildRenderPacks(episodes);
+    const pendingContractEpisodes = episodes.filter((episode) => {
+      const state = segmentStateRecords.find((candidate) => candidate.index === episode.episodeIndex);
+      return !renderedEpisodes[episode.episodeIndex - 1]
+        && !needsReviewEpisodes.has(episode.episodeIndex)
+        && !queuedRepairIndexes.has(episode.episodeIndex)
+        && (!state || ["pending", "preparing_input"].includes(state.generationStatus));
+    });
+    for (const episode of pendingContractEpisodes) {
+      const state = segmentStateRecords.find((candidate) => candidate.index === episode.episodeIndex);
+      if (state?.generationStatus === "pending") {
+        dispatchSegmentStateEvent(episode.episodeIndex, { type: "CONTRACT_PREFLIGHT_STARTED" });
+      }
+    }
+    publishBatchProgress("validating", "正在本地准备并校验每段 Contract 输入...");
+
+    const contractPreflightOptions = {
+      getSegmentIndex: (episode: SeasonPackEpisodeResult) => episode.episodeIndex,
+      getSourceText: (episode: SeasonPackEpisodeResult) => episode.input.sourceText,
+      getContract: (episode: SeasonPackEpisodeResult) => episode.input.segmentContract as SegmentContract,
+      getScheduleSegment: (entry: { item: SeasonPackEpisodeResult }) => ({
+        sourceText: entry.item.input.sourceText,
+        shotCount: entry.item.input.shotCount,
+        segmentContract: entry.item.input.segmentContract,
+      }),
+    };
+    const preflightMetricFingerprint = `${durableBatchId}:${batchContractHash}`;
+    const recordPreflightMetric = (
+      name: "contractPreflightAttempts" | "contractPreflightCompacted" | "contractPreflightIsolated" | "contractPreflightInvalid",
+      count: number,
+    ) => {
+      if (count <= 0) return;
+      invocationLedger.record(name, {
+        count,
+        fingerprint: `preflight:${preflightMetricFingerprint}:${name}`,
+      });
+    };
+
+    const contractPreflightPlan = batchEventFeatures.contractPreflightV2
+      ? preflightSegmentContracts(pendingContractEpisodes, contractPreflightOptions)
+      : {
+          eligibleRuns: [],
+          isolated: [],
+          invalid: [],
+          metrics: {
+            attempts: pendingContractEpisodes.length,
+            ready: 0,
+            compacted: 0,
+            isolated: 0,
+            invalid: pendingContractEpisodes.length,
+            overflow: 0,
+          },
+        };
+    const preflightSchedule = buildPreflightedRenderPacks(contractPreflightPlan, contractPreflightOptions);
+    recordPreflightMetric("contractPreflightAttempts", contractPreflightPlan.metrics.attempts);
+    recordPreflightMetric("contractPreflightCompacted", contractPreflightPlan.metrics.compacted);
+    recordPreflightMetric("contractPreflightIsolated", contractPreflightPlan.metrics.isolated);
+    recordPreflightMetric("contractPreflightInvalid", contractPreflightPlan.metrics.invalid);
+
+    if (batchEventFeatures.contractPreflightV2) {
+      for (const entry of [...contractPreflightPlan.eligibleRuns.flat(), ...contractPreflightPlan.isolated]) {
+        dispatchSegmentStateEvent(entry.item.episodeIndex, { type: "CONTRACT_PREFLIGHT_READY" });
+      }
+      for (const entry of contractPreflightPlan.invalid) {
+        markContractPreflightInvalid(
+          entry.item.episodeIndex,
+          entry.preflight.reasonCode,
+          `第 ${entry.item.episodeIndex} 段 Contract 输入需要检查：${entry.preflight.reasonCode}`,
+        );
+      }
+    } else {
+      for (const episode of pendingContractEpisodes) {
+        markContractPreflightInvalid(
+          episode.episodeIndex,
+          "CONTRACT_PREFLIGHT_V2_CREATE_PAUSED",
+          "Contract Preflight V2 已暂停，新 Render 创建已安全停止；不会回退旧生成链路。",
+        );
+      }
+    }
+    await writeBatchSegmentCache();
+
+    const renderSchedule = {
+      ...preflightSchedule,
+      profile: batchEventFeatures.contractPreflightV2
+        ? Array.from(new Set(preflightSchedule.packs.map((pack) => pack.profile))).join("+") || "NO_RENDER"
+        : "CONTRACT_PREFLIGHT_PAUSED",
+    };
     renderPhaseStartedAtMs = Date.now();
     activeRenderScheduleProfile = renderSchedule.profile;
     const renderPacks = renderSchedule.packs;
     let nextPackToRender = 0;
     const renderPackConcurrency = Math.min(renderSchedule.concurrency, renderPacks.length);
-    const renderPackShape = renderPacks.map((pack) => pack.length).join("/");
+    const renderPackShape = renderPacks.map((pack) => pack.entries.length).join("/");
     publishBatchProgress(
       "rendering",
       `调度策略：${renderSchedule.profile}，${renderPackConcurrency} 包并发，分包 ${renderPackShape}。`,
@@ -5387,6 +5601,20 @@ export function DashboardClient() {
         "quota_paused",
         `${batchQuotaPauseMessage || CODEX_QUOTA_EXHAUSTED_DISPLAY_MESSAGE} 已生成结果和缓存均已保留。`,
       );
+      setBatchGenerating(false);
+      return;
+    }
+
+    const contractInvalidStates = segmentStateRecords.filter((state) => state.generationStatus === "contract_invalid");
+    if (contractInvalidStates.length > 0) {
+      queueReadySegmentSaves();
+      await drainBatchSaveController();
+      await writeBatchSegmentCache();
+      await batchCachePersistChain;
+      const invalidIndexes = contractInvalidStates.map((state) => state.index).join("、");
+      const contractReviewMessage = `第 ${invalidIndexes} 段 Contract 输入需要检查；其他有效段已继续生成并缓存，不会触发视频提示词修复。`;
+      setError(contractReviewMessage);
+      publishBatchProgress("failed", contractReviewMessage);
       setBatchGenerating(false);
       return;
     }
@@ -6062,13 +6290,17 @@ export function DashboardClient() {
               </div>
             )}
             {batchProgress.invocationMetrics && (
-              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-3 xl:grid-cols-6">
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-3 xl:grid-cols-10">
                 <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Render 调用 {batchProgress.invocationMetrics.renderPackCalls}</span>
                 <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">单段补生成 {batchProgress.invocationMetrics.singleRegenerationCalls}</span>
                 <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">路径任务 {batchProgress.invocationMetrics.pathPatchJobCreated}</span>
                 <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">路径完成 {batchProgress.invocationMetrics.pathPatchCompleted}</span>
                 <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Judge 调用 {batchProgress.invocationMetrics.judgeCalls}</span>
                 <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">本地操作 {batchProgress.invocationMetrics.localPatchOperations}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Contract 预检 {batchProgress.invocationMetrics.contractPreflightAttempts}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Contract 压缩 {batchProgress.invocationMetrics.contractPreflightCompacted}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Contract 隔离 {batchProgress.invocationMetrics.contractPreflightIsolated}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Contract 待检查 {batchProgress.invocationMetrics.contractPreflightInvalid}</span>
               </div>
             )}
             {batchProgress.timingMetrics && (

@@ -21,6 +21,8 @@ export type BatchSegmentProgressItem = {
 
 export type SegmentGenerationStatus =
   | "pending"
+  | "preparing_input"
+  | "contract_invalid"
   | "rendering"
   | "render_detached"
   | "rendered"
@@ -65,6 +67,9 @@ export type SegmentStateRecord = {
 type SegmentStateEventBase = { baseRevision?: number; at?: number };
 
 export type SegmentStateEvent = SegmentStateEventBase & (
+  | { type: "CONTRACT_PREFLIGHT_STARTED" }
+  | { type: "CONTRACT_PREFLIGHT_READY" }
+  | { type: "CONTRACT_PREFLIGHT_INVALID"; errorCode: string; message?: string }
   | { type: "RENDER_STARTED" }
   | { type: "RENDER_SUCCEEDED"; resultHash: string; contractHash?: string }
   | {
@@ -127,6 +132,15 @@ function isPersistedSaveStatus(status: SegmentSaveStatus) {
 
 export function isLegalSegmentStateEvent(state: SegmentStateRecord, event: SegmentStateEvent) {
   switch (event.type) {
+    case "CONTRACT_PREFLIGHT_STARTED":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && state.generationStatus === "pending";
+    case "CONTRACT_PREFLIGHT_READY":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && state.generationStatus === "preparing_input";
+    case "CONTRACT_PREFLIGHT_INVALID":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && ["pending", "preparing_input"].includes(state.generationStatus);
     case "RENDER_STARTED":
       return !isPersistedSaveStatus(state.saveStatus)
         && ["pending", "rendered", "settled"].includes(state.generationStatus);
@@ -160,6 +174,7 @@ export function isLegalSegmentStateEvent(state: SegmentStateRecord, event: Segme
         && ["rendered", "repair_detached", "settled"].includes(state.generationStatus);
     case "REPAIR_QUEUED":
       return !isPersistedSaveStatus(state.saveStatus)
+        && state.generationStatus !== "contract_invalid"
         && !["repair_pending", "repair_running"].includes(state.generationStatus);
     case "REPAIR_STARTED":
       return state.generationStatus === "repair_pending" || state.generationStatus === "repair_detached";
@@ -215,6 +230,34 @@ export function reduceSegmentState(state: SegmentStateRecord, event: SegmentStat
     updatedAt: event.at ?? Date.now(),
   };
   switch (event.type) {
+    case "CONTRACT_PREFLIGHT_STARTED":
+      return {
+        ...next,
+        generationStatus: "preparing_input",
+        qualityStatus: "unknown",
+        lastErrorCode: undefined,
+        message: "正在准备分段 Contract 输入",
+      };
+    case "CONTRACT_PREFLIGHT_READY":
+      return {
+        ...next,
+        generationStatus: "pending",
+        lastErrorCode: undefined,
+        message: undefined,
+      };
+    case "CONTRACT_PREFLIGHT_INVALID":
+      return {
+        ...next,
+        generationStatus: "contract_invalid",
+        qualityStatus: "unknown",
+        saveStatus: "not_ready",
+        resultHash: undefined,
+        activeRepairJobId: undefined,
+        activeRenderPackJobId: undefined,
+        renderOperationToken: undefined,
+        lastErrorCode: event.errorCode,
+        message: event.message,
+      };
     case "RENDER_STARTED":
       return { ...next, generationStatus: "rendering", lastErrorCode: undefined };
     case "RENDER_SUCCEEDED":
@@ -371,6 +414,8 @@ export function progressStatusFromSegmentState(state: SegmentStateRecord): Batch
   if (state.saveStatus === "saving") return "saving";
   if (state.saveStatus === "save_failed") return "failed";
   if (state.qualityStatus === "needs_review") return "needs_review";
+  if (state.generationStatus === "contract_invalid") return "failed";
+  if (state.generationStatus === "preparing_input") return "validating";
   if (state.generationStatus === "repair_pending" || state.generationStatus === "repair_running") return "repairing";
   if (state.generationStatus === "repair_detached") return "patching";
   if (state.generationStatus === "rendering" || state.generationStatus === "render_detached") return "running";
@@ -393,6 +438,17 @@ export function deriveBatchPhaseFromSegmentStates(states: SegmentStateRecord[]):
   if (states.some((state) => ["repair_pending", "repair_running", "repair_detached"].includes(state.generationStatus))) {
     return "repairing";
   }
+  const validStates = states.filter((state) => state.generationStatus !== "contract_invalid");
+  if (validStates.some((state) => [
+    "pending",
+    "preparing_input",
+    "rendering",
+    "render_detached",
+    "rendered",
+  ].includes(state.generationStatus))) {
+    return "rendering";
+  }
+  if (states.some((state) => state.generationStatus === "contract_invalid")) return "failed";
   if (states.some((state) => state.saveStatus === "cached" || state.saveStatus === "save_failed")) return "saving";
   if (states.some((state) => state.qualityStatus === "blocked" && state.generationStatus === "settled")) return "failed";
   return "rendering";
