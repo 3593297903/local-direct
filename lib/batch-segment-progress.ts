@@ -22,6 +22,7 @@ export type BatchSegmentProgressItem = {
 export type SegmentGenerationStatus =
   | "pending"
   | "rendering"
+  | "render_detached"
   | "rendered"
   | "repair_pending"
   | "repair_running"
@@ -45,6 +46,11 @@ export type SegmentStateRecord = {
   saveStatus: SegmentSaveStatus;
   revision: number;
   activeRepairJobId?: string;
+  activeRenderPackJobId?: string;
+  renderOperationToken?: string;
+  expectedSourceHash?: string;
+  expectedContractHash?: string;
+  renderDetachedAt?: string;
   repairFingerprint?: string;
   contractHash?: string;
   resultHash?: string;
@@ -61,6 +67,17 @@ type SegmentStateEventBase = { baseRevision?: number; at?: number };
 export type SegmentStateEvent = SegmentStateEventBase & (
   | { type: "RENDER_STARTED" }
   | { type: "RENDER_SUCCEEDED"; resultHash: string; contractHash?: string }
+  | {
+      type: "RENDER_OPERATION_CREATED";
+      operationToken: string;
+      expectedSourceHash?: string;
+      expectedContractHash?: string;
+    }
+  | { type: "RENDER_OPERATION_OBSERVING"; operationToken: string; jobId: string; expectedSourceHash: string }
+  | { type: "RENDER_OPERATION_DETACHED"; operationToken: string; jobId: string }
+  | { type: "RENDER_OPERATION_RECONCILED"; operationToken: string; jobId: string; resultHash: string; contractHash?: string }
+  | { type: "RENDER_OPERATION_IGNORED"; operationToken: string; reasonCode: string }
+  | { type: "RENDER_OPERATION_FAILED"; operationToken: string; errorCode: string; message?: string }
   | { type: "QUALITY_PASSED" }
   | { type: "QUALITY_NEEDS_REVIEW"; message?: string }
   | { type: "QUALITY_BLOCKED"; message?: string }
@@ -115,7 +132,27 @@ export function isLegalSegmentStateEvent(state: SegmentStateRecord, event: Segme
         && ["pending", "rendered", "settled"].includes(state.generationStatus);
     case "RENDER_SUCCEEDED":
       return !isPersistedSaveStatus(state.saveStatus)
-        && ["pending", "rendering", "rendered"].includes(state.generationStatus);
+        && ["pending", "rendering", "render_detached", "rendered"].includes(state.generationStatus);
+    case "RENDER_OPERATION_CREATED":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && ["pending", "rendered", "settled"].includes(state.generationStatus);
+    case "RENDER_OPERATION_OBSERVING":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && state.renderOperationToken === event.operationToken
+        && ["rendering", "render_detached"].includes(state.generationStatus);
+    case "RENDER_OPERATION_DETACHED":
+      return state.renderOperationToken === event.operationToken
+        && (!state.activeRenderPackJobId || state.activeRenderPackJobId === event.jobId)
+        && ["rendering", "render_detached"].includes(state.generationStatus);
+    case "RENDER_OPERATION_RECONCILED":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && state.renderOperationToken === event.operationToken
+        && state.activeRenderPackJobId === event.jobId
+        && ["rendering", "render_detached"].includes(state.generationStatus);
+    case "RENDER_OPERATION_IGNORED":
+    case "RENDER_OPERATION_FAILED":
+      return state.renderOperationToken === event.operationToken
+        && ["rendering", "render_detached"].includes(state.generationStatus);
     case "QUALITY_PASSED":
     case "QUALITY_NEEDS_REVIEW":
     case "QUALITY_BLOCKED":
@@ -242,6 +279,65 @@ export function reduceSegmentState(state: SegmentStateRecord, event: SegmentStat
         saveStatus: event.review ? "review_saved" : "saved",
         lastErrorCode: undefined,
       };
+    case "RENDER_OPERATION_CREATED":
+      return {
+        ...next,
+        generationStatus: "rendering",
+        renderOperationToken: event.operationToken,
+        expectedSourceHash: event.expectedSourceHash,
+        expectedContractHash: event.expectedContractHash || state.contractHash,
+        activeRenderPackJobId: undefined,
+        renderDetachedAt: undefined,
+        lastErrorCode: undefined,
+      };
+    case "RENDER_OPERATION_OBSERVING":
+      return {
+        ...next,
+        generationStatus: "rendering",
+        activeRenderPackJobId: event.jobId,
+        expectedSourceHash: event.expectedSourceHash,
+        renderDetachedAt: undefined,
+        lastErrorCode: undefined,
+      };
+    case "RENDER_OPERATION_DETACHED":
+      return {
+        ...next,
+        generationStatus: "render_detached",
+        activeRenderPackJobId: event.jobId,
+        renderDetachedAt: new Date(event.at ?? Date.now()).toISOString(),
+      };
+    case "RENDER_OPERATION_RECONCILED":
+      return {
+        ...next,
+        generationStatus: "rendered",
+        resultHash: event.resultHash,
+        contractHash: event.contractHash || state.contractHash,
+        activeRenderPackJobId: undefined,
+        renderOperationToken: undefined,
+        expectedSourceHash: undefined,
+        expectedContractHash: undefined,
+        renderDetachedAt: undefined,
+        lastErrorCode: undefined,
+      };
+    case "RENDER_OPERATION_IGNORED":
+      return {
+        ...next,
+        generationStatus: "settled",
+        activeRenderPackJobId: undefined,
+        renderOperationToken: undefined,
+        renderDetachedAt: undefined,
+        lastErrorCode: event.reasonCode,
+      };
+    case "RENDER_OPERATION_FAILED":
+      return {
+        ...next,
+        generationStatus: "settled",
+        activeRenderPackJobId: undefined,
+        renderOperationToken: undefined,
+        renderDetachedAt: undefined,
+        lastErrorCode: event.errorCode,
+        message: event.message,
+      };
     case "SAVE_FAILED":
       return {
         ...next,
@@ -277,7 +373,7 @@ export function progressStatusFromSegmentState(state: SegmentStateRecord): Batch
   if (state.qualityStatus === "needs_review") return "needs_review";
   if (state.generationStatus === "repair_pending" || state.generationStatus === "repair_running") return "repairing";
   if (state.generationStatus === "repair_detached") return "patching";
-  if (state.generationStatus === "rendering") return "running";
+  if (state.generationStatus === "rendering" || state.generationStatus === "render_detached") return "running";
   if (state.saveStatus === "cached") return "cached";
   if (state.qualityStatus === "blocked") return "failed";
   return state.displayStatus || "pending";

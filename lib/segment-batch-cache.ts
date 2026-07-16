@@ -3,6 +3,10 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SegmentStateRecord } from "./batch-segment-progress";
 import type { BatchInvocationLedgerEvent } from "./batch-repair-scheduler";
+import {
+  retainBoundedRenderOperationAudits,
+  type RenderOperationRefV2,
+} from "./batch-render-operation";
 export {
   buildSegmentBatchLeaseOwnerKey,
   buildSegmentBatchRecoveryKey,
@@ -59,6 +63,7 @@ export type SegmentBatchCacheDocumentV2 = {
   requestedCount?: number | null;
   duration?: string;
   invocationEvents?: BatchInvocationLedgerEvent[];
+  renderOperations?: RenderOperationRefV2[];
 };
 
 export type SegmentBatchCacheDocument = SegmentBatchCacheDocumentV1 | SegmentBatchCacheDocumentV2;
@@ -134,8 +139,17 @@ function validateCacheDocument(value: SegmentBatchCacheDocument) {
     if (value.invocationEvents && !Array.isArray(value.invocationEvents)) {
       throw new Error("Segment batch cache invocation ledger is invalid");
     }
+    if (value.renderOperations && !Array.isArray(value.renderOperations)) {
+      throw new Error("Segment batch cache render operations are invalid");
+    }
   }
-  return { ...value, batchId };
+  return {
+    ...value,
+    batchId,
+    ...(value.schemaVersion === 2 && value.renderOperations
+      ? { renderOperations: retainBoundedRenderOperationAudits(value.renderOperations) }
+      : {}),
+  };
 }
 
 export function migrateSegmentBatchCacheDocument(
@@ -180,6 +194,7 @@ export function migrateSegmentBatchCacheDocument(
     segmentStates,
     activeJobIds: [],
     invocationEvents: [],
+    renderOperations: [],
   };
 }
 

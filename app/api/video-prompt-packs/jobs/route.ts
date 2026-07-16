@@ -28,12 +28,14 @@ const SegmentSchema = z.object({
 });
 
 const RequestSchema = z.object({
-  idempotencyKey: z.string().min(1).max(400).optional(),
+  batchId: z.string().min(1).max(240).regex(/^[A-Za-z0-9._:-]+$/),
+  operationToken: z.string().min(1).max(240).regex(/^[A-Za-z0-9._:-]+$/),
+  idempotencyKey: z.string().min(1).max(400),
   projectId: z.string().uuid().optional(),
   mode: z.enum(["standard", "strictUtf8"]).optional(),
   coverageSidecarEnabled: z.boolean().optional(),
   segments: z.array(SegmentSchema).min(1).max(5),
-});
+}).strict();
 
 export async function POST(request: NextRequest) {
   try {

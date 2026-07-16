@@ -20,6 +20,10 @@ test("video prompt render pack API exposes create, poll, claim, complete, and fa
   assert.match(createRoute, /segments/);
   assert.match(createRoute, /episodeIndex/);
   assert.match(createRoute, /renderInputScript/);
+  assert.match(createRoute, /batchId/);
+  assert.match(createRoute, /operationToken/);
+  assert.match(createRoute, /idempotencyKey/);
+  assert.match(createRoute, /\.strict\(\)/);
   assert.match(createRoute, /assertCodexFinalizationV2CreateEnabled/);
   assert.match(createRoute, /FINALIZATION_V2_CREATE_PAUSED/);
   assert.match(createRoute, /status:\s*503/);

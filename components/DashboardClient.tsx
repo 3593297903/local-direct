@@ -49,6 +49,12 @@ import {
 } from "@/lib/segment-batch-cache-identity";
 import type { SegmentBatchCacheDocumentV2 } from "@/lib/segment-batch-cache";
 import {
+  attachRenderOperationJob,
+  createRenderOperationDraft,
+  retainBoundedRenderOperationAudits,
+  type RenderOperationRefV2,
+} from "@/lib/batch-render-operation";
+import {
   findInternalPromptToken,
   sanitizeInternalPromptTokens,
   sanitizeInternalPromptTokensDeep,
@@ -229,6 +235,12 @@ type EventCoverageCodexJob = {
 
 type VideoPromptPackCodexJob = {
   id: string;
+  batchId?: string;
+  operationToken?: string;
+  sourceHash?: string;
+  aggregateContractHash?: string;
+  segmentIndexes?: number[];
+  contractHashes?: Record<string, string>;
   status: "pending" | "running" | "completed" | "failed";
   createdAt?: string;
   startedAt?: string;
@@ -1747,23 +1759,39 @@ export function DashboardClient() {
     projectId: string | undefined,
     mode: RenderPackCodexMode = STRICT_UTF8_RENDER_PACK_MODE,
     coverageSidecarEnabled = true,
+    operationIdentity?: Pick<RenderOperationRefV2, "batchId" | "operationToken" | "idempotencyKey">,
   ) {
     await assertCodexWorkerRuntimeHealthy("video-prompt-pack");
-    const res = await fetch("/api/video-prompt-packs/jobs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        projectId: projectId || undefined,
-        mode,
-        coverageSidecarEnabled,
-        segments,
-      }),
+    const body = JSON.stringify({
+      batchId: operationIdentity?.batchId,
+      operationToken: operationIdentity?.operationToken,
+      idempotencyKey: operationIdentity?.idempotencyKey,
+      projectId: projectId || undefined,
+      mode,
+      coverageSidecarEnabled,
+      segments,
     });
-    const data = await res.json().catch(() => null);
-    if (!res.ok || !data?.ok) {
-      throw new Error(data?.error || "Codex render pack job creation failed");
+    let lastTransportError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let res: Response;
+      try {
+        res = await fetch("/api/video-prompt-packs/jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+      } catch (error) {
+        lastTransportError = error;
+        if (attempt > 0) throw error;
+        continue;
+      }
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || "Codex render pack job creation failed");
+      }
+      return data.job as VideoPromptPackCodexJob;
     }
-    return data.job as VideoPromptPackCodexJob;
+    throw lastTransportError instanceof Error ? lastTransportError : new Error("Codex render pack job creation failed");
   }
 
   async function assertCodexWorkerRuntimeHealthy(workerName: string) {
@@ -2589,10 +2617,10 @@ export function DashboardClient() {
     let segmentOperationSequence = 0;
     const activeRenderOperations = new Map<number, RenderOperation>();
 
-    function beginRenderOperation(segmentIndex: number): RenderOperation {
+    function beginRenderOperation(segmentIndex: number, token?: string): RenderOperation {
       const operation = {
         segmentIndex,
-        token: `render:${segmentIndex}:${++segmentOperationSequence}`,
+        token: token || `render:${segmentIndex}:${++segmentOperationSequence}`,
       };
       activeRenderOperations.set(segmentIndex, operation);
       return operation;
@@ -2607,6 +2635,13 @@ export function DashboardClient() {
       if (operation && isCurrentRenderOperation(operation)) {
         activeRenderOperations.delete(operation.segmentIndex);
       }
+    }
+
+    function replaceRenderOperationRecord(operation: RenderOperationRefV2) {
+      renderOperationRecords = retainBoundedRenderOperationAudits([
+        ...renderOperationRecords.filter((item) => item.operationToken !== operation.operationToken),
+        operation,
+      ]);
     }
 
     function captureRepairOperationIdentity(segmentIndex: number): RepairOperationIdentity | null {
@@ -2805,6 +2840,7 @@ export function DashboardClient() {
     let batchCacheRevision = 0;
     let batchCacheWriteError: Error | null = null;
     let saveError: Error | null = null;
+    let renderOperationRecords: RenderOperationRefV2[] = [];
     const mergedRepairJobIds = new Set<string>();
     let activeRenderScheduleProfile = "UNSCHEDULED";
     let batchQuotaPaused = false;
@@ -2840,7 +2876,7 @@ export function DashboardClient() {
     }
 
     function writeBatchSegmentCache() {
-      if (typeof window === "undefined") return;
+      if (typeof window === "undefined") return batchCachePersistChain;
       const cachedSegments = renderedEpisodes
         .filter((item): item is RenderedEpisode => Boolean(item))
         .sort((left, right) => left.episodeIndex - right.episodeIndex)
@@ -2879,7 +2915,12 @@ export function DashboardClient() {
         updatedAt,
         phase: currentBatchPhase,
         segmentStates: segmentStateRecords,
-        activeJobIds: Array.from(new Set(segmentStateRecords.map((item) => item.activeRepairJobId).filter((value): value is string => Boolean(value)))),
+        activeJobIds: Array.from(new Set([
+          ...segmentStateRecords.map((item) => item.activeRepairJobId),
+          ...renderOperationRecords
+            .filter((operation) => ["creating", "observing", "detached"].includes(operation.state))
+            .map((operation) => operation.jobId),
+        ].filter((value): value is string => Boolean(value)))),
         coverageStage: batchCoverageStage,
         renderRound: 1,
         repairAttempts: Array.from(repairAttemptCounts.entries()),
@@ -2889,6 +2930,7 @@ export function DashboardClient() {
         requestedCount,
         duration: requestedDuration,
         invocationEvents: invocationLedger.summary().events,
+        renderOperations: retainBoundedRenderOperationAudits(renderOperationRecords),
         segments: cachedSegments,
       };
       try {
@@ -2943,6 +2985,7 @@ export function DashboardClient() {
           batchCacheWriteError = cacheError instanceof Error ? cacheError : new Error("服务端分段缓存写入失败");
           setGenerationProgress(`${batchCacheWriteError.message}，已保留浏览器恢复索引。`);
         });
+      return batchCachePersistChain;
     }
 
     async function watchDetachedRepair(
@@ -3476,6 +3519,7 @@ export function DashboardClient() {
           }>;
           repairAttempts?: Array<[string, number]>;
           invocationEvents?: BatchInvocationLedgerEvent[];
+          renderOperations?: RenderOperationRefV2[];
           mode?: SegmentCountMode;
           requestedCount?: number | null;
           duration?: string;
@@ -3525,6 +3569,9 @@ export function DashboardClient() {
           batchProjectId = cache.projectId;
         }
         if (Array.isArray(cache.invocationEvents)) invocationLedger.restore(cache.invocationEvents);
+        if (Array.isArray(cache.renderOperations)) {
+          renderOperationRecords = retainBoundedRenderOperationAudits(cache.renderOperations);
+        }
 
         let restoredCount = 0;
         const restoredJudgeItems: PendingCoverageJudgeSegment[] = [];
@@ -4519,14 +4566,44 @@ export function DashboardClient() {
         };
       });
 
+      let durableRenderOperation = createRenderOperationDraft({
+        batchId: durableBatchId,
+        segmentIndexes: packEpisodes.map((episode) => episode.episodeIndex),
+        contractHashes: Object.fromEntries(packEpisodes.map((episode) => {
+          const contractHash = episode.input.segmentContract?.contractHash;
+          if (!contractHash) throw new Error(`Segment ${episode.episodeIndex} is missing its Render Contract hash`);
+          return [String(episode.episodeIndex), contractHash];
+        })),
+        reconciliationContext: {
+          sourceText: script,
+          segments: packEpisodes.map((episode) => ({
+            episodeIndex: episode.episodeIndex,
+            title: episode.input.title,
+            sourceText: episode.input.sourceText || script,
+            duration: episode.input.duration || selectedDurationValue(),
+            shotCount: episode.input.shotCount,
+            segmentContract: episode.input.segmentContract,
+          })),
+        },
+      });
+      replaceRenderOperationRecord(durableRenderOperation);
+
       for (const episode of packEpisodes) {
         const state = segmentStateRecords.find((item) => item.index === episode.episodeIndex);
-        if (state?.generationStatus !== "rendering") {
-          dispatchSegmentStateEvent(episode.episodeIndex, { type: "RENDER_STARTED" });
+        if (state?.generationStatus !== "rendering" && state?.generationStatus !== "render_detached") {
+          dispatchSegmentStateEvent(episode.episodeIndex, {
+            type: "RENDER_OPERATION_CREATED",
+            operationToken: durableRenderOperation.operationToken,
+            expectedContractHash: episode.input.segmentContract?.contractHash,
+          });
         }
         updateSegmentProgress(episode.episodeIndex, "running", `Render Pack 生成中：${packLabel}`);
-        renderOperations.set(episode.episodeIndex, beginRenderOperation(episode.episodeIndex));
+        renderOperations.set(
+          episode.episodeIndex,
+          beginRenderOperation(episode.episodeIndex, durableRenderOperation.operationToken),
+        );
       }
+      await writeBatchSegmentCache();
       publishBatchProgress("rendering", `正在本地并发生成 Render Pack：第 ${packLabel} 段...`);
       const packStartedAt = Date.now();
 
@@ -4538,7 +4615,23 @@ export function DashboardClient() {
             activeProjectId || undefined,
             mode,
             batchEventFeatures.contractV2 && batchEventFeatures.coverageSidecar,
+            durableRenderOperation,
           );
+          durableRenderOperation = attachRenderOperationJob(durableRenderOperation, {
+            jobId: packJob.id,
+            sourceHash: String(packJob.sourceHash || ""),
+            aggregateContractHash: packJob.aggregateContractHash || null,
+          });
+          replaceRenderOperationRecord(durableRenderOperation);
+          for (const episode of packEpisodes) {
+            dispatchSegmentStateEvent(episode.episodeIndex, {
+              type: "RENDER_OPERATION_OBSERVING",
+              operationToken: durableRenderOperation.operationToken,
+              jobId: packJob.id,
+              expectedSourceHash: String(packJob.sourceHash || ""),
+            });
+          }
+          await writeBatchSegmentCache();
           return pollVideoPromptPackCodexJob(packJob.id, packSegments.length);
         }
 

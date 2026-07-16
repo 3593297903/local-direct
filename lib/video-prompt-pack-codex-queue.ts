@@ -68,6 +68,8 @@ export type VideoPromptPackSegmentInput = {
 
 export type CreateVideoPromptPackCodexJobInput = {
   idempotencyKey?: string;
+  batchId?: string;
+  operationToken?: string;
   projectId?: string;
   mode?: VideoPromptPackCodexMode;
   coverageSidecarEnabled?: boolean;
@@ -101,6 +103,8 @@ export type VideoPromptPackCodexJob = {
   protocolVersion: 1 | 2;
   stage: VideoPromptPackCodexJobStage;
   idempotencyKey: string | null;
+  batchId: string | null;
+  operationToken: string | null;
   projectId: string | null;
   mode: VideoPromptPackCodexMode;
   coverageSidecarEnabled: boolean;
@@ -117,6 +121,7 @@ export type VideoPromptPackCodexJob = {
   stagingDir: string | null;
   sourceHash: string;
   contractHash: string | null;
+  contractHashes: Record<string, string>;
   resultRef: CodexFinalizedResultRef | null;
   resultAvailable: boolean;
   result: VideoPromptPackCodexResult | null;
@@ -173,6 +178,7 @@ export async function createVideoPromptPackCodexJob(
   await ensureFileJobStore(rootDir, TASK_ROOT);
   const now = new Date().toISOString();
   const idempotencyKey = normalizeRenderPackIdempotencyKey(input.idempotencyKey);
+  const operationIdentity = normalizeRenderPackOperationIdentity(input, idempotencyKey);
   const jobId = idempotencyKey
     ? `video-prompt-pack-job-${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`
     : createId("video-prompt-pack-job");
@@ -202,11 +208,17 @@ export async function createVideoPromptPackCodexJob(
     episodeIndex: segment.episodeIndex,
     contractHash: segment.segmentContract?.contractHash || null,
   })));
+  const contractHashes = Object.fromEntries(segments.map((segment) => [
+    String(segment.episodeIndex),
+    segment.segmentContract?.contractHash || "",
+  ]));
   const job: VideoPromptPackCodexJob = {
     id: jobId,
     protocolVersion: CODEX_FINALIZATION_PROTOCOL_VERSION,
     stage: "pending",
     idempotencyKey,
+    batchId: operationIdentity.batchId,
+    operationToken: operationIdentity.operationToken,
     projectId: input.projectId || null,
     mode,
     coverageSidecarEnabled,
@@ -222,6 +234,7 @@ export async function createVideoPromptPackCodexJob(
     stagingDir: null,
     sourceHash,
     contractHash,
+    contractHashes,
     resultRef: null,
     resultAvailable: false,
     result: null,
@@ -245,8 +258,11 @@ function assertRenderPackIdempotencyIdentity(
     stored.id !== expected.id
     || stored.protocolVersion !== CODEX_FINALIZATION_PROTOCOL_VERSION
     || stored.idempotencyKey !== expected.idempotencyKey
+    || stored.batchId !== expected.batchId
+    || stored.operationToken !== expected.operationToken
     || stored.sourceHash !== expected.sourceHash
     || stored.contractHash !== expected.contractHash
+    || JSON.stringify(stored.contractHashes) !== JSON.stringify(expected.contractHashes)
     || stored.mode !== expected.mode
     || stored.coverageSidecarEnabled !== expected.coverageSidecarEnabled
     || JSON.stringify(storedIndexes) !== JSON.stringify(expectedIndexes)
@@ -573,11 +589,18 @@ export async function failVideoPromptPackCodexJob(
 }
 
 export function toVideoPromptPackCodexJobStatusDto(job: VideoPromptPackCodexJob) {
+  const segmentIndexes = requestedRenderPackIndexes(job);
   return {
     id: job.id,
     protocolVersion: job.protocolVersion,
     status: job.status,
     stage: job.stage,
+    ...(job.batchId ? { batchId: job.batchId } : {}),
+    ...(job.operationToken ? { operationToken: job.operationToken } : {}),
+    sourceHash: job.sourceHash,
+    ...(job.contractHash ? { aggregateContractHash: job.contractHash } : {}),
+    segmentIndexes,
+    contractHashes: job.contractHashes,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     ...(job.claimedAt ? { claimedAt: job.claimedAt } : {}),
@@ -1150,6 +1173,8 @@ function normalizeStoredRenderPackJob(job: VideoPromptPackCodexJob): VideoPrompt
           ? "executing"
           : "pending"),
     idempotencyKey: job.idempotencyKey || null,
+    batchId: job.batchId || null,
+    operationToken: job.operationToken || null,
     mode: job.mode === "standard" ? "standard" : "strictUtf8",
     outputTemplate: job.outputTemplate || null,
     leaseId: job.leaseId || null,
@@ -1171,6 +1196,10 @@ function normalizeStoredRenderPackJob(job: VideoPromptPackCodexJob): VideoPrompt
           contractHash: segment.segmentContract?.contractHash || null,
         })))
       : null),
+    contractHashes: job.contractHashes || Object.fromEntries(job.segments.map((segment) => [
+      String(segment.episodeIndex),
+      segment.segmentContract?.contractHash || "",
+    ])),
     resultRef: job.resultRef || null,
     resultAvailable: protocolVersion === 1
       ? status === "completed" && Boolean(job.result)
@@ -1438,6 +1467,27 @@ function renderPackStatePath(
 
 function episodeFileName(episodeIndex: number) {
   return `episode-${String(episodeIndex).padStart(3, "0")}.json`;
+}
+
+function normalizeRenderPackOperationIdentity(
+  input: CreateVideoPromptPackCodexJobInput,
+  idempotencyKey: string | null,
+) {
+  const batchId = String(input.batchId || "").trim();
+  const operationToken = String(input.operationToken || "").trim();
+  const hasDurableIdentity = Boolean(batchId || operationToken);
+  if (!hasDurableIdentity) return { batchId: null, operationToken: null };
+  if (!idempotencyKey || !isRenderPackIdentity(batchId, 240) || !isRenderPackIdentity(operationToken, 240)) {
+    throw new VideoPromptPackCodexQueueError(
+      "Render Pack batchId, operationToken, and idempotencyKey must form a complete durable identity",
+      "FINALIZATION_IDENTITY_MISMATCH",
+    );
+  }
+  return { batchId, operationToken };
+}
+
+function isRenderPackIdentity(value: string, maxLength: number) {
+  return Boolean(value && value.length <= maxLength && /^[A-Za-z0-9._:-]+$/.test(value));
 }
 
 function parseEpisodeIndexFromFileName(fileName: string) {
