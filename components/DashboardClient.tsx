@@ -67,6 +67,7 @@ import {
   prepareRenderPackReconciliation,
   reconcileDetachedRenderPack,
   retryCreatingRenderOperation,
+  shouldRetainRenderRecoveryPointer,
   startConcurrentRenderRecoveryObservers,
   type RenderObservationOutcome,
 } from "@/lib/batch-render-reconciliation";
