@@ -78,6 +78,7 @@ export type SegmentStateEvent = SegmentStateEventBase & (
       expectedSourceHash?: string;
       expectedContractHash?: string;
     }
+  | { type: "RENDER_OPERATION_REQUEUED"; operationToken: string }
   | { type: "RENDER_OPERATION_OBSERVING"; operationToken: string; jobId: string; expectedSourceHash: string }
   | { type: "RENDER_OPERATION_DETACHED"; operationToken: string; jobId: string }
   | { type: "RENDER_OPERATION_RECONCILED"; operationToken: string; jobId: string; resultHash: string; contractHash?: string }
@@ -140,7 +141,10 @@ export function isLegalSegmentStateEvent(state: SegmentStateRecord, event: Segme
         && state.generationStatus === "preparing_input";
     case "CONTRACT_PREFLIGHT_INVALID":
       return !isPersistedSaveStatus(state.saveStatus)
-        && ["pending", "preparing_input"].includes(state.generationStatus);
+        && (
+          ["pending", "preparing_input"].includes(state.generationStatus)
+          || (state.generationStatus === "rendering" && !state.activeRenderPackJobId)
+        );
     case "RENDER_STARTED":
       return !isPersistedSaveStatus(state.saveStatus)
         && ["pending", "rendered", "settled"].includes(state.generationStatus);
@@ -150,6 +154,11 @@ export function isLegalSegmentStateEvent(state: SegmentStateRecord, event: Segme
     case "RENDER_OPERATION_CREATED":
       return !isPersistedSaveStatus(state.saveStatus)
         && ["pending", "rendered", "settled"].includes(state.generationStatus);
+    case "RENDER_OPERATION_REQUEUED":
+      return !isPersistedSaveStatus(state.saveStatus)
+        && state.generationStatus === "rendering"
+        && state.renderOperationToken === event.operationToken
+        && !state.activeRenderPackJobId;
     case "RENDER_OPERATION_OBSERVING":
       return !isPersistedSaveStatus(state.saveStatus)
         && state.renderOperationToken === event.operationToken
@@ -255,6 +264,9 @@ export function reduceSegmentState(state: SegmentStateRecord, event: SegmentStat
         activeRepairJobId: undefined,
         activeRenderPackJobId: undefined,
         renderOperationToken: undefined,
+        expectedSourceHash: undefined,
+        expectedContractHash: undefined,
+        renderDetachedAt: undefined,
         lastErrorCode: event.errorCode,
         message: event.message,
       };
@@ -332,6 +344,21 @@ export function reduceSegmentState(state: SegmentStateRecord, event: SegmentStat
         activeRenderPackJobId: undefined,
         renderDetachedAt: undefined,
         lastErrorCode: undefined,
+      };
+    case "RENDER_OPERATION_REQUEUED":
+      return {
+        ...next,
+        generationStatus: "pending",
+        qualityStatus: "unknown",
+        saveStatus: "not_ready",
+        activeRenderPackJobId: undefined,
+        renderOperationToken: undefined,
+        expectedSourceHash: undefined,
+        expectedContractHash: undefined,
+        renderDetachedAt: undefined,
+        lastErrorCode: undefined,
+        message: undefined,
+        displayStatus: "pending",
       };
     case "RENDER_OPERATION_OBSERVING":
       return {

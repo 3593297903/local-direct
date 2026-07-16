@@ -95,6 +95,43 @@ test("contract preflight states are orthogonal and contract invalid cannot enter
   assert.deepEqual(repairAttempt, invalid);
 });
 
+test("authoritative contract rejection invalidates only B and requeues valid render neighbors", () => {
+  const beginRendering = (index) => reduceSegmentState(
+    createInitialSegmentState(index, { contractHash: `contract-${index}`, updatedAt: 1 }),
+    {
+      type: "RENDER_OPERATION_CREATED",
+      operationToken: "operation-original",
+      expectedSourceHash: "source-original",
+      expectedContractHash: `contract-${index}`,
+      at: 2,
+    },
+  );
+  const [a, b, c] = [1, 2, 3].map(beginRendering);
+
+  const requeue = (state) => reduceSegmentState(state, {
+    type: "RENDER_OPERATION_REQUEUED",
+    operationToken: "operation-original",
+    at: 3,
+  });
+  const invalid = reduceSegmentState(b, {
+    type: "CONTRACT_PREFLIGHT_INVALID",
+    errorCode: "CONTRACT_HASH_INVALID",
+    message: "authoritative rejection",
+    at: 3,
+  });
+
+  for (const state of [requeue(a), requeue(c)]) {
+    assert.equal(state.generationStatus, "pending");
+    assert.equal(state.renderOperationToken, undefined);
+    assert.equal(state.activeRenderPackJobId, undefined);
+    assert.equal(state.expectedSourceHash, undefined);
+    assert.equal(state.expectedContractHash, undefined);
+    assert.equal(progressStatusFromSegmentState(state), "pending");
+  }
+  assert.equal(invalid.generationStatus, "contract_invalid");
+  assert.equal(progressStatusFromSegmentState(invalid), "failed");
+});
+
 test("one contract-invalid segment does not stop an active valid neighbor", () => {
   let invalid = createInitialSegmentState(1);
   invalid = reduceSegmentState(invalid, { type: "CONTRACT_PREFLIGHT_STARTED", baseRevision: 0, at: 1 });

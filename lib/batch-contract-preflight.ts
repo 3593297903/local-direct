@@ -73,6 +73,28 @@ export type PreflightedRenderSchedule<T> = {
   metrics: ContractPreflightMetrics;
 };
 
+export type ContractPreflightAuthoritativeRejection = {
+  affectedSegmentIndexes: number[];
+  errorCode: string;
+  rerouteGeneration: number;
+};
+
+export type ContractPreflightRejectionPartition<T> =
+  | {
+      disposition: "reroute";
+      rejectedEntries: Array<SegmentContractPreflightEntry<T>>;
+      retryRuns: Array<Array<SegmentContractPreflightEntry<T>>>;
+      nextGeneration: number;
+      reasonCode: string;
+    }
+  | {
+      disposition: "fail_closed";
+      rejectedEntries: [];
+      retryRuns: [];
+      nextGeneration: number;
+      reasonCode: string;
+    };
+
 export function preflightSegmentContracts<T>(
   items: T[],
   options: ContractPreflightOptions<T>,
@@ -211,6 +233,86 @@ export function buildPreflightedRenderPacks<T>(
     concurrency: Math.min(4, Math.max(0, ...packs.map((pack) => pack.concurrency))),
     invalid: plan.invalid,
     metrics: { ...plan.metrics },
+  };
+}
+
+export function partitionPreflightedRenderPackAfterRejection<T>(
+  pack: PreflightedRenderPack<T>,
+  rejection: ContractPreflightAuthoritativeRejection,
+): ContractPreflightRejectionPartition<T> {
+  const entries = Array.isArray(pack?.entries) ? pack.entries : [];
+  const entryIndexes = entries.map((entry) => Number(entry?.preflight?.segmentIndex));
+  const affectedIndexes = Array.isArray(rejection?.affectedSegmentIndexes)
+    ? rejection.affectedSegmentIndexes.map(Number)
+    : [];
+  const failClosed = (reasonCode: string): ContractPreflightRejectionPartition<T> => ({
+    disposition: "fail_closed",
+    rejectedEntries: [],
+    retryRuns: [],
+    nextGeneration: Number.isInteger(rejection?.rerouteGeneration)
+      ? rejection.rerouteGeneration
+      : 0,
+    reasonCode,
+  });
+
+  if (
+    rejection?.errorCode === "CONTRACT_PREFLIGHT_V2_CREATE_PAUSED"
+    || rejection?.rerouteGeneration !== 0
+  ) {
+    return failClosed(String(rejection?.errorCode || "CONTRACT_PREFLIGHT_REJECTION_INVALID"));
+  }
+  if (
+    !entries.length
+    || entryIndexes.some((index) => !Number.isInteger(index) || index < 1)
+    || new Set(entryIndexes).size !== entryIndexes.length
+    || affectedIndexes.length === 0
+    || affectedIndexes.some((index) => !Number.isInteger(index) || index < 1)
+    || new Set(affectedIndexes).size !== affectedIndexes.length
+  ) {
+    return failClosed("CONTRACT_PREFLIGHT_REJECTION_INVALID");
+  }
+
+  const entryIndexSet = new Set(entryIndexes);
+  if (affectedIndexes.some((index) => !entryIndexSet.has(index))) {
+    return failClosed("CONTRACT_PREFLIGHT_REJECTION_INVALID");
+  }
+  if (entries.some((entry) => (
+    !["ready", "isolated"].includes(entry.preflight.disposition)
+    || ["invalid", "overflow"].includes(entry.preflight.compile.status)
+  ))) {
+    return failClosed("CONTRACT_PREFLIGHT_REJECTION_INVALID");
+  }
+
+  const affected = new Set(affectedIndexes);
+  const rejectedEntries = entries.filter((entry) => affected.has(entry.preflight.segmentIndex));
+  const retryRuns: Array<Array<SegmentContractPreflightEntry<T>>> = [];
+  let currentRun: Array<SegmentContractPreflightEntry<T>> = [];
+  let previousIndex: number | null = null;
+
+  const flushRun = () => {
+    if (currentRun.length) retryRuns.push(currentRun);
+    currentRun = [];
+    previousIndex = null;
+  };
+
+  for (const entry of entries) {
+    const segmentIndex = entry.preflight.segmentIndex;
+    if (affected.has(segmentIndex)) {
+      flushRun();
+      continue;
+    }
+    if (previousIndex !== null && segmentIndex !== previousIndex + 1) flushRun();
+    currentRun.push(entry);
+    previousIndex = segmentIndex;
+  }
+  flushRun();
+
+  return {
+    disposition: "reroute",
+    rejectedEntries,
+    retryRuns,
+    nextGeneration: 1,
+    reasonCode: String(rejection.errorCode || "CONTRACT_PREFLIGHT_REJECTED"),
   };
 }
 

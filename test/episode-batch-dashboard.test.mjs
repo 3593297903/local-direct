@@ -224,6 +224,8 @@ test("dashboard preflights contracts before operations and never routes contract
   assert.ok(scheduleIndex > preflightIndex);
   assert.ok(renderInvocationIndex > scheduleIndex);
   assert.match(dashboardSource, /createRenderOperationDraftFromPreflightPack\(/);
+  assert.match(dashboardSource, /partitionPreflightedRenderPackAfterRejection\(/);
+  assert.match(dashboardSource, /RENDER_OPERATION_REQUEUED/);
   assert.match(dashboardSource, /CONTRACT_PREFLIGHT_STARTED/);
   assert.match(dashboardSource, /CONTRACT_PREFLIGHT_READY/);
   assert.match(dashboardSource, /CONTRACT_PREFLIGHT_INVALID/);

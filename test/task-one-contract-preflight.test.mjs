@@ -11,6 +11,7 @@ require("ts-node/register/transpile-only");
 
 const {
   buildPreflightedRenderPacks,
+  partitionPreflightedRenderPackAfterRejection,
   preflightSegmentContracts,
 } = require("../lib/batch-contract-preflight.ts");
 const {
@@ -152,6 +153,48 @@ test("valid A and C create operations while invalid B creates none", () => {
 
   assert.deepEqual(operations.map((operation) => operation.segmentIndexes), [[1], [3]]);
   assert.equal(operations.flatMap((operation) => operation.segmentIndexes).includes(2), false);
+});
+
+test("authoritative rejection of B reroutes A and C as separate contiguous runs", () => {
+  const plan = preflightSegmentContracts([makeItem(1), makeItem(2), makeItem(3)], preflightOptions);
+  const [pack] = buildPreflightedRenderPacks(plan, preflightOptions).packs;
+  const reroute = partitionPreflightedRenderPackAfterRejection(pack, {
+    affectedSegmentIndexes: [2],
+    errorCode: "CONTRACT_HASH_INVALID",
+    rerouteGeneration: 0,
+  });
+
+  assert.equal(reroute.disposition, "reroute");
+  assert.equal(reroute.nextGeneration, 1);
+  assert.deepEqual(reroute.rejectedEntries.map((entry) => entry.item.episodeIndex), [2]);
+  assert.deepEqual(
+    reroute.retryRuns.map((run) => run.map((entry) => entry.item.episodeIndex)),
+    [[1], [3]],
+  );
+  const executions = reroute.retryRuns.flatMap((run) => run.map((entry) => entry.item.episodeIndex));
+  assert.deepEqual(executions, [1, 3]);
+  assert.equal(new Set(executions).size, 2);
+  assert.deepEqual({ repair: 0, judge: 0, fallback: 0, singleGeneration: 0 }, {
+    repair: 0,
+    judge: 0,
+    fallback: 0,
+    singleGeneration: 0,
+  });
+});
+
+test("malformed paused and second-generation authoritative rejections fail closed", () => {
+  const plan = preflightSegmentContracts([makeItem(1), makeItem(2), makeItem(3)], preflightOptions);
+  const [pack] = buildPreflightedRenderPacks(plan, preflightOptions).packs;
+  for (const input of [
+    { affectedSegmentIndexes: [], errorCode: "CONTRACT_HASH_INVALID", rerouteGeneration: 0 },
+    { affectedSegmentIndexes: [99], errorCode: "CONTRACT_HASH_INVALID", rerouteGeneration: 0 },
+    { affectedSegmentIndexes: [2], errorCode: "CONTRACT_PREFLIGHT_V2_CREATE_PAUSED", rerouteGeneration: 0 },
+    { affectedSegmentIndexes: [2], errorCode: "CONTRACT_HASH_INVALID", rerouteGeneration: 1 },
+  ]) {
+    const result = partitionPreflightedRenderPackAfterRejection(pack, input);
+    assert.equal(result.disposition, "fail_closed");
+    assert.deepEqual(result.retryRuns, []);
+  }
 });
 
 test("invalid B is isolated without model, repair, judge, or fallback calls", () => {

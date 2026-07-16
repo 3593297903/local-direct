@@ -18,6 +18,7 @@ import type { CompiledSegmentContractBlock } from "@/lib/codex-prompt-input-comp
 import { buildRenderPacks } from "@/lib/batch-render-scheduler";
 import {
   buildPreflightedRenderPacks,
+  partitionPreflightedRenderPackAfterRejection,
   preflightSegmentContracts,
   type PreflightedRenderPack,
 } from "@/lib/batch-contract-preflight";
@@ -5264,6 +5265,7 @@ export function DashboardClient() {
       allowSplitFallback = true,
       packIndex?: number,
       renderRound = 1,
+      contractRerouteGeneration = 0,
     ) {
       const packEntries = renderPack.entries.filter(
         ({ item: episode }) => !renderedEpisodes[episode.episodeIndex - 1]
@@ -5371,20 +5373,56 @@ export function DashboardClient() {
           renderPackJob = await runRenderPack(STRICT_UTF8_RENDER_PACK_MODE);
         } catch (strictError) {
           if (isContractPreflightCreateError(strictError)) {
-            const affected = strictError.segmentIndexes.length
-              ? new Set(strictError.segmentIndexes)
-              : new Set(packEpisodes.map((episode) => episode.episodeIndex));
+            const partition = partitionPreflightedRenderPackAfterRejection(effectiveRenderPack, {
+              affectedSegmentIndexes: Array.isArray(strictError.segmentIndexes)
+                ? strictError.segmentIndexes
+                : [],
+              errorCode: strictError.code,
+              rerouteGeneration: contractRerouteGeneration,
+            });
             durableRenderOperation = terminateRenderOperation(durableRenderOperation, {
               state: "failed",
               errorCode: strictError.code,
             });
             replaceRenderOperationRecord(durableRenderOperation);
             for (const episode of packEpisodes) {
-              if (!affected.has(episode.episodeIndex)) continue;
-              markContractPreflightInvalid(episode.episodeIndex, strictError.code, strictError.message);
               finishRenderOperation(renderOperations.get(episode.episodeIndex));
             }
+
+            if (partition.disposition === "fail_closed") {
+              for (const episode of packEpisodes) {
+                markContractPreflightInvalid(episode.episodeIndex, partition.reasonCode, strictError.message);
+              }
+              await writeBatchSegmentCache();
+              return;
+            }
+
+            for (const entry of partition.rejectedEntries) {
+              markContractPreflightInvalid(entry.item.episodeIndex, strictError.code, strictError.message);
+            }
+            for (const run of partition.retryRuns) {
+              for (const entry of run) {
+                dispatchSegmentStateEvent(entry.item.episodeIndex, {
+                  type: "RENDER_OPERATION_REQUEUED",
+                  operationToken: durableRenderOperation.operationToken,
+                });
+                updateSegmentProgress(entry.item.episodeIndex, "pending", "Contract 已重新验证，等待连续区间重新调度");
+              }
+            }
             await writeBatchSegmentCache();
+
+            const retryPacks = partition.retryRuns.map((entries) => ({
+              ...effectiveRenderPack,
+              entries,
+              packSize: entries.length,
+            }));
+            await Promise.all(retryPacks.map((retryPack) => renderPackedSegmentsWithQualityRepair(
+              retryPack,
+              allowSplitFallback,
+              packIndex,
+              renderRound,
+              partition.nextGeneration,
+            )));
             return;
           }
           if (allowSplitFallback && packEpisodes.length > 1 && isRecoverableRenderPackError(strictError)) {
