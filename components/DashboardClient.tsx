@@ -59,13 +59,15 @@ import {
 import {
   applyPreparedRenderPackReconciliation,
   createRenderPackObserverRegistry,
+  hasActiveRenderRecovery,
+  hasSaveableUnsavedResults,
+  isBatchRenderLateReconciliationEnabled,
   listRecoverableRenderOperations,
   observeRenderPackJob,
   prepareRenderPackReconciliation,
   reconcileDetachedRenderPack,
   retryCreatingRenderOperation,
   startConcurrentRenderRecoveryObservers,
-  shouldRetainRenderRecoveryPointer,
   type RenderObservationOutcome,
 } from "@/lib/batch-render-reconciliation";
 import {
@@ -460,7 +462,32 @@ const TASK_ONE_SAFETY_ENABLED = process.env.NEXT_PUBLIC_TASK_ONE_SAFETY !== "0";
 const TASK_ONE_STATE_REDUCER_ENABLED = process.env.NEXT_PUBLIC_TASK_ONE_STATE_REDUCER !== "0";
 const TASK_ONE_CACHE_RECOVERY_ENABLED = process.env.NEXT_PUBLIC_TASK_ONE_CACHE_RECOVERY !== "0";
 const TASK_ONE_REPAIR_SCHEDULER_ENABLED = process.env.NEXT_PUBLIC_TASK_ONE_REPAIR_SCHEDULER !== "0";
+const BATCH_RENDER_LATE_RECONCILIATION_ENABLED = isBatchRenderLateReconciliationEnabled(
+  process.env.NEXT_PUBLIC_BATCH_RENDER_LATE_RECONCILIATION,
+);
 const segmentTerminologyPattern = /(?:\u7b2c\s*[0-9\u4e00-\u9fa5]+\s*\u96c6|\u672c\u96c6|\u5355\u96c6|\u5267\u96c6)/;
+
+function waitForRenderObservation(delayMs: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      const error = new Error("Render observation aborted");
+      error.name = "AbortError";
+      reject(error);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      const error = new Error("Render observation aborted");
+      error.name = "AbortError";
+      reject(error);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, Math.max(0, delayMs));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 function formatBatchDurationMs(ms: number) {
   if (!Number.isFinite(ms) || ms <= 0) return "0s";
@@ -1255,6 +1282,9 @@ export function DashboardClient() {
   const renderRecoveryObserverRegistryRef = useRef(
     createRenderPackObserverRegistry<RenderObservationOutcome<VideoPromptPackCodexJob>>(),
   );
+  const renderPackObserverRegistryRef = useRef(
+    createRenderPackObserverRegistry<void>(),
+  );
   const [batchProgressTick, setBatchProgressTick] = useState(0);
   const [episodeCountPickerOpen, setEpisodeCountPickerOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState("");
@@ -1272,6 +1302,11 @@ export function DashboardClient() {
     const timer = window.setInterval(() => setBatchProgressTick(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [batchProgress?.startedAtMs, batchProgress?.phase]);
+
+  useEffect(() => () => {
+    renderRecoveryObserverRegistryRef.current.abortAll();
+    renderPackObserverRegistryRef.current.abortAll();
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -2441,11 +2476,13 @@ export function DashboardClient() {
     >({
       operations: recoverable,
       registry: renderRecoveryObserverRegistryRef.current,
-      observe: (operation) => observeRenderPackJob({
+      observe: (operation, signal) => observeRenderPackJob({
         jobId: String(operation.jobId),
         mode: "background",
+        signal,
         readJob: readVideoPromptPackCodexJob,
-        sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+        sleep: waitForRenderObservation,
+        isHidden: () => typeof document !== "undefined" && document.hidden,
       }),
       async onOutcome(operation, outcome) {
         if (outcome.status === "completed") {
@@ -2463,10 +2500,9 @@ export function DashboardClient() {
     });
     void recoveryObservers.settled;
 
-    return shouldRetainRenderRecoveryPointer({
-      operations,
-      segmentStates: [...stateByIndex.values()],
-    });
+    const segmentStates = [...stateByIndex.values()];
+    return hasActiveRenderRecovery(operations)
+      || hasSaveableUnsavedResults(segmentStates);
   }
 
   async function resumeCachedBatchSavesOnly(
@@ -3182,7 +3218,6 @@ export function DashboardClient() {
     let saveError: Error | null = null;
     let renderOperationRecords: RenderOperationRefV2[] = [];
     const mergedRepairJobIds = new Set<string>();
-    const renderPackObserverRegistry = new Map<string, Promise<void>>();
     let activeRenderScheduleProfile = "UNSCHEDULED";
     let batchQuotaPaused = false;
     let batchQuotaPauseMessage = "";
@@ -5100,14 +5135,14 @@ export function DashboardClient() {
     }) {
       const jobId = input.operation.jobId;
       if (!jobId) return Promise.resolve();
-      const existing = renderPackObserverRegistry.get(jobId);
-      if (existing) return existing;
-      const observer = (async () => {
+      return renderPackObserverRegistryRef.current.observe(jobId, async (signal) => {
         const outcome = await observeRenderPackJob({
           jobId,
           mode: "background",
+          signal,
           readJob: readVideoPromptPackCodexJob,
-          sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+          sleep: waitForRenderObservation,
+          isHidden: () => typeof document !== "undefined" && document.hidden,
         });
         if (outcome.status === "completed") {
           await reconcileAndRouteRenderPackResult({ ...input, job: outcome.job });
@@ -5133,11 +5168,7 @@ export function DashboardClient() {
           }
           await writeBatchSegmentCache();
         }
-      })().finally(() => {
-        renderPackObserverRegistry.delete(jobId);
       });
-      renderPackObserverRegistry.set(jobId, observer);
-      return observer;
     }
 
     async function renderPackedSegmentsWithQualityRepair(
@@ -5285,13 +5316,15 @@ export function DashboardClient() {
             finishRenderOperation(renderOperations.get(episode.episodeIndex));
           }
           await writeBatchSegmentCache();
-          void observeDetachedRenderOperation({
-            operation: durableRenderOperation,
-            packEpisodes,
-            packStartedAt,
-            packIndex,
-            renderRound,
-          });
+          if (BATCH_RENDER_LATE_RECONCILIATION_ENABLED) {
+            void observeDetachedRenderOperation({
+              operation: durableRenderOperation,
+              packEpisodes,
+              packStartedAt,
+              packIndex,
+              renderRound,
+            });
+          }
           publishBatchProgress(
             "rendering",
             `Render Pack 第 ${packLabel} 段状态暂不可读，原任务 ${error.jobId} 已保留，不会创建逐段补生成任务。`,

@@ -23,15 +23,23 @@ test("transient render-pack polling failures keep the original job and never fan
   const pollStart = source.indexOf("async function pollVideoPromptPackCodexJob");
   const pollEnd = source.indexOf("async function pollVideoPromptCodexJob", pollStart);
   const pollBody = source.slice(pollStart, pollEnd);
-  assert.match(pollBody, /consecutiveTransportFailures/);
-  assert.match(pollBody, /continue/);
+  assert.match(pollBody, /observeRenderPackJob/);
+  assert.match(pollBody, /mode:\s*"foreground"/);
   assert.match(pollBody, /RenderPackPollingInfrastructureError/);
+  assert.doesNotMatch(pollBody, /queueSegmentRepair|renderBatchSegmentWithQualityRepair/);
 
   const renderStart = source.indexOf("async function renderPackedSegmentsWithQualityRepair");
   const renderEnd = source.indexOf("await restoreCachedRenderedSegments", renderStart);
   const renderBody = source.slice(renderStart, renderEnd);
   assert.match(renderBody, /isRenderPackPollingInfrastructureError\(error\)/);
   assert.match(renderBody, /throw error/);
+});
+
+test("dashboard owns and aborts Render observer registries without mutating durable state", () => {
+  assert.match(source, /renderRecoveryObserverRegistryRef/);
+  assert.match(source, /renderPackObserverRegistryRef/);
+  assert.match(source, /abortAll\(\)/);
+  assert.match(source, /NEXT_PUBLIC_BATCH_RENDER_LATE_RECONCILIATION/);
 });
 
 test("repair polling detaches at the frontend timeout instead of failing the generation", () => {

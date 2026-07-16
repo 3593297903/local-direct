@@ -1,6 +1,8 @@
 import type { RenderOperationRefV2 } from "./batch-render-operation";
 export {
+  calculateRenderObservationDelay,
   classifyRenderObservationError,
+  isBatchRenderLateReconciliationEnabled,
   observeRenderPackJob,
   retryCreatingRenderOperation,
   startConcurrentRenderRecoveryObservers,
@@ -74,15 +76,16 @@ export function listRecoverableRenderOperations(operations: RenderOperationRefV2
 }
 
 export function createRenderPackObserverRegistry<T = unknown>() {
-  const observers = new Map<string, Promise<T>>();
+  const observers = new Map<string, { promise: Promise<T>; controller: AbortController }>();
   return {
-    observe(jobId: string, factory: () => Promise<T>) {
+    observe(jobId: string, factory: (signal: AbortSignal) => Promise<T>) {
       const active = observers.get(jobId);
-      if (active) return active;
-      const observer = Promise.resolve().then(factory).finally(() => {
-        if (observers.get(jobId) === observer) observers.delete(jobId);
+      if (active) return active.promise;
+      const controller = new AbortController();
+      const observer = Promise.resolve().then(() => factory(controller.signal)).finally(() => {
+        if (observers.get(jobId)?.promise === observer) observers.delete(jobId);
       });
-      observers.set(jobId, observer);
+      observers.set(jobId, { promise: observer, controller });
       return observer;
     },
     has(jobId: string) {
@@ -91,17 +94,36 @@ export function createRenderPackObserverRegistry<T = unknown>() {
     size() {
       return observers.size;
     },
+    abort(jobId: string) {
+      const observer = observers.get(jobId);
+      if (!observer) return false;
+      observers.delete(jobId);
+      observer.controller.abort();
+      return true;
+    },
+    abortAll() {
+      const active = [...observers.values()];
+      observers.clear();
+      for (const observer of active) observer.controller.abort();
+    },
   };
+}
+
+export function hasActiveRenderRecovery(operations: RenderOperationRefV2[]) {
+  return operations.some((operation) => ACTIVE_RENDER_OPERATION_STATES.has(operation.state));
+}
+
+export function hasSaveableUnsavedResults(
+  segmentStates: Array<{ generationStatus?: string; qualityStatus?: string; saveStatus?: string }>,
+) {
+  return segmentStates.some((state) => ["cached", "saving", "save_failed"].includes(String(state.saveStatus || "")));
 }
 
 export function shouldRetainRenderRecoveryPointer(input: {
   operations: RenderOperationRefV2[];
-  segmentStates: Array<{ generationStatus?: string; saveStatus?: string }>;
+  segmentStates: Array<{ generationStatus?: string; qualityStatus?: string; saveStatus?: string }>;
 }) {
-  if (input.operations.some((operation) => ACTIVE_RENDER_OPERATION_STATES.has(operation.state))) return true;
-  return input.segmentStates.some((state) => (
-    state.saveStatus !== "saved" && state.saveStatus !== "review_saved"
-  ));
+  return hasActiveRenderRecovery(input.operations) || hasSaveableUnsavedResults(input.segmentStates);
 }
 
 export function reconcileDetachedRenderPack(input: {

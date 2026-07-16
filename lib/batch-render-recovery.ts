@@ -22,8 +22,12 @@ type RenderJobStatus = {
 };
 
 type ObserverRegistry<T> = {
-  observe(jobId: string, factory: () => Promise<T>): Promise<T>;
+  observe(jobId: string, factory: (signal: AbortSignal) => Promise<T>): Promise<T>;
 };
+
+export function isBatchRenderLateReconciliationEnabled(value: string | undefined) {
+  return value !== "0";
+}
 
 export function classifyRenderObservationError(error: unknown): RenderObservationErrorClass {
   const record = error && typeof error === "object" ? error as Record<string, unknown> : {};
@@ -53,6 +57,8 @@ export async function observeRenderPackJob<TJob extends RenderJobStatus>(input: 
   attentionMs?: number;
   now?: () => number;
   pollDelay?: (input: { stage: string; transientFailures: number }) => number;
+  isHidden?: () => boolean;
+  random?: () => number;
   signal?: AbortSignal;
   confirmedMissingProbes?: number;
   onStage?: (job: TJob) => void;
@@ -115,7 +121,12 @@ export async function observeRenderPackJob<TJob extends RenderJobStatus>(input: 
     }
 
     const delayMs = Math.max(0, input.pollDelay?.({ stage, transientFailures })
-      ?? defaultRenderObservationDelay(stage, transientFailures));
+      ?? calculateRenderObservationDelay({
+        stage,
+        transientFailures,
+        hidden: input.isHidden?.() === true,
+        random: input.random,
+      }));
     try {
       await input.sleep(delayMs, input.signal);
     } catch (error) {
@@ -130,7 +141,7 @@ export async function observeRenderPackJob<TJob extends RenderJobStatus>(input: 
 export function startConcurrentRenderRecoveryObservers<TJob, TOutcome>(input: {
   operations: RenderOperationRefV2[];
   registry: ObserverRegistry<TOutcome>;
-  observe: (operation: RenderOperationRefV2) => Promise<TOutcome>;
+  observe: (operation: RenderOperationRefV2, signal: AbortSignal) => Promise<TOutcome>;
   onOutcome?: (operation: RenderOperationRefV2, outcome: TOutcome) => void | Promise<void>;
 }) {
   const seen = new Set<string>();
@@ -139,8 +150,8 @@ export function startConcurrentRenderRecoveryObservers<TJob, TOutcome>(input: {
     const jobId = String(operation.jobId || "");
     if (!jobId || seen.has(jobId)) continue;
     seen.add(jobId);
-    const promise = input.registry.observe(jobId, async () => {
-      const outcome = await input.observe(operation);
+    const promise = input.registry.observe(jobId, async (signal) => {
+      const outcome = await input.observe(operation, signal);
       await input.onOutcome?.(operation, outcome);
       return outcome;
     });
@@ -186,7 +197,17 @@ export async function retryCreatingRenderOperation<TValue>(input: {
   return { status: "transient", errorCode: "RENDER_CREATE_TRANSIENT", attempts: maxAttempts };
 }
 
-function defaultRenderObservationDelay(stage: string, transientFailures: number) {
-  if (transientFailures > 0) return Math.min(30_000, 2_500 * (2 ** Math.min(transientFailures - 1, 4)));
-  return /executing|finalizing|running|completed/i.test(stage) ? 2_500 : 5_000;
+export function calculateRenderObservationDelay(input: {
+  stage: string;
+  transientFailures: number;
+  hidden: boolean;
+  random?: () => number;
+}) {
+  const base = input.transientFailures > 0
+    ? Math.min(30_000, 2_500 * (2 ** Math.min(input.transientFailures - 1, 4)))
+    : /executing|finalizing|running|completed/i.test(input.stage) ? 2_500 : 5_000;
+  const visibilityAdjusted = input.hidden ? Math.min(30_000, base * 2) : base;
+  const random = Math.min(1, Math.max(0, (input.random || Math.random)()));
+  const jittered = visibilityAdjusted * (0.9 + random * 0.2);
+  return Math.min(30_000, Math.max(250, Math.round(jittered)));
 }

@@ -10,8 +10,12 @@ const require = createRequire(import.meta.url);
 require("ts-node/register/transpile-only");
 
 const {
+  calculateRenderObservationDelay,
   classifyRenderObservationError,
   createRenderPackObserverRegistry,
+  hasActiveRenderRecovery,
+  hasSaveableUnsavedResults,
+  isBatchRenderLateReconciliationEnabled,
   listRecoverableRenderOperations,
   observeRenderPackJob,
   retryCreatingRenderOperation,
@@ -72,6 +76,94 @@ test("observer registry deduplicates concurrent observers by job id", async () =
   await Promise.resolve();
   assert.equal(registry.size(), 0);
   assert.equal(starts, 1);
+});
+
+test("abortAll clears observer ownership and aborts future reads without failure dispatch", async () => {
+  const registry = createRenderPackObserverRegistry();
+  let reads = 0;
+  let failureDispatches = 0;
+  const observer = registry.observe("abort-job", async (signal) => observeRenderPackJob({
+    jobId: "abort-job",
+    mode: "background",
+    signal,
+    readJob: async () => {
+      reads += 1;
+      return { id: "abort-job", status: "pending", stage: "waiting-slot" };
+    },
+    sleep: (delayMs, activeSignal) => new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, delayMs);
+      activeSignal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      }, { once: true });
+    }),
+    pollDelay: () => 60_000,
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reads, 1);
+  registry.abortAll();
+  assert.equal(registry.size(), 0);
+  const outcome = await observer;
+  if (outcome.status === "terminal_failed") failureDispatches += 1;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(outcome.status, "aborted");
+  assert.equal(reads, 1);
+  assert.equal(failureDispatches, 0);
+});
+
+test("remount resumes the same durable operation and merges it once", async () => {
+  const durable = activeOperation("remount-token", "remount-job");
+  let merges = 0;
+  let firstReads = 0;
+  const firstRegistry = createRenderPackObserverRegistry();
+  const first = startConcurrentRenderRecoveryObservers({
+    operations: [durable],
+    registry: firstRegistry,
+    observe: async (operation, signal) => observeRenderPackJob({
+      jobId: operation.jobId,
+      mode: "background",
+      signal,
+      readJob: async () => {
+        firstReads += 1;
+        return { id: operation.jobId, status: "pending", stage: "pending" };
+      },
+      sleep: (delayMs, activeSignal) => new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, delayMs);
+        activeSignal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        }, { once: true });
+      }),
+      pollDelay: () => 60_000,
+    }),
+    onOutcome: async (_operation, outcome) => {
+      if (outcome.status === "completed") merges += 1;
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  firstRegistry.abortAll();
+  await first.settled;
+  assert.equal(firstReads, 1);
+  assert.equal(merges, 0);
+
+  const secondRegistry = createRenderPackObserverRegistry();
+  const second = startConcurrentRenderRecoveryObservers({
+    operations: [durable],
+    registry: secondRegistry,
+    observe: async (operation, signal) => observeRenderPackJob({
+      jobId: operation.jobId,
+      mode: "background",
+      signal,
+      readJob: async () => ({ id: operation.jobId, status: "completed", stage: "completed" }),
+      sleep: async () => {},
+    }),
+    onOutcome: async (_operation, outcome) => {
+      if (outcome.status === "completed") merges += 1;
+    },
+  });
+  await second.settled;
+  assert.equal(merges, 1);
+  assert.equal(secondRegistry.size(), 0);
 });
 
 test("refresh starts unique observers concurrently and later jobs do not wait for an earlier pending job", async () => {
@@ -240,6 +332,47 @@ test("recovery pointer remains while an active operation or unresolved segment e
     operations: [],
     segmentStates: [{ generationStatus: "settled", saveStatus: "saved" }],
   }), false);
+});
+
+test("active recovery saveable results and audit retention use separate predicates", () => {
+  const failed = terminateRenderOperation(activeOperation("failed-token", "failed-job"), {
+    state: "failed",
+    errorCode: "RENDER_JOB_TERMINAL_FAILURE",
+  });
+  const detached = detachRenderOperation(activeOperation("detached-token", "detached-job"));
+  assert.equal(hasActiveRenderRecovery([failed]), false);
+  assert.equal(hasSaveableUnsavedResults([{ generationStatus: "failed", saveStatus: "not_ready" }]), false);
+  assert.equal(shouldRetainRenderRecoveryPointer({
+    operations: [failed],
+    segmentStates: [{ generationStatus: "failed", saveStatus: "not_ready" }],
+  }), false);
+  assert.equal(hasActiveRenderRecovery([detached]), true);
+  assert.equal(shouldRetainRenderRecoveryPointer({
+    operations: [detached],
+    segmentStates: [{ generationStatus: "render_detached", saveStatus: "not_ready" }],
+  }), true);
+  assert.equal(hasSaveableUnsavedResults([{ generationStatus: "settled", saveStatus: "cached" }]), true);
+  assert.equal(shouldRetainRenderRecoveryPointer({
+    operations: [failed],
+    segmentStates: [{ generationStatus: "settled", saveStatus: "cached" }],
+  }), true);
+});
+
+test("polling delay is bounded by job state hidden-tab backoff and deterministic jitter", () => {
+  const executing = calculateRenderObservationDelay({ stage: "executing", transientFailures: 0, hidden: false, random: () => 0.5 });
+  const pending = calculateRenderObservationDelay({ stage: "waiting-slot", transientFailures: 0, hidden: false, random: () => 0.5 });
+  const hidden = calculateRenderObservationDelay({ stage: "waiting-slot", transientFailures: 0, hidden: true, random: () => 0.5 });
+  const transport = calculateRenderObservationDelay({ stage: "pending", transientFailures: 9, hidden: true, random: () => 0.5 });
+  assert.ok(executing >= 2_500 && executing <= 5_000);
+  assert.ok(pending >= 5_000 && pending <= 15_000);
+  assert.ok(hidden >= pending && hidden <= 30_000);
+  assert.ok(transport <= 30_000);
+});
+
+test("late reconciliation rollback flag defaults on and explicit zero is safe rollback", () => {
+  assert.equal(isBatchRenderLateReconciliationEnabled(undefined), true);
+  assert.equal(isBatchRenderLateReconciliationEnabled("1"), true);
+  assert.equal(isBatchRenderLateReconciliationEnabled("0"), false);
 });
 
 test("pending Render Pack status is smaller than 4 KiB", async () => {
