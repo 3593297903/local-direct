@@ -35,6 +35,9 @@ export function resolveCodexCliSlotConfig(env = process.env) {
 }
 
 const config = resolveCodexCliSlotConfig();
+let lastGrantStaleRecoveryAt = 0;
+let capacityFullUntil = 0;
+let grantTurnTail = Promise.resolve();
 
 export async function withCodexCliSlot(taskClass, taskId, callback) {
   const release = await acquireCodexCliSlot(taskClass, taskId);
@@ -49,7 +52,7 @@ export async function withCodexCliSlot(taskClass, taskId, callback) {
   } finally {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     await release();
-    await recordSlotMetric({
+    void recordSlotMetric({
       event: "exec_completed",
       taskClass: normalizeCodexSlotTaskClass(taskClass),
       taskId: String(taskId || "unknown"),
@@ -99,6 +102,7 @@ export async function releaseCodexCliLease(leaseIdentity) {
     const current = await readJsonFile(leasePath);
     if (!sameLease(current, leaseIdentity)) return false;
     await fsp.rm(leasePath, { force: true });
+    capacityFullUntil = 0;
     return true;
   });
 }
@@ -132,22 +136,22 @@ async function acquireFairCodexCliSlot(taskClass, taskId) {
   };
   const startedAt = Date.now();
   let alertRecorded = false;
+  let pollAttempt = 0;
   await ensureV2Directories();
-  await withCoordinatorLock(async () => {
-    await fsp.writeFile(v2RecordPath(waiterRoot, waiterId), `${JSON.stringify(waiter, null, 2)}\n`, "utf8");
-  });
+  await fsp.writeFile(v2RecordPath(waiterRoot, waiterId), `${JSON.stringify(waiter, null, 2)}\n`, "utf8");
 
   try {
     for (;;) {
-      const lease = await grantOrReadLease(waiterId);
+      const grantState = await grantOrReadLease(waiterId, pollAttempt);
+      const lease = grantState.lease;
       if (lease) {
-        await recordSlotMetric({
+        void recordSlotMetric({
           event: "slot_acquired",
           taskClass: normalizedTaskClass,
           taskId: waiter.taskId,
           slotNumber: lease.slotNumber,
           queueWaitMs: Date.now() - startedAt,
-          activeSlots: (await inspectCodexCliSlotState()).leases.length,
+          activeSlots: grantState.activeSlots,
         });
         let released = false;
         const release = async () => {
@@ -161,50 +165,108 @@ async function acquireFairCodexCliSlot(taskClass, taskId) {
       }
       if (!alertRecorded && Date.now() - startedAt >= config.waitAlertMs) {
         alertRecorded = true;
-        await recordSlotMetric({
+        void recordSlotMetric({
           event: "wait_threshold_exceeded",
           taskClass: normalizedTaskClass,
           taskId: waiter.taskId,
           queueWaitMs: Date.now() - startedAt,
         });
       }
-      await delay(config.pollMs);
+      await delay(coordinatorPollDelay(config.pollMs, pollAttempt));
+      pollAttempt += 1;
     }
   } catch (error) {
-    await withCoordinatorLock(() => fsp.rm(v2RecordPath(waiterRoot, waiterId), { force: true })).catch(() => undefined);
+    await fsp.rm(v2RecordPath(waiterRoot, waiterId), { force: true }).catch(() => undefined);
     throw error;
   }
 }
 
-async function grantOrReadLease(waiterId) {
-  return withCoordinatorLock(async () => {
-    await recoverStaleRecords();
-    const existing = await readJsonFile(v2RecordPath(leaseRoot, waiterId));
-    if (existing) return existing;
-
-    const waiters = await readJsonRecords(waiterRoot);
-    const leases = await readJsonRecords(leaseRoot);
-    const grants = selectCodexSlotGrants({ waiters, leases, maxSlots: config.maxSlots });
-    const now = new Date().toISOString();
-    for (const grant of grants) {
-      const lease = {
-        protocolVersion: 2,
-        waiterId: grant.waiterId,
-        leaseId: randomUUID(),
-        fencingToken: randomUUID(),
-        pid: grant.pid,
-        taskClass: grant.taskClass,
-        taskId: String(grant.taskId || "unknown"),
-        slotNumber: grant.slotNumber,
-        requestedAt: grant.requestedAt,
-        acquiredAt: now,
-        heartbeatAt: now,
+async function grantOrReadLease(waiterId, pollAttempt = 0) {
+  const leasePath = v2RecordPath(leaseRoot, waiterId);
+  const ownLease = await readJsonFile(leasePath);
+  if (ownLease) {
+    return {
+      lease: ownLease,
+      activeSlots: Number(ownLease.activeSlotsAtGrant || 1),
+    };
+  }
+  const forceStaleSweep = pollAttempt > 0 && pollAttempt % 20 === 0;
+  if (Date.now() < capacityFullUntil && !forceStaleSweep) {
+    return { lease: undefined, activeSlots: config.maxSlots };
+  }
+  return withGrantTurn(async () => {
+    const currentOwnLease = await readJsonFile(leasePath);
+    if (currentOwnLease) {
+      return {
+        lease: currentOwnLease,
+        activeSlots: Number(currentOwnLease.activeSlotsAtGrant || 1),
       };
-      await fsp.writeFile(v2RecordPath(leaseRoot, grant.waiterId), `${JSON.stringify(lease, null, 2)}\n`, "utf8");
-      await fsp.rm(v2RecordPath(waiterRoot, grant.waiterId), { force: true });
     }
-    return readJsonFile(v2RecordPath(leaseRoot, waiterId));
+    if (Date.now() < capacityFullUntil && !forceStaleSweep) {
+      return { lease: undefined, activeSlots: config.maxSlots };
+    }
+    const visibleLeases = await readJsonRecords(leaseRoot);
+    if (visibleLeases.length >= config.maxSlots && !forceStaleSweep) {
+      capacityFullUntil = Date.now() + 250;
+      return { lease: undefined, activeSlots: visibleLeases.length };
+    }
+    return withCoordinatorLock(async () => {
+      if (forceStaleSweep || Date.now() - lastGrantStaleRecoveryAt >= 5_000) {
+        await recoverStaleRecords();
+        lastGrantStaleRecoveryAt = Date.now();
+      }
+      const existing = await readJsonFile(leasePath);
+      if (existing) {
+        return {
+          lease: existing,
+          activeSlots: Number(existing.activeSlotsAtGrant || 1),
+        };
+      }
+
+      const waiters = await readJsonRecords(waiterRoot);
+      const leases = await readJsonRecords(leaseRoot);
+      const grants = selectCodexSlotGrants({ waiters, leases, maxSlots: config.maxSlots });
+      const now = new Date().toISOString();
+      const activeSlotsAtGrant = Math.min(config.maxSlots, leases.length + grants.length);
+      capacityFullUntil = activeSlotsAtGrant >= config.maxSlots ? Date.now() + 250 : 0;
+      let grantedOwnLease;
+      for (const grant of grants) {
+        const lease = {
+          protocolVersion: 2,
+          waiterId: grant.waiterId,
+          leaseId: randomUUID(),
+          fencingToken: randomUUID(),
+          pid: grant.pid,
+          taskClass: grant.taskClass,
+          taskId: String(grant.taskId || "unknown"),
+          slotNumber: grant.slotNumber,
+          requestedAt: grant.requestedAt,
+          acquiredAt: now,
+          heartbeatAt: now,
+          activeSlotsAtGrant,
+        };
+        await fsp.writeFile(v2RecordPath(leaseRoot, grant.waiterId), `${JSON.stringify(lease, null, 2)}\n`, "utf8");
+        await fsp.rm(v2RecordPath(waiterRoot, grant.waiterId), { force: true });
+        if (grant.waiterId === waiterId) grantedOwnLease = lease;
+      }
+      return {
+        lease: grantedOwnLease,
+        activeSlots: grantedOwnLease ? activeSlotsAtGrant : leases.length,
+      };
+    });
   });
+}
+
+async function withGrantTurn(callback) {
+  const previous = grantTurnTail;
+  let releaseTurn;
+  grantTurnTail = new Promise((resolve) => { releaseTurn = resolve; });
+  await previous;
+  try {
+    return await callback();
+  } finally {
+    releaseTurn();
+  }
 }
 
 async function recoverStaleRecords() {
@@ -241,6 +303,7 @@ async function withCoordinatorLock(callback) {
 
 async function acquireCoordinatorLock() {
   const startedAt = Date.now();
+  let attempt = 0;
   for (;;) {
     try {
       await fsp.mkdir(coordinatorLockPath);
@@ -252,7 +315,7 @@ async function acquireCoordinatorLock() {
       return async () => {
         if (released) return;
         released = true;
-        await removeWithRetry(coordinatorLockPath, { recursive: true, force: true });
+        await removeCodexCoordinatorPathWithRetry(coordinatorLockPath, { recursive: true, force: true });
       };
     } catch (error) {
       if (error?.code !== "EEXIST" && !isWindowsTransientError(error)) throw error;
@@ -260,13 +323,14 @@ async function acquireCoordinatorLock() {
       const stats = await fsp.stat(coordinatorLockPath).catch(() => undefined);
       const stale = stats && Date.now() - stats.mtimeMs > config.lockStaleMs;
       if (stale && !isProcessAlive(owner?.pid)) {
-        await removeWithRetry(coordinatorLockPath, { recursive: true, force: true });
+        await removeCodexCoordinatorPathWithRetry(coordinatorLockPath, { recursive: true, force: true });
         continue;
       }
       if (Date.now() - startedAt >= config.lockWaitMs) {
         throw new Error("Timed out acquiring the Codex CLI coordinator state lock");
       }
-      await delay(25);
+      await delay(coordinatorLockRetryDelay(attempt));
+      attempt += 1;
     }
   }
 }
@@ -296,18 +360,33 @@ async function readJsonFile(filePath, attempt = 0) {
   }
 }
 
-async function removeWithRetry(target, options, attempt = 0) {
+export async function removeCodexCoordinatorPathWithRetry(
+  target,
+  options,
+  remove = (targetPath, removeOptions) => fsp.rm(targetPath, removeOptions),
+  attempt = 0,
+) {
   try {
-    await fsp.rm(target, options);
+    await remove(target, options);
   } catch (error) {
     if (!isWindowsTransientError(error) || attempt >= 8) throw error;
     await delay(10 * (attempt + 1));
-    await removeWithRetry(target, options, attempt + 1);
+    await removeCodexCoordinatorPathWithRetry(target, options, remove, attempt + 1);
   }
 }
 
 function isWindowsTransientError(error) {
-  return ["EPERM", "EACCES", "EBUSY"].includes(error?.code);
+  return ["EPERM", "EACCES", "EBUSY", "ENOTEMPTY"].includes(error?.code);
+}
+
+function coordinatorPollDelay(baseMs, attempt) {
+  const boundedBase = Math.min(750, Math.max(25, baseMs) * (1.6 ** Math.min(attempt, 8)));
+  return Math.max(25, Math.round(boundedBase * (0.85 + Math.random() * 0.3)));
+}
+
+function coordinatorLockRetryDelay(attempt) {
+  const boundedBase = Math.min(40, 5 + attempt * 2);
+  return Math.max(5, Math.round(boundedBase * (0.8 + Math.random() * 0.4)));
 }
 
 function v2RecordPath(directory, recordId) {

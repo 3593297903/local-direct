@@ -152,3 +152,75 @@ test("stale-fence heartbeat and release are no-ops while a live owner is preserv
     await rm(rootDir, { recursive: true, force: true });
   }
 });
+
+test("100 physical coordinator callers finish with four slots and no leaked records", { timeout: 45_000 }, async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "localdirector-phase2r-slot-physical-"));
+  Object.assign(process.env, {
+    CODEX_CLI_SLOT_ROOT_DIR: rootDir,
+    CODEX_CLI_MAX_SLOTS: "4",
+    CODEX_CLI_SLOT_POLL_MS: "25",
+    CODEX_CLI_SLOT_LOCK_WAIT_MS: "10000",
+    CODEX_FAIR_SCHEDULER_V2: "1",
+  });
+  const coordinator = await import(`../scripts/codex-cli-slot-coordinator.mjs?physical=${Date.now()}`);
+  let active = 0;
+  let maxActive = 0;
+  let completed = 0;
+  let renderOutstanding = 75;
+  let activeNonOriginal = 0;
+  let maxNonOriginalWhileRenderOutstanding = 0;
+  const startedAt = Date.now();
+  try {
+    const calls = Array.from({ length: 100 }, (_, index) => {
+      const taskClass = index < 75 ? "render_pack" : "path_repair";
+      return coordinator.withCodexCliSlot(taskClass, `physical-${index}`, async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (taskClass !== "render_pack") {
+          activeNonOriginal += 1;
+          if (renderOutstanding > 0) {
+            maxNonOriginalWhileRenderOutstanding = Math.max(
+              maxNonOriginalWhileRenderOutstanding,
+              activeNonOriginal,
+            );
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (taskClass === "render_pack") renderOutstanding -= 1;
+        else activeNonOriginal -= 1;
+        active -= 1;
+        completed += 1;
+      });
+    });
+    const outcomes = await Promise.allSettled(calls);
+    const elapsedMs = Date.now() - startedAt;
+    const state = await coordinator.inspectCodexCliSlotState();
+    const rejected = outcomes.filter((outcome) => outcome.status === "rejected");
+    const lockTimeoutCount = rejected.filter((outcome) => /coordinator state lock/i.test(String(outcome.reason))).length;
+    assert.equal(rejected.length, 0, rejected.map((outcome) => String(outcome.reason)).join("\n"));
+    assert.equal(lockTimeoutCount, 0);
+    assert.equal(completed, 100);
+    assert.equal(maxActive, 4);
+    assert.ok(maxNonOriginalWhileRenderOutstanding <= 1);
+    assert.ok(elapsedMs < 45_000, `physical coordinator took ${elapsedMs}ms`);
+    assert.equal(state.waiters.length, 0);
+    assert.equal(state.leases.length, 0);
+  } finally {
+    delete process.env.CODEX_CLI_SLOT_ROOT_DIR;
+    delete process.env.CODEX_CLI_MAX_SLOTS;
+    delete process.env.CODEX_CLI_SLOT_POLL_MS;
+    delete process.env.CODEX_CLI_SLOT_LOCK_WAIT_MS;
+    delete process.env.CODEX_FAIR_SCHEDULER_V2;
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("Windows ENOTEMPTY coordinator removal is retried without leaking the lock", async () => {
+  const coordinator = await import(`../scripts/codex-cli-slot-coordinator.mjs?enotempty=${Date.now()}`);
+  let attempts = 0;
+  await coordinator.removeCodexCoordinatorPathWithRetry("unused", { recursive: true, force: true }, async () => {
+    attempts += 1;
+    if (attempts < 3) throw Object.assign(new Error("directory not empty"), { code: "ENOTEMPTY" });
+  });
+  assert.equal(attempts, 3);
+});
