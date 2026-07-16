@@ -231,7 +231,8 @@ export function compileSegmentContractForPrompt(
     const compactedFields = [
       "sourceText",
       "requiredEventsDisplayProse",
-      "executionInstructions",
+      "assetDisplayLocks",
+      "verboseExecutionInstructions",
     ];
     if (compactByteLength <= maxBytes) {
       return {
@@ -285,7 +286,7 @@ export function compileSegmentContractRenderBlock(
 ) {
   const compiled = compileSegmentContractForPrompt(contract, options);
   if (compiled.status === "invalid") {
-    throw new CodexPromptInputCompilerError(compiled.message);
+    return compileCompatibleSegmentContractRenderBlock(contract, options.maxBytes ?? CONTRACT_PROMPT_MAX_BYTES);
   }
   if (compiled.status === "overflow") {
     throw new CodexPromptInputCompilerError(
@@ -299,6 +300,112 @@ export function compileSegmentContractRenderBlock(
   };
 }
 
+function compileCompatibleSegmentContractRenderBlock(value: unknown, maxBytes: number) {
+  const contract = readCompatibilitySegmentContract(value);
+  const fullSections = buildContractProjectionSections(contract, false);
+  const fullText = joinContractProjectionSections(fullSections);
+  const fullByteLength = utf8ByteLength(fullText);
+  if (fullByteLength <= maxBytes) {
+    return { text: fullText, byteLength: fullByteLength, wasCompacted: false };
+  }
+
+  const compactSections = buildContractProjectionSections(contract, true);
+  const compactText = joinContractProjectionSections(compactSections);
+  const compactByteLength = utf8ByteLength(compactText);
+  if (compactByteLength > maxBytes) {
+    throw new CodexPromptInputCompilerError(
+      `Blocking event slots exceed the compact contract budget (${compactByteLength}/${maxBytes} UTF-8 bytes); split the segment or revise planning.`,
+    );
+  }
+  return { text: compactText, byteLength: compactByteLength, wasCompacted: true };
+}
+
+function readCompatibilitySegmentContract(value: unknown): SegmentContract {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CodexPromptInputCompilerError("Historical SegmentContract must be an object");
+  }
+  const record = value as Record<string, unknown>;
+  const segmentIndex = Number(record.segmentIndex);
+  const durationSeconds = Number(record.durationSeconds);
+  const shotCount = Number(record.shotCount);
+  if (!Number.isInteger(segmentIndex) || segmentIndex < 1) {
+    throw new CodexPromptInputCompilerError("Historical SegmentContract requires a positive segmentIndex");
+  }
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0 || durationSeconds > 15) {
+    throw new CodexPromptInputCompilerError("Historical SegmentContract requires a duration between 0 and 15 seconds");
+  }
+  if (!Number.isInteger(shotCount) || shotCount < 1) {
+    throw new CodexPromptInputCompilerError("Historical SegmentContract requires a positive shotCount");
+  }
+  for (const field of ["title", "sourceText"] as const) {
+    if (typeof record[field] !== "string" || !record[field].trim()) {
+      throw new CodexPromptInputCompilerError(`Historical SegmentContract requires non-empty ${field}`);
+    }
+  }
+  if (!isNonEmptyStringArray(record.requiredEvents)) {
+    throw new CodexPromptInputCompilerError("Historical SegmentContract requires non-empty requiredEvents");
+  }
+  if (!Array.isArray(record.requiredShotBeats) || !record.requiredShotBeats.length) {
+    throw new CodexPromptInputCompilerError("Historical SegmentContract requires non-empty requiredShotBeats");
+  }
+  for (const beat of record.requiredShotBeats) {
+    if (!beat || typeof beat !== "object") {
+      throw new CodexPromptInputCompilerError("Historical SegmentContract contains an invalid shot beat");
+    }
+    const beatRecord = beat as Record<string, unknown>;
+    if (!Number.isInteger(Number(beatRecord.shotNumber)) || Number(beatRecord.shotNumber) < 1) {
+      throw new CodexPromptInputCompilerError("Historical SegmentContract contains an invalid shot number");
+    }
+    if (![beatRecord.beat, beatRecord.visualFocus].some((item) => typeof item === "string" && item.trim())) {
+      throw new CodexPromptInputCompilerError("Historical SegmentContract contains an empty shot beat");
+    }
+  }
+
+  const requiredEventSlots = Array.isArray(record.requiredEventSlots) ? record.requiredEventSlots : [];
+  for (const item of requiredEventSlots) {
+    if (!item || typeof item !== "object") {
+      throw new CodexPromptInputCompilerError("Historical SegmentContract contains an invalid event slot");
+    }
+    const slot = item as Record<string, unknown>;
+    if (slot.importance !== "blocking") continue;
+    if (typeof slot.id !== "string" || !slot.id.trim() || typeof slot.label !== "string" || !slot.label.trim()) {
+      throw new CodexPromptInputCompilerError("Historical blocking event slots require id and label");
+    }
+    if (!isNonEmptyStringMatrix(slot.anchorGroups) || !isNonEmptyStringMatrix(slot.conceptGroups)) {
+      throw new CodexPromptInputCompilerError(`Historical blocking event slot ${slot.id} requires anchors and concepts`);
+    }
+    if (!Array.isArray(slot.contradictionGroups) || !slot.contradictionGroups.every(isStringArray)) {
+      throw new CodexPromptInputCompilerError(`Historical blocking event slot ${slot.id} has invalid contradictions`);
+    }
+    if (!Array.isArray(slot.evidenceSelectors) || !slot.evidenceSelectors.length) {
+      throw new CodexPromptInputCompilerError(`Historical blocking event slot ${slot.id} requires evidence selectors`);
+    }
+  }
+
+  const safetyPolicy = record.safetyPolicy && typeof record.safetyPolicy === "object"
+    ? record.safetyPolicy as Record<string, unknown>
+    : {};
+  return {
+    ...record,
+    contractSchemaVersion: Number(record.contractSchemaVersion) || 0,
+    coveragePolicyVersion: typeof record.coveragePolicyVersion === "string" ? record.coveragePolicyVersion : "historical",
+    sourceHash: typeof record.sourceHash === "string" ? record.sourceHash : "historical",
+    contractHash: typeof record.contractHash === "string" ? record.contractHash : "historical",
+    requiredEventSlots,
+    forbiddenFutureEvents: Array.isArray(record.forbiddenFutureEvents) ? record.forbiddenFutureEvents : [],
+    characterLocks: Array.isArray(record.characterLocks) ? record.characterLocks : [],
+    characters: Array.isArray(record.characters) ? record.characters : [],
+    locations: Array.isArray(record.locations) ? record.locations : [],
+    props: Array.isArray(record.props) ? record.props : [],
+    safetyPolicy: {
+      avoidTerms: Array.isArray(safetyPolicy.avoidTerms) ? safetyPolicy.avoidTerms : [],
+      rewriteHints: safetyPolicy.rewriteHints && typeof safetyPolicy.rewriteHints === "object" && !Array.isArray(safetyPolicy.rewriteHints)
+        ? safetyPolicy.rewriteHints
+        : {},
+    },
+  } as SegmentContract;
+}
+
 export function segmentContractToChineseRenderBlock(contract: SegmentContract) {
   return compileSegmentContractRenderBlock(contract).text;
 }
@@ -306,7 +413,7 @@ export function segmentContractToChineseRenderBlock(contract: SegmentContract) {
 function buildContractSemanticManifest(contract: SegmentContract): ContractSemanticManifest {
   const blockingSlots = (contract.requiredEventSlots || []).filter((slot) => slot.importance === "blocking");
   const rewriteHintEntries = Object.entries(contract.safetyPolicy?.rewriteHints || {})
-    .sort(([left], [right]) => left.localeCompare(right, "zh-CN"));
+    .sort(([left], [right]) => compareCodeUnits(left, right));
   return {
     manifestVersion: "segment-contract-semantic-v1",
     segmentIndex: contract.segmentIndex,
@@ -358,7 +465,7 @@ function buildContractProjectionSections(
     ? [
         "段落契约：",
         `第${contract.segmentIndex}段｜${compileCodexPromptText(contract.title)}｜${contract.durationSeconds}秒｜${contract.shotCount}镜头`,
-        `contractHash=${contract.contractHash}｜sourceHash=${contract.sourceHash}｜coverage=${contract.coveragePolicyVersion}`,
+        `v=${CONTRACT_PROMPT_COMPILER_VERSION}｜c=${contract.contractHash}｜s=${contract.sourceHash}｜p=${contract.coveragePolicyVersion}`,
       ].join("\n")
     : [
         "段落契约：",
@@ -408,8 +515,7 @@ function buildContractProjectionSections(
   const executionMetadata = compact
     ? [
         ...fallbackEvents,
-        ...assetLines,
-        "执行：镜头数量必须一致；事件槽需在允许路径表达；人物不得与锁定事实矛盾；不得提前透露后续信息。",
+        "镜头匹配；事件槽按路径表达；人物锁、禁透、安全。",
       ].join("\n")
     : [
         `本段原文（Render script 已独立携带，本处仅作契约核对）：${compileCodexPromptText(contract.sourceText)}`,
@@ -493,7 +599,7 @@ function formatGroupsExact(groups: string[][], fallback = "无") {
 
 function formatRewriteHintsExact(hints: Record<string, string>) {
   const entries = Object.entries(hints)
-    .sort(([left], [right]) => left.localeCompare(right, "zh-CN"))
+    .sort(([left], [right]) => compareCodeUnits(left, right))
     .map(([key, value]) => [compileCodexPromptText(key), compileCodexPromptText(value)] as const)
     .filter(([key, value]) => key && value);
   return entries.length ? ["合规替换方向：", ...entries.map(([key, value]) => `- ${key} -> ${value}`)] : [];
@@ -522,11 +628,27 @@ function stableSemanticStringify(value: unknown): string {
   if (value && typeof value === "object") {
     return `{${Object.entries(value as Record<string, unknown>)
       .filter(([, item]) => item !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => compareCodeUnits(left, right))
       .map(([key, item]) => `${JSON.stringify(key)}:${stableSemanticStringify(item)}`)
       .join(",")}}`;
   }
   return JSON.stringify(value) ?? "null";
+}
+
+function compareCodeUnits(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return isStringArray(value) && value.some((item) => item.trim().length > 0);
+}
+
+function isNonEmptyStringMatrix(value: unknown): value is string[][] {
+  return Array.isArray(value) && value.length > 0 && value.every(isNonEmptyStringArray);
 }
 
 function formatEvidenceSelectors(selectors: SegmentEvidenceSelector[]) {

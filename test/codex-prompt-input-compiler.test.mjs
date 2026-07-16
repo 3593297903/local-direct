@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import test from "node:test";
 
+import fixture20, {
+  FIXTURE_SHA256 as FIXTURE_20_SHA256,
+  computeFixtureHash as computeFixture20Hash,
+} from "./fixtures/batch-generation/batch-generation-20-segment.mjs";
+import fixture30, {
+  FIXTURE_SHA256 as FIXTURE_30_SHA256,
+  computeFixtureHash as computeFixture30Hash,
+} from "./fixtures/batch-generation/batch-generation-30-segment.mjs";
+
 process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({
   module: "commonjs",
   moduleResolution: "node",
@@ -23,6 +32,33 @@ const {
   buildSegmentContractHash,
   normalizeSegmentContract,
 } = require("../lib/batch-segment-contract.ts");
+const {
+  createRenderOperationDraft,
+} = require("../lib/batch-render-operation.ts");
+
+function normalizeProductionContract(contract) {
+  const raw = structuredClone(contract);
+  delete raw.sourceHash;
+  delete raw.contractHash;
+  return normalizeSegmentContract(raw, {
+    segmentIndex: raw.segmentIndex,
+    fallbackTitle: raw.title,
+    fallbackSourceText: raw.sourceText,
+    fallbackDurationSeconds: raw.durationSeconds,
+    fallbackShotCount: raw.shotCount,
+    forbiddenFutureEvents: raw.forbiddenFutureEvents,
+    coveragePolicyVersion: raw.coveragePolicyVersion,
+  });
+}
+
+function renderInputScriptForContract(contract) {
+  return [
+    contract.sourceText,
+    ...contract.characters.flatMap((item) => Object.values(item)),
+    ...contract.locations.flatMap((item) => Object.values(item)),
+    ...contract.props.flatMap((item) => Object.values(item)),
+  ].filter((value) => typeof value === "string" && value.trim()).join("\n");
+}
 
 function createContract(overrides = {}) {
   const contract = normalizeSegmentContract({
@@ -247,6 +283,96 @@ test("typed contract compiler returns schema and hash failures instead of throwi
   const hashResult = compileSegmentContractForPrompt(invalidHash);
   assert.equal(hashResult.status, "invalid");
   assert.equal(hashResult.errorCode, "CONTRACT_HASH_INVALID");
+});
+
+test("historical contracts remain compatibility-readable but authoritative compilation stays strict", () => {
+  const historical = structuredClone(createContract());
+  historical.contractHash = "sc_historical_identity";
+  delete historical.requiredEventSlots[0].repairTargets;
+  const before = structuredClone(historical);
+
+  const readable = compileSegmentContractRenderBlock(historical);
+  const strict = compileSegmentContractForPrompt(historical);
+
+  assert.match(readable.text, /verify_chat_record/);
+  assert.ok(readable.byteLength <= CONTRACT_PROMPT_MAX_BYTES);
+  assert.equal(strict.status, "invalid");
+  assert.deepEqual(historical, before);
+});
+
+test("production-shaped 20 and 30 contracts fit the strict budget without losing asset visibility", () => {
+  assert.equal(computeFixture20Hash(fixture20), FIXTURE_20_SHA256);
+  assert.equal(computeFixture30Hash(fixture30), FIXTURE_30_SHA256);
+
+  for (const fixture of [fixture20, fixture30]) {
+    const normalized = fixture.contracts.map(normalizeProductionContract);
+    const compiled = normalized.map((contract) => compileSegmentContractForPrompt(contract));
+    assert.equal(compiled.filter((item) => item.status === "invalid").length, 0);
+    assert.equal(compiled.filter((item) => item.status === "overflow").length, 0);
+    assert.equal(compiled.filter((item) => item.status === "ready" || item.status === "compacted").length, fixture.segmentCount);
+    assert.ok(Math.max(...compiled.map((item) => item.byteLength)) <= CONTRACT_PROMPT_MAX_BYTES);
+
+    normalized.forEach((contract, index) => {
+      const item = compiled[index];
+      assert.ok(item.status === "ready" || item.status === "compacted");
+      const modelInput = `${item.text}\n${renderInputScriptForContract(contract)}`;
+      for (const lock of [...contract.characters, ...contract.locations, ...contract.props]) {
+        assert.match(modelInput, new RegExp(lock.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      }
+      if (item.status === "compacted") {
+        assert.ok(item.compactedFields.includes("assetDisplayLocks"));
+        assert.ok(item.compactedFields.includes("verboseExecutionInstructions"));
+      }
+    });
+  }
+});
+
+test("contract projection and manifest do not depend on localeCompare", () => {
+  const contract = createContract({
+    safetyPolicy: {
+      avoidTerms: ["真实标识"],
+      rewriteHints: { "乙标识": "抽象乙标识", "甲标识": "抽象甲标识" },
+    },
+  });
+  const baseline = compileSegmentContractForPrompt(contract);
+  const originalLocaleCompare = String.prototype.localeCompare;
+  try {
+    String.prototype.localeCompare = function forbiddenLocaleCompare() {
+      throw new Error("localeCompare must not participate in contract identity");
+    };
+    const perturbed = compileSegmentContractForPrompt(contract);
+    assert.deepEqual(perturbed, baseline);
+  } finally {
+    String.prototype.localeCompare = originalLocaleCompare;
+  }
+});
+
+test("render operation identity does not depend on localeCompare", () => {
+  const input = {
+    batchId: "batch-locale-stability",
+    operationToken: "operation-locale-stability",
+    segmentIndexes: [2, 1],
+    sourceHash: "source-locale-stability",
+    contractHashes: { 2: "contract-b", 1: "contract-a" },
+    reconciliationContext: {
+      sourceText: "source",
+      segments: [
+        { episodeIndex: 1, title: "甲", sourceText: "甲", duration: "12s" },
+        { episodeIndex: 2, title: "乙", sourceText: "乙", duration: "12s" },
+      ],
+    },
+    now: "2026-07-16T00:00:00.000Z",
+  };
+  const baseline = createRenderOperationDraft(input);
+  const originalLocaleCompare = String.prototype.localeCompare;
+  try {
+    String.prototype.localeCompare = function forbiddenLocaleCompare() {
+      throw new Error("localeCompare must not participate in render operation identity");
+    };
+    assert.deepEqual(createRenderOperationDraft(input), baseline);
+  } finally {
+    String.prototype.localeCompare = originalLocaleCompare;
+  }
 });
 
 test("full and compact projections preserve the same blocking semantic manifest", () => {

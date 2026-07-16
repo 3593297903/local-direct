@@ -17,9 +17,11 @@ const {
   preflightSegmentContracts,
 } = require("../lib/batch-contract-preflight.ts");
 const {
-  buildSegmentContractHash,
-  buildSegmentContractSourceHash,
+  normalizeSegmentContract,
 } = require("../lib/batch-segment-contract.ts");
+const {
+  compileSegmentContractForPrompt,
+} = require("../lib/codex-prompt-input-compiler.ts");
 
 const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ZERO_CALLS = Object.freeze({
@@ -42,28 +44,35 @@ export async function runContractPreflightBenchmark({
   if (!Number.isInteger(iterations) || iterations < 1) throw new Error("iterations must be a positive integer");
   if (!Number.isInteger(warmups) || warmups < 0) throw new Error("warmups must be a non-negative integer");
 
-  const fixtureModule = await import(pathToFileURL(path.join(
-    taskRoot,
-    "test",
-    "fixtures",
-    "batch-generation",
-    "batch-generation-30-segment.mjs",
-  )).href);
-  const fixture = fixtureModule.default;
-  const fixtureHash = fixtureModule.computeFixtureHash(fixture);
-  if (fixtureHash !== fixtureModule.FIXTURE_SHA256) throw new Error("Phase 3 fixture integrity check failed");
-  if (fixture.contracts.length !== contracts) throw new Error("Phase 3 fixture contract count changed");
+  const fixtureSets = Object.fromEntries(await Promise.all([20, 30].map(async (segmentCount) => {
+    const module = await import(pathToFileURL(path.join(
+      taskRoot,
+      "test",
+      "fixtures",
+      "batch-generation",
+      `batch-generation-${segmentCount}-segment.mjs`,
+    )).href);
+    const fixture = module.default;
+    const fixtureHash = module.computeFixtureHash(fixture);
+    if (fixtureHash !== module.FIXTURE_SHA256) throw new Error(`Phase 3 ${segmentCount}-segment fixture integrity check failed`);
+    if (fixture.contracts.length !== segmentCount) throw new Error(`Phase 3 ${segmentCount}-segment fixture contract count changed`);
+    return [String(segmentCount), { fixture, fixtureHash }];
+  })));
 
-  const fixtureContractsBefore = hashJson(fixture.contracts);
-  const templateContract = fixture.contracts[0];
-  const items = Array.from({ length: contracts }, (_, index) => {
-    const currentContract = structuredClone(templateContract);
-    currentContract.segmentIndex = index + 1;
-    currentContract.title = `Contract Preflight Benchmark Segment ${index + 1}`;
-    currentContract.sourceHash = buildSegmentContractSourceHash(currentContract.sourceText);
-    currentContract.contractHash = buildSegmentContractHash(currentContract);
+  const fixtureContractsBefore = hashJson(Object.values(fixtureSets).map(({ fixture }) => fixture.contracts));
+  const normalizedSets = Object.fromEntries(Object.entries(fixtureSets).map(([segmentCount, { fixture }]) => [
+    segmentCount,
+    fixture.contracts.map(normalizeProductionContract),
+  ]));
+  const normalizedContractsBefore = hashJson(normalizedSets);
+  const representativeContractSets = Object.fromEntries(Object.entries(normalizedSets).map(([segmentCount, normalized]) => [
+    segmentCount,
+    summarizeRepresentativeContracts(fixtureSets[segmentCount], normalized),
+  ]));
+  const targetContracts = normalizedSets["30"];
+  const items = targetContracts.map((currentContract) => {
     return {
-      segmentIndex: index + 1,
+      segmentIndex: currentContract.segmentIndex,
       sourceText: currentContract.sourceText,
       contract: currentContract,
       shotCount: currentContract.shotCount,
@@ -105,15 +114,18 @@ export async function runContractPreflightBenchmark({
   for (let index = 0; index < iterations; index += 1) samples.push(runOnce());
 
   const sourceAfter = hashJson(items.map((item) => item.contract));
-  const fixtureContractsAfter = hashJson(fixture.contracts);
+  const fixtureContractsAfter = hashJson(Object.values(fixtureSets).map(({ fixture }) => fixture.contracts));
+  const normalizedContractsAfter = hashJson(normalizedSets);
   const timingsMs = summarize(samples);
   return {
     schemaVersion: 1,
     phase: "3",
     gitCommit: gitValue(taskRoot, ["rev-parse", "HEAD"]),
     branch: gitValue(taskRoot, ["branch", "--show-current"]),
-    fixtureId: fixture.fixtureId,
-    fixtureHash,
+    fixtureId: fixtureSets["30"].fixture.fixtureId,
+    fixtureHash: fixtureSets["30"].fixtureHash,
+    fixtureHashes: Object.fromEntries(Object.entries(fixtureSets).map(([segmentCount, item]) => [segmentCount, item.fixtureHash])),
+    representativeContractSets,
     contractSetDigest: sourceBefore,
     sourceFingerprint: await productionSourceFingerprint(taskRoot),
     contracts,
@@ -124,7 +136,11 @@ export async function runContractPreflightBenchmark({
     eligibleSegmentCount: lastSchedule.packs.reduce((total, pack) => total + pack.entries.length, 0),
     semanticDigest: referenceSemanticDigest,
     semanticDigestStable: true,
-    sourceMutationCount: sourceBefore === sourceAfter && fixtureContractsBefore === fixtureContractsAfter ? 0 : 1,
+    sourceMutationCount: sourceBefore === sourceAfter
+      && fixtureContractsBefore === fixtureContractsAfter
+      && normalizedContractsBefore === normalizedContractsAfter
+      ? 0
+      : 1,
     operationCountBeforePreflight: 0,
     canceledValidNeighbors: 0,
     tamperedQueueCreates: 0,
@@ -145,6 +161,15 @@ export async function runContractPreflightBenchmarkCli(argv = process.argv.slice
   if (report.metrics.attempts !== 30 || report.metrics.invalid !== 0) {
     throw new Error("Contract preflight benchmark did not accept all 30 deterministic contracts");
   }
+  for (const segmentCount of ["20", "30"]) {
+    const representative = report.representativeContractSets[segmentCount];
+    if (representative.statusHistogram.invalid !== 0
+      || representative.statusHistogram.overflow !== 0
+      || representative.statusHistogram.ready + representative.statusHistogram.compacted !== Number(segmentCount)
+      || representative.maxByteLength > 3_072) {
+      throw new Error(`Production-shaped ${segmentCount}-segment Contract set failed the 3072-byte gate`);
+    }
+  }
   if (report.sourceMutationCount !== 0 || !report.semanticDigestStable) {
     throw new Error("Contract preflight benchmark changed source semantics");
   }
@@ -152,6 +177,35 @@ export async function runContractPreflightBenchmarkCli(argv = process.argv.slice
   await writeJson(output, report);
   console.log(JSON.stringify({ output, p50: report.timingsMs.p50, p95: report.timingsMs.p95, cv: report.timingsMs.coefficientOfVariation }));
   return report;
+}
+
+function normalizeProductionContract(contract) {
+  const raw = structuredClone(contract);
+  delete raw.sourceHash;
+  delete raw.contractHash;
+  return normalizeSegmentContract(raw, {
+    segmentIndex: raw.segmentIndex,
+    fallbackTitle: raw.title,
+    fallbackSourceText: raw.sourceText,
+    fallbackDurationSeconds: raw.durationSeconds,
+    fallbackShotCount: raw.shotCount,
+    coveragePolicyVersion: raw.coveragePolicyVersion,
+    forbiddenFutureEvents: raw.forbiddenFutureEvents,
+  });
+}
+
+function summarizeRepresentativeContracts({ fixture, fixtureHash }, contracts) {
+  const compiled = contracts.map((contract) => compileSegmentContractForPrompt(contract));
+  const statusHistogram = { ready: 0, compacted: 0, invalid: 0, overflow: 0 };
+  for (const result of compiled) statusHistogram[result.status] += 1;
+  return {
+    fixtureId: fixture.fixtureId,
+    fixtureHash,
+    contractCount: contracts.length,
+    statusHistogram,
+    maxByteLength: Math.max(0, ...compiled.map((result) => Number(result.byteLength) || 0)),
+    semanticDigest: hashJson(compiled.map((result) => result.semanticManifest || null)),
+  };
 }
 
 function summarize(values) {

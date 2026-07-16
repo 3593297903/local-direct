@@ -745,6 +745,17 @@ test("phase-three contract benchmark runs the production preflight without mutat
   assert.equal(report.metrics.invalid, 0);
   assert.equal(report.semanticDigestStable, true);
   assert.equal(report.sourceMutationCount, 0);
+  for (const segmentCount of ["20", "30"]) {
+    const representative = report.representativeContractSets[segmentCount];
+    assert.equal(representative.contractCount, Number(segmentCount));
+    assert.equal(representative.statusHistogram.invalid, 0);
+    assert.equal(representative.statusHistogram.overflow, 0);
+    assert.equal(
+      representative.statusHistogram.ready + representative.statusHistogram.compacted,
+      Number(segmentCount),
+    );
+    assert.ok(representative.maxByteLength <= 3_072);
+  }
   assert.deepEqual(report.calls, {
     model: 0,
     judge: 0,
