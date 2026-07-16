@@ -64,7 +64,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed visual asset task ${task.id} for @${task.entityKey}.`);
   try {
-    await withCodexCliSlot("auxiliary", task.id, () => runCodex(task));
+    await withCodexCliSlot("visual_asset", task.id, () => runCodex(task));
     await assertOutputFile(task.outputPath);
     const logPath = codexLogPath(task);
     const completed = await completeTask(task, {

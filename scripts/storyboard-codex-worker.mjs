@@ -65,7 +65,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed storyboard panel ${task.id} for job ${task.jobId} (shot ${task.shotNumber}).`);
   try {
-    await withCodexCliSlot("auxiliary", task.id, () => runCodex(task));
+    await withCodexCliSlot("visual_asset", task.id, () => runCodex(task));
     await normalizePngToExpectedSize(task.outputPath, task.size);
     await assertOutputFile(task.outputPath, task.size);
     const metadata = await buildCompletionMetadata(task);

@@ -70,7 +70,7 @@ async function processTask(task) {
       "waiting_slot",
       { rootDir },
     );
-    await withCodexCliSlot("primary", task.id, async () => {
+    await withCodexCliSlot("season_pack", task.id, async () => {
       activeTask = await updateSeasonPackCodexJobStage(
         task.id,
         task.leaseId,

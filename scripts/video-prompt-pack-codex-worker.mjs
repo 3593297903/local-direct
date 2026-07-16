@@ -88,7 +88,7 @@ async function processTask(task) {
       "waiting_slot",
       { rootDir },
     );
-    await withCodexCliSlot("primary", task.id, async () => {
+    await withCodexCliSlot("render_pack", task.id, async () => {
       activeTask = await updateVideoPromptPackCodexJobStage(
         task.id,
         task.leaseId,

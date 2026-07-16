@@ -49,7 +49,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed prompt safety job ${task.id}.`);
   try {
-    await withCodexCliSlot("auxiliary", task.id, () => runCodex(task));
+    await withCodexCliSlot("safety_rewrite", task.id, () => runCodex(task));
     await assertOutputJson(task.outputPath);
     await completeTask(task);
     console.log(`Completed prompt safety job ${task.id}: ${task.outputPath}`);

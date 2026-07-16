@@ -58,7 +58,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed event coverage wave ${task.waveId}.`);
   try {
-    await withCodexCliSlot("auxiliary", task.id, () => runCodex(task));
+    await withCodexCliSlot("coverage_judge", task.id, () => runCodex(task));
     await assertDecisionsOnlyJson(task.outputPath, task);
     await postJson(`/api/event-coverage/jobs/${encodeURIComponent(task.id)}/complete`, { leaseId: task.leaseId });
     console.log(`Completed event coverage wave ${task.waveId}.`);

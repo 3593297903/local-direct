@@ -9,6 +9,6 @@ test("event coverage worker emits decisions only and defaults to one concurrent 
   assert.equal(pkg.scripts["event-coverage:codex-worker"], "node scripts/event-coverage-codex-worker.mjs");
   assert.match(worker, /EVENT_COVERAGE_CODEX_CONCURRENCY, 1/);
   assert.match(worker, /decisions-only/i);
-  assert.match(worker, /withCodexCliSlot\("auxiliary"/);
+  assert.match(worker, /withCodexCliSlot\("coverage_judge"/);
   assert.doesNotMatch(worker, /requestAnalysisWithContext/);
 });

@@ -68,7 +68,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed video prompt job ${task.id}.`);
   try {
-    await withCodexCliSlot("primary", task.id, () => runCodex(task));
+    await withCodexCliSlot("single_generation", task.id, () => runCodex(task));
     await assertOutputJson(task.outputPath, task);
     await completeTask(task);
     console.log(`Completed video prompt job ${task.id}: ${task.outputPath}`);

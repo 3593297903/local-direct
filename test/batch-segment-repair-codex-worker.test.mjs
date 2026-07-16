@@ -10,6 +10,6 @@ test("batch segment repair worker requests strict repairs-only JSON", () => {
   assert.match(source, /\/api\/batch-segment-repair\/jobs\/claim/);
   assert.match(source, /repairs-only/i);
   assert.match(source, /assertRepairPatchJson/);
-  assert.match(source, /withCodexCliSlot\("auxiliary"/);
+  assert.match(source, /withCodexCliSlot\("path_repair"/);
   assert.doesNotMatch(source, /complete video prompt result/i);
 });

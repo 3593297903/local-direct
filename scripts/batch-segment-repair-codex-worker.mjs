@@ -60,7 +60,7 @@ async function processTask(task) {
   console.log(`Claimed repairs-only job ${task.id}.`);
   let outputReady = false;
   try {
-    await withCodexCliSlot("auxiliary", task.id, () => runCodex(task));
+    await withCodexCliSlot("path_repair", task.id, () => runCodex(task));
     await assertRepairPatchJson(task.outputPath, task);
     outputReady = true;
     await postJson(`/api/batch-segment-repair/jobs/${encodeURIComponent(task.id)}/complete`, {
