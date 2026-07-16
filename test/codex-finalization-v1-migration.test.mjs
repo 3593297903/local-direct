@@ -7,12 +7,29 @@ import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { withAuthoritativeRenderPackInput } from "./helpers/authoritative-render-pack-fixture.mjs";
 
 process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({ module: "commonjs", moduleResolution: "node" });
 const require = createRequire(import.meta.url);
 require("ts-node/register/transpile-only");
 const { createSeasonPackCodexJob } = require("../lib/season-pack-codex-queue.ts");
-const { createVideoPromptPackCodexJob } = require("../lib/video-prompt-pack-codex-queue.ts");
+const videoPromptPackQueue = require("../lib/video-prompt-pack-codex-queue.ts");
+const { createVideoPromptPackCodexJob: createRawVideoPromptPackCodexJob } = videoPromptPackQueue;
+const { normalizeSegmentContract } = require("../lib/batch-segment-contract.ts");
+const { compileSegmentContractForPrompt } = require("../lib/codex-prompt-input-compiler.ts");
+
+async function createVideoPromptPackCodexJob(input, options) {
+  return createRawVideoPromptPackCodexJob(
+    withAuthoritativeRenderPackInput(input, {
+      normalizeSegmentContract,
+      compileSegmentContractForPrompt,
+    }),
+    options,
+  );
+}
+
+// The dynamically loaded migration module resolves this cached CommonJS export.
+videoPromptPackQueue.createVideoPromptPackCodexJob = createVideoPromptPackCodexJob;
 
 function makeTempRoot() {
   return path.join(os.tmpdir(), `localdirector-finalization-v1-migration-${Date.now()}-${Math.random().toString(16).slice(2)}`);

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import test from "node:test";
+import { withAuthoritativeRenderPackInput } from "./helpers/authoritative-render-pack-fixture.mjs";
 
 process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({ module: "commonjs", moduleResolution: "node" });
 const require = createRequire(import.meta.url);
@@ -13,9 +14,21 @@ const {
   getSeasonPackCodexJob,
 } = require("../lib/season-pack-codex-queue.ts");
 const {
-  createVideoPromptPackCodexJob,
+  createVideoPromptPackCodexJob: createRawVideoPromptPackCodexJob,
   getVideoPromptPackCodexJob,
 } = require("../lib/video-prompt-pack-codex-queue.ts");
+const { normalizeSegmentContract } = require("../lib/batch-segment-contract.ts");
+const { compileSegmentContractForPrompt } = require("../lib/codex-prompt-input-compiler.ts");
+
+async function createVideoPromptPackCodexJob(input, options) {
+  return createRawVideoPromptPackCodexJob(
+    withAuthoritativeRenderPackInput(input, {
+      normalizeSegmentContract,
+      compileSegmentContractForPrompt,
+    }),
+    options,
+  );
+}
 
 const STATUSES = ["pending", "running", "completed", "failed"];
 

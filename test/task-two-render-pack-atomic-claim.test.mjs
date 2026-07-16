@@ -4,6 +4,7 @@ import path from "node:path";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import test from "node:test";
+import { withAuthoritativeRenderPackInput } from "./helpers/authoritative-render-pack-fixture.mjs";
 
 process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({ module: "commonjs", moduleResolution: "node" });
 const require = createRequire(import.meta.url);
@@ -11,14 +12,26 @@ require("ts-node/register/transpile-only");
 const {
   claimNextVideoPromptPackCodexJob,
   completeVideoPromptPackCodexJob,
-  createVideoPromptPackCodexJob,
+  createVideoPromptPackCodexJob: createRawVideoPromptPackCodexJob,
   getVideoPromptPackCodexJob,
 } = require("../lib/video-prompt-pack-codex-queue.ts");
+const { normalizeSegmentContract } = require("../lib/batch-segment-contract.ts");
+const { compileSegmentContractForPrompt } = require("../lib/codex-prompt-input-compiler.ts");
 const {
   claimNextFileJob,
   finishRunningFileJob,
   putPendingFileJob,
 } = require("../lib/file-job-store.ts");
+
+async function createVideoPromptPackCodexJob(input, options) {
+  return createRawVideoPromptPackCodexJob(
+    withAuthoritativeRenderPackInput(input, {
+      normalizeSegmentContract,
+      compileSegmentContractForPrompt,
+    }),
+    options,
+  );
+}
 
 test("render pack create is idempotent and twenty concurrent claims produce one fenced lease", async () => {
   const rootDir = path.join(os.tmpdir(), `localdirector-render-claim-${Date.now()}-${Math.random().toString(16).slice(2)}`);
@@ -34,6 +47,21 @@ test("render pack create is idempotent and twenty concurrent claims produce one 
     }],
   };
   try {
+    const originalInput = structuredClone(input);
+    const adaptedOnce = withAuthoritativeRenderPackInput(input, {
+      normalizeSegmentContract,
+      compileSegmentContractForPrompt,
+    });
+    const adaptedTwice = withAuthoritativeRenderPackInput(input, {
+      normalizeSegmentContract,
+      compileSegmentContractForPrompt,
+    });
+    assert.deepEqual(input, originalInput);
+    assert.deepEqual(adaptedOnce, adaptedTwice);
+    await assert.rejects(
+      () => createRawVideoPromptPackCodexJob(input, { rootDir }),
+      (error) => error?.code === "CONTRACT_PREFLIGHT_REQUIRED",
+    );
     const creates = await Promise.all(Array.from({ length: 20 }, () =>
       createVideoPromptPackCodexJob(input, { rootDir })));
     const first = creates[0];
