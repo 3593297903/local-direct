@@ -64,7 +64,7 @@ test("dashboard can generate multiple project segments through a season pack job
   );
   assert.match(
     dashboardSource,
-    /renderPackJob\.result\?\.segments/,
+    /job\.result\?\.segments/,
   );
   assert.match(
     dashboardSource,
