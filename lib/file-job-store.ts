@@ -192,6 +192,26 @@ export async function getFileJob<T extends FileJobRecord>(rootDir: string, names
   return found.job;
 }
 
+export async function listFileJobsByStatus<T extends FileJobRecord>(
+  rootDir: string,
+  namespace: string,
+  status: FileJobStatus,
+) {
+  await ensureFileJobStore(rootDir, namespace);
+  const directory = stateDir(rootDir, namespace, status);
+  const entries = (await readdir(directory, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
+  const jobs: T[] = [];
+  for (const entry of entries) {
+    try {
+      jobs.push(await readJobFile<T>(path.join(directory, entry.name)));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return jobs;
+}
+
 export async function claimNextFileJob<T extends FileJobRecord>(
   rootDir: string,
   namespace: string,
@@ -200,6 +220,8 @@ export async function claimNextFileJob<T extends FileJobRecord>(
     runningTimeoutMs?: number;
     workerId?: string;
     canRecoverRunningJob?: (job: T) => boolean | Promise<boolean>;
+    resetRecoveredRunningJob?: (job: T) => T;
+    canClaimPendingJob?: (job: T) => boolean | Promise<boolean>;
     claimLeaseWriteOptions?: Omit<AtomicReplaceJsonOptions, "rootDir">;
   } = {},
 ) {
@@ -209,6 +231,7 @@ export async function claimNextFileJob<T extends FileJobRecord>(
     namespace,
     options.runningTimeoutMs,
     options.canRecoverRunningJob,
+    options.resetRecoveredRunningJob,
   );
   await recoverStaleClaimLocks(rootDir, namespace);
   const pendingDir = stateDir(rootDir, namespace, "pending");
@@ -222,6 +245,7 @@ export async function claimNextFileJob<T extends FileJobRecord>(
   candidates.sort((left, right) => direction * (Date.parse(left.job.createdAt) - Date.parse(right.job.createdAt)));
 
   for (const candidate of candidates) {
+    if (options.canClaimPendingJob && !(await options.canClaimPendingJob(candidate.job))) continue;
     const pendingPath = path.join(pendingDir, candidate.name);
     const runningPath = path.join(stateDir(rootDir, namespace, "running"), candidate.name);
     const claimLockPath = path.join(rootDir, namespace, "claim-locks", candidate.name.replace(/\.json$/, ""));
@@ -279,6 +303,49 @@ export async function readRunningFileJob<T extends FileJobRecord>(
     throw new Error("File job fencing token is stale or invalid");
   }
   return { job, runningPath };
+}
+
+export async function updateRunningFileJob<T extends FileJobRecord>(
+  rootDir: string,
+  namespace: string,
+  jobId: string,
+  leaseId: string,
+  fencingToken: number,
+  update: Partial<T> | ((current: T) => T),
+) {
+  const release = await acquireJobStateLock(rootDir, namespace, jobId);
+  try {
+    const runningPath = filePath(rootDir, namespace, "running", jobId);
+    let current: T;
+    try {
+      current = await readJobFile<T>(runningPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new FileJobLeaseError();
+      throw error;
+    }
+    if (current.status !== "running" || !leaseId || current.leaseId !== leaseId
+      || Number(current.fencingToken || 0) !== Number(fencingToken || 0)) {
+      throw new FileJobLeaseError();
+    }
+    const nextValue = typeof update === "function"
+      ? update(current)
+      : { ...current, ...update } as T;
+    const updated = {
+      ...nextValue,
+      id: current.id,
+      status: "running" as const,
+      leaseId: current.leaseId,
+      workerId: current.workerId,
+      attempt: current.attempt,
+      fencingToken: current.fencingToken,
+      heartbeatAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as T;
+    await writeJobFile(rootDir, runningPath, updated);
+    return updated;
+  } finally {
+    await release();
+  }
 }
 
 export async function finishRunningFileJob<T extends FileJobRecord>(
@@ -357,6 +424,7 @@ async function recoverStaleFileJobs<T extends FileJobRecord>(
   namespace: string,
   runningTimeoutMs = 0,
   canRecoverRunningJob?: (job: T) => boolean | Promise<boolean>,
+  resetRecoveredRunningJob?: (job: T) => T,
 ) {
   const runningDir = stateDir(rootDir, namespace, "running");
   const entries = (await readdir(runningDir, { withFileTypes: true }))
@@ -378,7 +446,10 @@ async function recoverStaleFileJobs<T extends FileJobRecord>(
       }
       const hasValidRunningLease = job.status === "running" && Boolean(job.leaseId);
       if (!hasValidRunningLease) {
-        const recovered = buildRecoveredPendingJob(job);
+        const recovered = applyRecoveredRunningJobReset(
+          buildRecoveredPendingJob(job),
+          resetRecoveredRunningJob,
+        );
         await writeJobFile(rootDir, runningPath, recovered);
         await renameWithRetry(runningPath, path.join(stateDir(rootDir, namespace, "pending"), entry.name));
         continue;
@@ -387,7 +458,10 @@ async function recoverStaleFileJobs<T extends FileJobRecord>(
       const heartbeatAt = Date.parse(job.heartbeatAt || job.startedAt || job.updatedAt);
       if (!Number.isFinite(heartbeatAt) || Date.now() - heartbeatAt < runningTimeoutMs) continue;
       if (canRecoverRunningJob && !(await canRecoverRunningJob(job))) continue;
-      const recovered = buildRecoveredPendingJob(job);
+      const recovered = applyRecoveredRunningJobReset(
+        buildRecoveredPendingJob(job),
+        resetRecoveredRunningJob,
+      );
       await writeJobFile(rootDir, runningPath, recovered);
       await renameWithRetry(runningPath, path.join(stateDir(rootDir, namespace, "pending"), entry.name));
     } finally {
@@ -428,6 +502,13 @@ function buildRecoveredPendingJob<T extends FileJobRecord>(job: T) {
     startedAt: undefined,
     updatedAt: new Date().toISOString(),
   } as T;
+}
+
+function applyRecoveredRunningJobReset<T extends FileJobRecord>(
+  job: T,
+  resetRecoveredRunningJob?: (job: T) => T,
+) {
+  return resetRecoveredRunningJob ? resetRecoveredRunningJob(job) : job;
 }
 
 async function recoverStaleClaimLocks(rootDir: string, namespace: string, staleMs = 60_000) {

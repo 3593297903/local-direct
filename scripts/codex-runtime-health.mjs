@@ -67,21 +67,29 @@ export async function validateCodexRuntime(options = {}) {
 export async function writeCodexWorkerHeartbeat({
   rootDir = process.cwd(),
   workerName,
+  workerInstanceId,
   health,
   heartbeatAt = new Date().toISOString(),
 }) {
   const runtimeRoot = path.join(path.resolve(rootDir), RUNTIME_DIR);
   await mkdir(path.join(runtimeRoot, WORKER_DIR), { recursive: true });
+  const normalizedWorkerInstanceId = workerInstanceId
+    ? normalizeWorkerInstanceId(workerInstanceId)
+    : undefined;
   const worker = {
     schemaVersion: 1,
     workerName: normalizeWorkerName(workerName),
+    ...(normalizedWorkerInstanceId ? { workerInstanceId: normalizedWorkerInstanceId } : {}),
     pid: process.pid,
     heartbeatAt,
     runtimeFingerprint: health.runtimeFingerprint,
     status: health.status,
     environment: health,
   };
-  await writeJsonAtomic(workerPath(runtimeRoot, worker.workerName, worker.pid), worker);
+  await writeJsonAtomic(
+    workerPath(runtimeRoot, worker.workerName, normalizedWorkerInstanceId || worker.pid),
+    worker,
+  );
   return worker;
 }
 
@@ -95,10 +103,18 @@ export async function writeCodexRuntimeEnvironmentHealth({
   return health;
 }
 
-export async function readCodexRuntimeHealth({ rootDir = process.cwd(), workerName = "season-pack" } = {}) {
+export async function readCodexRuntimeHealth({
+  rootDir = process.cwd(),
+  workerName = "season-pack",
+  workerInstanceId,
+} = {}) {
   const runtimeRoot = path.join(path.resolve(rootDir), RUNTIME_DIR);
   const normalizedWorkerName = normalizeWorkerName(workerName);
-  const worker = await readLatestWorkerHeartbeat(runtimeRoot, normalizedWorkerName);
+  const worker = await readLatestWorkerHeartbeat(
+    runtimeRoot,
+    normalizedWorkerName,
+    workerInstanceId ? normalizeWorkerInstanceId(workerInstanceId) : undefined,
+  );
   return {
     environment: worker?.environment || await readJsonOrNull(path.join(runtimeRoot, ENVIRONMENT_FILE)),
     worker,
@@ -109,12 +125,15 @@ export async function startCodexWorkerRuntimeHealth(workerName, options = {}) {
   const rootDir = path.resolve(options.rootDir || process.cwd());
   const heartbeatMs = positiveInteger(options.heartbeatMs, DEFAULT_HEARTBEAT_MS);
   const revalidateMs = positiveInteger(options.revalidateMs, DEFAULT_REVALIDATE_MS);
+  const workerInstanceId = options.workerInstanceId
+    ? normalizeWorkerInstanceId(options.workerInstanceId)
+    : undefined;
   let currentHealth = await validateCodexRuntime(options);
-  await writeCodexWorkerHeartbeat({ rootDir, workerName, health: currentHealth });
+  await writeCodexWorkerHeartbeat({ rootDir, workerName, workerInstanceId, health: currentHealth });
   if (currentHealth.status !== "healthy") throw new CodexRuntimeInvalidError(currentHealth);
 
   const heartbeatTimer = setInterval(() => {
-    writeCodexWorkerHeartbeat({ rootDir, workerName, health: currentHealth }).catch((error) => {
+    writeCodexWorkerHeartbeat({ rootDir, workerName, workerInstanceId, health: currentHealth }).catch((error) => {
       console.error(`Codex runtime heartbeat failed for ${workerName}:`, error);
     });
   }, heartbeatMs);
@@ -123,7 +142,7 @@ export async function startCodexWorkerRuntimeHealth(workerName, options = {}) {
   const validationTimer = setInterval(async () => {
     try {
       currentHealth = await validateCodexRuntime(options);
-      await writeCodexWorkerHeartbeat({ rootDir, workerName, health: currentHealth });
+      await writeCodexWorkerHeartbeat({ rootDir, workerName, workerInstanceId, health: currentHealth });
     } catch (error) {
       console.error(`Codex runtime revalidation failed for ${workerName}:`, error);
     }
@@ -131,6 +150,7 @@ export async function startCodexWorkerRuntimeHealth(workerName, options = {}) {
   validationTimer.unref();
 
   return {
+    workerInstanceId: workerInstanceId || null,
     assertHealthy() {
       if (currentHealth.status !== "healthy") throw new CodexRuntimeInvalidError(currentHealth);
     },
@@ -224,11 +244,19 @@ function normalizeWorkerName(value) {
   return workerName;
 }
 
-function workerPath(runtimeRoot, workerName, pid) {
-  return path.join(runtimeRoot, WORKER_DIR, `${workerName}.${pid}.json`);
+function normalizeWorkerInstanceId(value) {
+  const workerInstanceId = String(value || "").trim().toLowerCase();
+  if (!workerInstanceId || !/^[a-z0-9][a-z0-9._-]{0,159}$/.test(workerInstanceId)) {
+    throw new Error("Invalid Codex worker instance ID");
+  }
+  return workerInstanceId;
 }
 
-async function readLatestWorkerHeartbeat(runtimeRoot, workerName) {
+function workerPath(runtimeRoot, workerName, instanceKey) {
+  return path.join(runtimeRoot, WORKER_DIR, `${workerName}.${instanceKey}.json`);
+}
+
+async function readLatestWorkerHeartbeat(runtimeRoot, workerName, workerInstanceId) {
   const workerRoot = path.join(runtimeRoot, WORKER_DIR);
   const candidates = [];
   try {
@@ -237,7 +265,10 @@ async function readLatestWorkerHeartbeat(runtimeRoot, workerName) {
       if (fileName !== `${workerName}.json` && !fileName.startsWith(`${workerName}.`)) continue;
       if (!fileName.endsWith(".json")) continue;
       const worker = await readJsonOrNull(path.join(workerRoot, fileName));
-      if (worker?.workerName === workerName) candidates.push(worker);
+      if (
+        worker?.workerName === workerName
+        && (!workerInstanceId || worker.workerInstanceId === workerInstanceId)
+      ) candidates.push(worker);
     }
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;

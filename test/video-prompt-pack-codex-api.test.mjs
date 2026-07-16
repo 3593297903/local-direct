@@ -20,6 +20,9 @@ test("video prompt render pack API exposes create, poll, claim, complete, and fa
   assert.match(createRoute, /segments/);
   assert.match(createRoute, /episodeIndex/);
   assert.match(createRoute, /renderInputScript/);
+  assert.match(createRoute, /assertCodexFinalizationV2CreateEnabled/);
+  assert.match(createRoute, /FINALIZATION_V2_CREATE_PAUSED/);
+  assert.match(createRoute, /status:\s*503/);
 
   const claimRoute = readFileSync(routes[2], "utf8");
   assert.match(claimRoute, /claimNextVideoPromptPackCodexJob/);
@@ -46,4 +49,8 @@ test("video prompt render pack worker runs bounded concurrent pack tasks", () =>
   assert.match(worker, /Promise\.race\(activeTasks\)/);
   assert.match(worker, /\/api\/video-prompt-packs\/jobs\/claim/);
   assert.match(worker, /Do not use 同上/);
+  assert.match(worker, /child\.on\("close"/);
+  assert.doesNotMatch(worker, /child\.on\("exit"/);
+  assert.match(worker, /finalizeVideoPromptPackCodexJobFiles/);
+  assert.match(worker, /resultRef/);
 });

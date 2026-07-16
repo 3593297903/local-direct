@@ -21,4 +21,14 @@ test("season pack Codex worker invokes one codex exec and reports job status", (
   assert.match(source, /assertSeasonPackOutput/);
   assert.match(source, /manifestPath/);
   assert.match(source, /episodesDir/);
+  assert.match(source, /finalizeSeasonPackCodexJobFiles/);
+  assert.match(source, /updateSeasonPackCodexJobStage/);
+  assert.match(source, /child\.on\("close"/);
+  assert.doesNotMatch(source, /child\.on\("exit"/);
+  assert.match(source, /resultRef/);
+  assert.match(source, /errorCode/);
+  assert.match(source, /class WorkerRequestError extends Error/);
+  assert.match(source, /let outputReady = false/);
+  assert.match(source, /if \(outputReady\)/);
+  assert.match(source, /JOB_STORAGE_BUSY/);
 });

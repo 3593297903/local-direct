@@ -1,10 +1,20 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
 import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
 import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
 import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
+
+process.env.TS_NODE_COMPILER_OPTIONS ||= JSON.stringify({ module: "commonjs", moduleResolution: "node" });
+const require = createRequire(import.meta.url);
+require("ts-node/register/transpile-only");
+const {
+  finalizeVideoPromptPackCodexJobFiles,
+  updateVideoPromptPackCodexJobStage,
+} = require("../lib/video-prompt-pack-codex-queue.ts");
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.VIDEO_PROMPT_PACK_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -13,14 +23,16 @@ const idleLogMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_IDLE_LOG_M
 const taskTimeoutMs = positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_TASK_TIMEOUT_MS, 30 * 60_000);
 const concurrency = Math.max(1, Math.min(4, positiveInteger(process.env.VIDEO_PROMPT_PACK_CODEX_CONCURRENCY, 4)));
 const workerToken = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_TOKEN || "";
-const workerId = process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_ID || `video-prompt-pack-${process.pid}`;
+const workerInstanceId = `${
+  process.env.VIDEO_PROMPT_PACK_CODEX_WORKER_ID?.trim() || `video-prompt-pack-${process.pid}`
+}-${randomUUID()}`.toLowerCase();
 const messageDir = path.join(rootDir, ".tmp-video-prompt-pack-codex", "codex-messages");
 const workerLock = await acquireWorkerFleetLock("video-prompt-pack-worker", { rootDir });
 if (!workerLock.acquired) {
   console.log(`Video prompt Render Pack worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
   process.exit(0);
 }
-const runtimeHealth = await startCodexWorkerRuntimeHealth("video-prompt-pack", { rootDir });
+const runtimeHealth = await startCodexWorkerRuntimeHealth("video-prompt-pack", { rootDir, workerInstanceId });
 installWorkerShutdown(workerLock);
 
 console.log("Local Director video prompt Render Pack Codex worker started.");
@@ -69,22 +81,49 @@ async function processTask(task) {
   console.log(`Claimed video prompt Render Pack job ${task.id} (${task.segments?.length || 0} segments).`);
   let outputReady = false;
   try {
-    await withCodexCliSlot("primary", task.id, () => runCodex(task));
-    await assertOutputJsonFiles(task);
+    let activeTask = await updateVideoPromptPackCodexJobStage(
+      task.id,
+      task.leaseId,
+      task.fencingToken,
+      "waiting_slot",
+      { rootDir },
+    );
+    await withCodexCliSlot("primary", task.id, async () => {
+      activeTask = await updateVideoPromptPackCodexJobStage(
+        task.id,
+        task.leaseId,
+        task.fencingToken,
+        "executing",
+        { rootDir },
+      );
+      await runCodex(activeTask);
+    });
+    activeTask = await updateVideoPromptPackCodexJobStage(
+      task.id,
+      task.leaseId,
+      task.fencingToken,
+      "finalizing",
+      { rootDir },
+    );
+    const finalized = await finalizeVideoPromptPackCodexJobFiles(activeTask, {
+      rootDir,
+      codexExitCode: 0,
+    });
     outputReady = true;
-    await completeTask(task);
+    await completeTask(activeTask, finalized.resultRef);
     console.log(`Completed video prompt Render Pack job ${task.id}.`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (error?.errorCode === "JOB_LEASE_LOST") {
+    const errorCode = typeof error?.code === "string" ? error.code : error?.errorCode;
+    if (errorCode === "JOB_LEASE_LOST" || errorCode === "FINALIZATION_STALE_FENCE") {
       console.warn(`Discarded stale Render Pack lease for ${task.id}; a newer worker owns the job.`);
       return;
     }
-    if (outputReady && isTransientWorkerRequestError(error)) {
+    if (outputReady) {
       console.warn(`Render Pack output for ${task.id} is complete; completion will be reconciled from disk: ${message}`);
       return;
     }
-    await failTask(task, message).catch((failError) => {
+    await failTask(task, message, errorCode).catch((failError) => {
       console.error(`Could not report failed video prompt Render Pack job ${task.id}:`, failError);
     });
     console.error(`Video prompt Render Pack job ${task.id} failed: ${message}`);
@@ -96,18 +135,20 @@ async function claimTask() {
   return data.task || null;
 }
 
-async function completeTask(task) {
+async function completeTask(task, resultRef) {
   await postJson(`/api/video-prompt-packs/jobs/${encodeURIComponent(task.id)}/complete`, {
     leaseId: task.leaseId,
     fencingToken: task.fencingToken,
+    resultRef,
   });
 }
 
-async function failTask(task, message) {
+async function failTask(task, message, errorCode) {
   await postJson(`/api/video-prompt-packs/jobs/${encodeURIComponent(task.id)}/fail`, {
     leaseId: task.leaseId,
     fencingToken: task.fencingToken,
     message,
+    errorCode,
   });
 }
 
@@ -121,7 +162,7 @@ async function postJson(pathname, body) {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-worker-id": workerId,
+          "x-worker-id": workerInstanceId,
           ...(workerToken ? { "x-video-prompt-pack-codex-token": workerToken } : {}),
         },
         body: JSON.stringify(body),
@@ -138,7 +179,7 @@ async function postJson(pathname, body) {
       response.status,
       response.status >= 500,
     );
-    if (requestError.errorCode !== "JOB_STORAGE_BUSY" || attempt === retryDelaysMs.length - 1) {
+    if (!requestError.transient || attempt === retryDelaysMs.length - 1) {
       throw requestError;
     }
   }
@@ -153,10 +194,6 @@ class WorkerRequestError extends Error {
     this.status = status;
     this.transient = transient || errorCode === "JOB_STORAGE_BUSY";
   }
-}
-
-function isTransientWorkerRequestError(error) {
-  return error instanceof WorkerRequestError && error.transient;
 }
 
 function buildCodexPrompt(task) {
@@ -220,7 +257,7 @@ async function runCodex(task) {
       clearTimeout(timeout);
       reject(new Error(buildCodexFailureMessage(error.message, capturedOutput)));
     });
-    child.on("exit", (code) => {
+    child.on("close", (code) => {
       clearTimeout(timeout);
       if (timedOut) return;
       if (code === 0) resolve();
@@ -229,30 +266,8 @@ async function runCodex(task) {
   });
 }
 
-async function assertOutputJsonFiles(task) {
-  for (const segment of task.segments || []) {
-    const fileStat = await fsp.stat(segment.outputPath);
-    if (!fileStat.isFile() || fileStat.size <= 0) {
-      throw new Error(`Codex did not produce a valid segment JSON file: ${segment.outputPath}`);
-    }
-    const result = JSON.parse(stripJsonBom(await fsp.readFile(segment.outputPath, "utf8")));
-    if (!result || typeof result !== "object") throw new Error(`Codex output JSON is not an object: ${segment.outputPath}`);
-    if (typeof result.optimizedScript !== "string") throw new Error(`Codex output JSON is missing optimizedScript: ${segment.outputPath}`);
-    if (!result.workflow || typeof result.workflow.fullVideoPrompt !== "string") {
-      throw new Error(`Codex output JSON is missing workflow.fullVideoPrompt: ${segment.outputPath}`);
-    }
-    if (!Array.isArray(result.storyboard) || result.storyboard.length < 1) {
-      throw new Error(`Codex output JSON is missing storyboard: ${segment.outputPath}`);
-    }
-  }
-}
-
 function codexMessagePath(task) {
   return path.join(messageDir, `${safeFileName(task.id)}.txt`);
-}
-
-function stripJsonBom(value) {
-  return value.charCodeAt(0) === 0xfeff ? value.slice(1) : value;
 }
 
 function logIdle() {

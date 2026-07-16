@@ -8,6 +8,12 @@ export const runtime = "nodejs";
 const RequestSchema = z.object({
   leaseId: z.string().uuid(),
   fencingToken: z.number().int().positive(),
+  resultRef: z.object({
+    protocolVersion: z.literal(2),
+    resultHash: z.string().regex(/^[a-f0-9]{64}$/),
+    relativePath: z.string().min(1),
+    manifestRelativePath: z.string().min(1),
+  }),
 });
 
 function isWorkerAuthorized(request: Request) {
@@ -23,8 +29,8 @@ export async function POST(request: Request, context: { params: Promise<{ jobId:
 
   try {
     const params = await context.params;
-    const { leaseId, fencingToken } = RequestSchema.parse(await request.json());
-    const job = await completeVideoPromptPackCodexJob(params.jobId, leaseId, fencingToken);
+    const { leaseId, fencingToken, resultRef } = RequestSchema.parse(await request.json());
+    const job = await completeVideoPromptPackCodexJob(params.jobId, leaseId, fencingToken, resultRef);
     return NextResponse.json({ ok: true, job });
   } catch (error: any) {
     return fileJobRouteError(error, "Video prompt render pack Codex job completion failed");
