@@ -711,6 +711,7 @@ async function createPhaseThreeAcceptanceFixture() {
   } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
   const taskCommit = "a".repeat(40);
   const baselineCommit = "b".repeat(40);
+  const sourceFingerprint = "805aa2b46f96d33fd89c5fa4a82a8d7390bde1983c0f62139a988e0d2a78a237";
   const replay20 = replayFixture(fixture20);
   const replay30 = replayFixture(fixture30);
   const zeroCalls = {
@@ -731,8 +732,12 @@ async function createPhaseThreeAcceptanceFixture() {
       needsReview: 0,
       localPatchOperations,
       promptLengths: { min: 1_800 },
+      missingRequiredFields: 0,
+      changedUnmatchedPaths: 0,
     },
     extensions: {
+      adapterVersion: FROZEN_DASHBOARD_ADAPTER_VERSION,
+      productionSourceFingerprint: sourceFingerprint,
       canonicalPromptHashes,
       localPatchOperations,
       queueScanStatus: "skipped_unchanged_scope",
@@ -746,18 +751,22 @@ async function createPhaseThreeAcceptanceFixture() {
     }])),
     timingsMs: { full_local_pipeline_total: { p50: 10, p95: 12, coefficientOfVariation: 0.1 } },
     comparison: { full_local_pipeline_total: { p50Ratio: 1, p95Ratio: 1 } },
+    assertionDiagnostics: {
+      invariants: { passed: true, error: null },
+      quality: { passed: true, error: null },
+    },
     environment: { queueScan: "skipped" },
   });
   const fixture = {
     taskCommit,
     baselineCommit,
-    sourceFingerprint: "e".repeat(64),
+    sourceFingerprint,
     reports: {
       contractPreflight: {
         schemaVersion: 1,
         ...createPhaseThreeContractTimingFixture(),
         gitCommit: taskCommit,
-        sourceFingerprint: "e".repeat(64),
+        sourceFingerprint,
         contracts: 30,
         iterations: 1000,
         metrics: { attempts: 30, invalid: 0 },
@@ -1254,6 +1263,71 @@ test("phase-three finalizer verifies top-level paired timing and performance acc
   for (const pair of report.pairedTimingEvidence.rawPairs) pair.taskMs = pair.baselineMs * 1.06;
   assert.equal(evaluatePhaseThreeAcceptance(concealedRegression).status, "rejected", "concealed regression");
 });
+
+test("phase-three finalizer accepts independently aggregated nonconstant quality evidence", async () => {
+  const {
+    evaluatePairedQualityPerformance,
+    summarizePairedQualityTimingTrials,
+  } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const {
+    evaluatePhaseThreeAcceptance,
+    inspectPairedQualityTimingEvidence,
+  } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = await createPhaseThreeAcceptanceFixture();
+  const report = valid.reports.benchmark20;
+  const pairs = createPairedQualityTimingPairs({
+    baselineForPair: (pairIndex) => pairIndex,
+  });
+  const pairedTimingEvidence = summarizePairedQualityTimingTrials(pairs, {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  });
+  const baselineAggregate = summarizeNumericSamples(pairs.map((pair) => pair.baselineMs));
+  const taskAggregate = summarizeNumericSamples(pairs.map((pair) => pair.taskMs));
+  report.pairedTimingEvidence = pairedTimingEvidence;
+  report.baseline.timingsMs.full_local_pipeline_total = { ...baselineAggregate };
+  report.timingsMs.full_local_pipeline_total = { ...taskAggregate };
+  report.comparison.full_local_pipeline_total = {
+    baselineP50: baselineAggregate.p50,
+    baselineP95: baselineAggregate.p95,
+    taskP50: taskAggregate.p50,
+    taskP95: taskAggregate.p95,
+    p50Ratio: taskAggregate.p50 / baselineAggregate.p50,
+    p95Ratio: taskAggregate.p95 / baselineAggregate.p95,
+  };
+  report.performanceAcceptance = evaluatePairedQualityPerformance({
+    comparison: report.comparison,
+    pairedTimingEvidence,
+    invariantPassed: true,
+    qualityPassed: true,
+  });
+
+  const inspection = inspectPairedQualityTimingEvidence(report);
+  assert.equal(inspection.rawSummaryIntegrity, true);
+  assert.equal(inspection.comparisonIntegrity, true);
+  assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
+});
+
+for (const [label, mutate] of [
+  ["missing assertion diagnostics", (report) => { delete report.assertionDiagnostics; }],
+  ["failed invariant assertion", (report) => { report.assertionDiagnostics.invariants.passed = false; }],
+  ["invariant assertion error", (report) => { report.assertionDiagnostics.invariants.error = "invariant failed"; }],
+  ["failed quality assertion", (report) => { report.assertionDiagnostics.quality.passed = false; }],
+  ["quality assertion error", (report) => { report.assertionDiagnostics.quality.error = "quality failed"; }],
+  ["forged accepted performance", (report) => { report.assertionDiagnostics.invariants.passed = false; }],
+  ["wrong adapter version", (report) => { report.extensions.adapterVersion = "frozen-dashboard-local-v1"; }],
+  ["wrong production fingerprint", (report) => { report.extensions.productionSourceFingerprint = "0".repeat(64); }],
+  ["non-sha production fingerprint", (report) => { report.extensions.productionSourceFingerprint = "not-a-sha"; }],
+  ["missing required fields", (report) => { report.quality.missingRequiredFields = 1; }],
+  ["changed unmatched paths", (report) => { report.quality.changedUnmatchedPaths = 1; }],
+]) {
+  test(`phase-three finalizer rejects ${label}`, async () => {
+    const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+    const forged = await createPhaseThreeAcceptanceFixture();
+    mutate(forged.reports.benchmark20);
+    assert.equal(evaluatePhaseThreeAcceptance(forged).status, "rejected");
+  });
+}
 
 test("phase-three finalizer accepts common-mode raw variance but rejects every paired hard gate", async () => {
   const {

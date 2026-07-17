@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PHASE_THREE_START_COMMIT = "de4443c09cbf34bc68bf8dbb0123391376025d47";
+const EXPECTED_QUALITY_ADAPTER_VERSION = "frozen-dashboard-local-v2";
+const EXPECTED_PRODUCTION_SOURCE_FINGERPRINT = "805aa2b46f96d33fd89c5fa4a82a8d7390bde1983c0f62139a988e0d2a78a237";
 const EXPECTED_FIXTURES = Object.freeze({
   20: Object.freeze({
     fixtureHash: "4b65de1642f5d7cf318f14f818116a16dd4a1460b4269f4bb3b2f84c330706b3",
@@ -112,8 +114,8 @@ export function evaluatePhaseThreeAcceptance(input) {
 
   checks.push(...contractPreflightChecks(reports.contractPreflight, taskCommit, sourceFingerprint));
   checks.push(...lifecycleChecks(reports.lifecycle));
-  checks.push(...qualityChecks(reports.benchmark20, 20, taskCommit, baselineCommit));
-  checks.push(...qualityChecks(reports.benchmark30, 30, taskCommit, baselineCommit));
+  checks.push(...qualityChecks(reports.benchmark20, 20, taskCommit, baselineCommit, sourceFingerprint));
+  checks.push(...qualityChecks(reports.benchmark30, 30, taskCommit, baselineCommit, sourceFingerprint));
 
   const mergeCommand = commands.find((command) => command?.commandId === "git-merge-tree");
   const changedFiles = Array.isArray(git.changedFiles) ? git.changedFiles : [];
@@ -399,7 +401,7 @@ function lifecycleChecks(report) {
   ];
 }
 
-function qualityChecks(report, count, taskCommit, baselineCommit) {
+function qualityChecks(report, count, taskCommit, baselineCommit, sourceFingerprint) {
   const expected = EXPECTED_FIXTURES[count];
   const canonicalHashes = report?.extensions?.canonicalPromptHashes;
   const digest = Array.isArray(canonicalHashes) ? hashJson(canonicalHashes) : null;
@@ -410,9 +412,17 @@ function qualityChecks(report, count, taskCommit, baselineCommit) {
     check(`quality${count}.gitCommit`, report?.gitCommit === taskCommit),
     check(`quality${count}.baselineCommit`, report?.baseline?.gitCommit === baselineCommit),
     check(`quality${count}.fixtureHash`, report?.fixtureHash === expected.fixtureHash),
+    check(`quality${count}.adapterVersion`, report?.extensions?.adapterVersion === EXPECTED_QUALITY_ADAPTER_VERSION),
+    check(
+      `quality${count}.productionSourceFingerprint`,
+      sourceFingerprint === EXPECTED_PRODUCTION_SOURCE_FINGERPRINT
+        && report?.extensions?.productionSourceFingerprint === sourceFingerprint,
+    ),
     check(`quality${count}.accepted`, report?.quality?.accepted === count),
     check(`quality${count}.blocked`, report?.quality?.blocked === 0),
     check(`quality${count}.needsReview`, report?.quality?.needsReview === 0),
+    check(`quality${count}.missingRequiredFields`, report?.quality?.missingRequiredFields === 0),
+    check(`quality${count}.changedUnmatchedPaths`, report?.quality?.changedUnmatchedPaths === 0),
     check(`quality${count}.promptFloor`, Number(report?.quality?.promptLengths?.min) >= 900),
     check(`quality${count}.patches`, report?.extensions?.localPatchOperations === expected.localPatchOperations),
     check(`quality${count}.canonicalCount`, Array.isArray(canonicalHashes) && canonicalHashes.length === count),
@@ -437,6 +447,8 @@ function qualityChecks(report, count, taskCommit, baselineCommit) {
     check(`quality${count}.pairedMeanRatio`, paired.pairedMeanRatio),
     check(`quality${count}.pairedRatioCv`, paired.pairedRatioCv),
     check(`quality${count}.maxTrialRatio`, paired.maxTrialRatio),
+    check(`quality${count}.invariantAssertion`, paired.invariantAssertion),
+    check(`quality${count}.noRegressionAssertion`, paired.noRegressionAssertion),
     check(`quality${count}.performanceAcceptance`, paired.performanceAcceptance),
   ];
 }
@@ -469,8 +481,17 @@ export function inspectPairedQualityTimingEvidence(report) {
   } : null;
   const actualComparison = report?.comparison?.full_local_pipeline_total;
   const stability = evidence?.stability;
+  const invariantAssertion = report?.assertionDiagnostics?.invariants?.passed === true
+    && report?.assertionDiagnostics?.invariants?.error === null;
+  const noRegressionAssertion = report?.assertionDiagnostics?.quality?.passed === true
+    && report?.assertionDiagnostics?.quality?.error === null;
   const performanceExpected = expected && expectedComparison
-    ? expectedPairedPerformanceAcceptance(expectedComparison, expected.stability)
+    ? expectedPairedPerformanceAcceptance({
+      comparison: expectedComparison,
+      stability: expected.stability,
+      invariantPassed: invariantAssertion,
+      qualityPassed: noRegressionAssertion,
+    })
     : null;
 
   return {
@@ -529,18 +550,20 @@ export function inspectPairedQualityTimingEvidence(report) {
       && expected.stability.coefficientOfVariation <= 0.15,
     maxTrialRatio: Boolean(expected)
       && expected.stability.maxTrialRatio <= 1.10,
+    invariantAssertion,
+    noRegressionAssertion,
     performanceAcceptance: Boolean(performanceExpected)
       && samePerformanceAcceptance(report?.performanceAcceptance, performanceExpected),
   };
 }
 
 function recomputePairedQualityEvidence(rawPairs) {
-  const baselineRawTimingsMs = summarizeTimingValues(rawPairs.map((pair) => pair.baselineMs));
-  const taskRawTimingsMs = summarizeTimingValues(rawPairs.map((pair) => pair.taskMs));
+  const baselineRawTimingsMs = summarizeInterpolatedQualityTimingValues(rawPairs.map((pair) => pair.baselineMs));
+  const taskRawTimingsMs = summarizeInterpolatedQualityTimingValues(rawPairs.map((pair) => pair.taskMs));
   const trials = Array.from({ length: 5 }, (_, index) => {
     const pairs = rawPairs.slice(index * 80, (index + 1) * 80);
-    const baseline = summarizeTimingValues(pairs.map((pair) => pair.baselineMs));
-    const task = summarizeTimingValues(pairs.map((pair) => pair.taskMs));
+    const baseline = summarizeInterpolatedQualityTimingValues(pairs.map((pair) => pair.baselineMs));
+    const task = summarizeInterpolatedQualityTimingValues(pairs.map((pair) => pair.taskMs));
     return {
       trialIndex: index + 1,
       pairCount: pairs.length,
@@ -552,7 +575,7 @@ function recomputePairedQualityEvidence(rawPairs) {
     };
   });
   const trialRatios = trials.map((trial) => trial.taskToBaselineMeanRatio);
-  const ratioSummary = summarizeTimingValues(trialRatios);
+  const ratioSummary = summarizeInterpolatedQualityTimingValues(trialRatios);
   return {
     baselineRawTimingsMs,
     taskRawTimingsMs,
@@ -571,10 +594,42 @@ function recomputePairedQualityEvidence(rawPairs) {
   };
 }
 
-function expectedPairedPerformanceAcceptance(comparison, stability) {
+function summarizeInterpolatedQualityTimingValues(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  const mean = sorted.reduce((total, value) => total + value, 0) / Math.max(1, sorted.length);
+  const variance = sorted.reduce((total, value) => total + ((value - mean) ** 2), 0) / Math.max(1, sorted.length);
+  const standardDeviation = Math.sqrt(variance);
+  return {
+    count: sorted.length,
+    min: sorted[0] || 0,
+    p50: interpolatedQualityPercentile(sorted, 0.5),
+    p95: interpolatedQualityPercentile(sorted, 0.95),
+    p99: interpolatedQualityPercentile(sorted, 0.99),
+    max: sorted.at(-1) || 0,
+    mean,
+    standardDeviation,
+    coefficientOfVariation: mean ? standardDeviation / mean : 0,
+  };
+}
+
+function interpolatedQualityPercentile(sorted, quantile) {
+  if (!sorted.length) return 0;
+  const index = (sorted.length - 1) * quantile;
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + ((sorted[upper] - sorted[lower]) * (index - lower));
+}
+
+function expectedPairedPerformanceAcceptance({
+  comparison,
+  stability,
+  invariantPassed,
+  qualityPassed,
+}) {
   const checks = [
-    pairedPerformanceCheck("quality.invariants", true, true, true),
-    pairedPerformanceCheck("quality.no_regression", true, true, true),
+    pairedPerformanceCheck("quality.invariants", invariantPassed, invariantPassed, true),
+    pairedPerformanceCheck("quality.no_regression", qualityPassed, qualityPassed, true),
     pairedPerformanceCheck("comparison.p50_ratio", comparison.p50Ratio <= 1.05, comparison.p50Ratio, 1.05),
     pairedPerformanceCheck("comparison.p95_ratio", comparison.p95Ratio <= 1.05, comparison.p95Ratio, 1.05),
     pairedPerformanceCheck("paired.mean_ratio", stability.meanRatio <= 1.05, stability.meanRatio, 1.05),
