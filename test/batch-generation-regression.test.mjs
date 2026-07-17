@@ -47,6 +47,7 @@ const {
   createThrowingBenchmarkModelAdapters,
   extractDashboardProductionSourceFingerprint,
   runTimedBatchFixtureReplay,
+  summarizeNumericSamples,
 } = require("../lib/batch-generation-metrics.ts");
 
 const MODEL_KINDS = [
@@ -823,23 +824,26 @@ async function createPhaseThreeAcceptanceFixture() {
     },
   };
   for (const report of [fixture.reports.benchmark20, fixture.reports.benchmark30]) {
+    const rawPairs = createPairedQualityTimingPairs();
     const pairedTimingEvidence = summarizePairedQualityTimingTrials(
-      createPairedQualityTimingPairs(),
+      rawPairs,
       { trialCount: 5, pairsPerTrial: 80 },
     );
+    const baselineAggregate = summarizeNumericSamples(rawPairs.map((pair) => pair.baselineMs));
+    const taskAggregate = summarizeNumericSamples(rawPairs.map((pair) => pair.taskMs));
     report.qualityBenchmarkVersion = "phase-3-quality-paired-v1";
     report.pairedTimingEvidence = pairedTimingEvidence;
-    report.timingsMs.full_local_pipeline_total = { ...pairedTimingEvidence.taskRawTimingsMs };
+    report.timingsMs.full_local_pipeline_total = { ...taskAggregate };
     report.baseline.timingsMs = {
-      full_local_pipeline_total: { ...pairedTimingEvidence.baselineRawTimingsMs },
+      full_local_pipeline_total: { ...baselineAggregate },
     };
     report.comparison.full_local_pipeline_total = {
-      baselineP50: pairedTimingEvidence.baselineRawTimingsMs.p50,
-      baselineP95: pairedTimingEvidence.baselineRawTimingsMs.p95,
-      taskP50: pairedTimingEvidence.taskRawTimingsMs.p50,
-      taskP95: pairedTimingEvidence.taskRawTimingsMs.p95,
-      p50Ratio: 1,
-      p95Ratio: 1,
+      baselineP50: baselineAggregate.p50,
+      baselineP95: baselineAggregate.p95,
+      taskP50: taskAggregate.p50,
+      taskP95: taskAggregate.p95,
+      p50Ratio: taskAggregate.p50 / baselineAggregate.p50,
+      p95Ratio: taskAggregate.p95 / baselineAggregate.p95,
     };
     report.performanceAcceptance = evaluatePairedQualityPerformance({
       comparison: report.comparison,
@@ -989,6 +993,44 @@ test("paired quality timing preserves all 400 pairs and 5x80 trials", async () =
   assert.equal(summary.sampleConservation.preserved, true);
   assert.match(summary.pairDigest, /^[a-f0-9]{64}$/);
   assert.match(summary.trialDigest, /^[a-f0-9]{64}$/);
+});
+
+test("paired quality summary matches production interpolation on nonconstant samples", async () => {
+  const { summarizePairedQualityTimingTrials } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const pairs = createPairedQualityTimingPairs({
+    baselineForPair: (pairIndex) => pairIndex,
+  });
+  const summary = summarizePairedQualityTimingTrials(pairs, {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  });
+
+  assert.equal(summary.baselineRawTimingsMs.p50, 200.5);
+  assert.ok(Math.abs(summary.baselineRawTimingsMs.p95 - 380.05) < 1e-9);
+  assert.ok(Math.abs(summary.baselineRawTimingsMs.p99 - 396.01) < 1e-9);
+});
+
+test("paired quality evidence matches independently aggregated production samples", async () => {
+  const { summarizePairedQualityTimingTrials } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const pairs = createPairedQualityTimingPairs({
+    baselineForPair: (pairIndex) => pairIndex + ((pairIndex % 7) / 10),
+    taskForPair: (pairIndex, baselineMs) => baselineMs + ((pairIndex % 5) / 100),
+  });
+  const summary = summarizePairedQualityTimingTrials(pairs, {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  });
+  const baselineAggregate = summarizeNumericSamples(pairs.map((pair) => pair.baselineMs));
+  const taskAggregate = summarizeNumericSamples(pairs.map((pair) => pair.taskMs));
+
+  for (const [paired, aggregate] of [
+    [summary.baselineRawTimingsMs, baselineAggregate],
+    [summary.taskRawTimingsMs, taskAggregate],
+  ]) {
+    for (const key of ["p50", "p95", "max", "mean", "standardDeviation", "coefficientOfVariation"]) {
+      assert.equal(paired[key], aggregate[key], key);
+    }
+  }
 });
 
 test("paired quality timing balances execution order in every trial", async () => {
@@ -1224,16 +1266,18 @@ test("phase-three finalizer accepts common-mode raw variance but rejects every p
       trialCount: 5,
       pairsPerTrial: 80,
     });
+    const baselineAggregate = summarizeNumericSamples(pairs.map((pair) => pair.baselineMs));
+    const taskAggregate = summarizeNumericSamples(pairs.map((pair) => pair.taskMs));
     report.pairedTimingEvidence = pairedTimingEvidence;
-    report.timingsMs.full_local_pipeline_total = { ...pairedTimingEvidence.taskRawTimingsMs };
-    report.baseline.timingsMs.full_local_pipeline_total = { ...pairedTimingEvidence.baselineRawTimingsMs };
+    report.timingsMs.full_local_pipeline_total = { ...taskAggregate };
+    report.baseline.timingsMs.full_local_pipeline_total = { ...baselineAggregate };
     report.comparison.full_local_pipeline_total = {
-      baselineP50: pairedTimingEvidence.baselineRawTimingsMs.p50,
-      baselineP95: pairedTimingEvidence.baselineRawTimingsMs.p95,
-      taskP50: pairedTimingEvidence.taskRawTimingsMs.p50,
-      taskP95: pairedTimingEvidence.taskRawTimingsMs.p95,
-      p50Ratio: pairedTimingEvidence.taskRawTimingsMs.p50 / pairedTimingEvidence.baselineRawTimingsMs.p50,
-      p95Ratio: pairedTimingEvidence.taskRawTimingsMs.p95 / pairedTimingEvidence.baselineRawTimingsMs.p95,
+      baselineP50: baselineAggregate.p50,
+      baselineP95: baselineAggregate.p95,
+      taskP50: taskAggregate.p50,
+      taskP95: taskAggregate.p95,
+      p50Ratio: taskAggregate.p50 / baselineAggregate.p50,
+      p95Ratio: taskAggregate.p95 / baselineAggregate.p95,
     };
     report.performanceAcceptance = evaluatePairedQualityPerformance({
       comparison: report.comparison,
@@ -1245,7 +1289,7 @@ test("phase-three finalizer accepts common-mode raw variance but rejects every p
 
   const commonMode = await createPhaseThreeAcceptanceFixture();
   installEvidence(commonMode.reports.benchmark20, createPairedQualityTimingPairs({
-    baselineForPair: (pairIndex) => (pairIndex === 1 ? 500 : 50),
+    baselineForPair: (pairIndex) => (pairIndex <= 6 ? 500 : 50),
   }));
   assert.ok(commonMode.reports.benchmark20.pairedTimingEvidence.taskRawTimingsMs.coefficientOfVariation > 0.15);
   assert.equal(evaluatePhaseThreeAcceptance(commonMode).status, "accepted");

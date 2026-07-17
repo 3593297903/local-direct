@@ -324,24 +324,26 @@ function summarizePairedSamples(values) {
     throw new Error("Paired timing summary requires finite positive samples");
   }
   const sorted = [...values].sort((left, right) => left - right);
-  const mean = sorted.reduce((total, value) => total + value, 0) / sorted.length;
-  const variance = sorted.reduce((total, value) => total + ((value - mean) ** 2), 0) / sorted.length;
-  const standardDeviation = Math.sqrt(variance);
+  const aggregate = summarizeNumericSamples(sorted);
   return {
     count: sorted.length,
     min: sorted[0],
-    p50: nearestRank(sorted, 0.5),
-    p95: nearestRank(sorted, 0.95),
-    p99: nearestRank(sorted, 0.99),
-    max: sorted.at(-1),
-    mean,
-    standardDeviation,
-    coefficientOfVariation: mean ? standardDeviation / mean : 0,
+    p50: aggregate.p50,
+    p95: aggregate.p95,
+    p99: interpolatedPercentile(sorted, 0.99),
+    max: aggregate.max,
+    mean: aggregate.mean,
+    standardDeviation: aggregate.standardDeviation,
+    coefficientOfVariation: aggregate.coefficientOfVariation,
   };
 }
 
-function nearestRank(sorted, fraction) {
-  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * fraction) - 1))];
+function interpolatedPercentile(sorted, quantile) {
+  const index = (sorted.length - 1) * quantile;
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + ((sorted[upper] - sorted[lower]) * (index - lower));
 }
 
 function pickTrialTimingSummary(summary) {
