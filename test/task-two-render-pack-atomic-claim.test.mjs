@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -108,6 +109,146 @@ test("render pack create is idempotent and twenty concurrent claims produce one 
         { rootDir },
       ),
       /lease|fencing/i,
+    );
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("vanished pending candidate is skipped when another claimant wins between readdir and read", () => {
+  const scriptPath = path.join(os.tmpdir(), `localdirector-vanished-candidate-${process.pid}-${Date.now()}.cjs`);
+  const script = String.raw`
+const assert = require("node:assert/strict");
+const os = require("node:os");
+const path = require("node:path");
+const { existsSync, readFileSync, rmSync } = require("node:fs");
+const fsPromises = require("node:fs/promises");
+const Module = require("node:module");
+
+process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({ module: "commonjs", moduleResolution: "node" });
+require(process.cwd() + "/node_modules/ts-node/register/transpile-only");
+
+const originalReadFile = fsPromises.readFile;
+const originalLoad = Module._load;
+const rootDir = path.join(os.tmpdir(), "localdirector-vanished-claim-" + Date.now() + "-" + Math.random().toString(16).slice(2));
+const namespace = ".tmp-vanished-candidate-test";
+const id = "vanished-job";
+const pendingPath = path.resolve(rootDir, namespace, "pending", id + ".json");
+const pendingSuffix = path.normalize(path.join(namespace, "pending", id + ".json")).toLowerCase();
+let firstTargetRead = true;
+let interceptedTargetRead = false;
+let releaseSlowRead;
+let slowReadStarted;
+const releaseSlowReadPromise = new Promise((resolve) => { releaseSlowRead = resolve; });
+const slowReadStartedPromise = new Promise((resolve) => { slowReadStarted = resolve; });
+
+const patchedReadFile = async (...args) => {
+  const target = path.resolve(String(args[0]));
+  if (target.toLowerCase().endsWith(pendingSuffix) && firstTargetRead) {
+    firstTargetRead = false;
+    interceptedTargetRead = true;
+    slowReadStarted();
+    await releaseSlowReadPromise;
+    const error = new Error("simulated pending candidate vanished");
+    error.code = "ENOENT";
+    error.path = target;
+    throw error;
+  }
+  return originalReadFile(...args);
+};
+Module._load = function patchedModuleLoad(request, parent, isMain) {
+  if (request === "node:fs/promises") {
+    return { ...fsPromises, readFile: patchedReadFile };
+  }
+  return originalLoad.apply(this, arguments);
+};
+
+(async () => {
+  const {
+    claimNextFileJob,
+    putPendingFileJob,
+  } = require(process.cwd() + "/lib/file-job-store.ts");
+  try {
+    const now = new Date().toISOString();
+    await putPendingFileJob(rootDir, namespace, {
+      id,
+      status: "pending",
+      leaseId: null,
+      workerId: null,
+      attempt: 0,
+      fencingToken: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const slowClaim = claimNextFileJob(rootDir, namespace, { workerId: "worker-slow" });
+    await slowReadStartedPromise;
+    assert.equal(interceptedTargetRead, true);
+    const fastClaim = await claimNextFileJob(rootDir, namespace, { workerId: "worker-fast" });
+    assert.equal(fastClaim.id, id);
+    assert.equal(fastClaim.status, "running");
+    assert.ok(fastClaim.leaseId);
+    assert.equal(fastClaim.attempt, 1);
+    assert.equal(fastClaim.fencingToken, 1);
+    releaseSlowRead();
+    const slowResult = await slowClaim;
+    assert.equal(slowResult, null);
+    const runningPath = path.join(rootDir, namespace, "running", id + ".json");
+    assert.equal(existsSync(runningPath), true);
+    assert.equal(existsSync(pendingPath), false);
+    const running = JSON.parse(readFileSync(runningPath, "utf8"));
+    assert.equal(running.id, id);
+    assert.equal(running.workerId, "worker-fast");
+    assert.equal(running.fencingToken, 1);
+  } finally {
+    Module._load = originalLoad;
+    releaseSlowRead();
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+})().catch((error) => {
+  try {
+    Module._load = originalLoad;
+    releaseSlowRead();
+    rmSync(rootDir, { recursive: true, force: true });
+  } catch {}
+  console.error(error && error.stack || error);
+  process.exitCode = 1;
+});
+`;
+  try {
+    writeFileSync(scriptPath, script, "utf8");
+    const result = spawnSync(process.execPath, [scriptPath], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 10_000,
+      maxBuffer: 1024 * 1024,
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  } finally {
+    rmSync(scriptPath, { force: true });
+  }
+});
+
+test("malformed pending JSON remains a hard claim failure", async () => {
+  const rootDir = path.join(os.tmpdir(), `localdirector-malformed-pending-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const namespace = ".tmp-malformed-pending-test";
+  const now = new Date().toISOString();
+  try {
+    await putPendingFileJob(rootDir, namespace, {
+      id: "malformed-job",
+      status: "pending",
+      leaseId: null,
+      workerId: null,
+      attempt: 0,
+      fencingToken: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const pendingPath = path.join(rootDir, namespace, "pending", "malformed-job.json");
+    writeFileSync(pendingPath, "{ malformed json", "utf8");
+    await assert.rejects(
+      () => claimNextFileJob(rootDir, namespace, { workerId: "worker-malformed" }),
+      SyntaxError,
     );
   } finally {
     rmSync(rootDir, { recursive: true, force: true });

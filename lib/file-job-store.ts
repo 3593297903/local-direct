@@ -237,10 +237,18 @@ export async function claimNextFileJob<T extends FileJobRecord>(
   const pendingDir = stateDir(rootDir, namespace, "pending");
   const entries = (await readdir(pendingDir, { withFileTypes: true }))
     .filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
-  const candidates = await Promise.all(entries.map(async (entry) => ({
-    name: entry.name,
-    job: await readJobFile<T>(path.join(pendingDir, entry.name)),
-  })));
+  const candidateReads = await Promise.all(entries.map(async (entry) => {
+    try {
+      return {
+        name: entry.name,
+        job: await readJobFile<T>(path.join(pendingDir, entry.name)),
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }));
+  const candidates = candidateReads.filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
   const direction = options.order === "newest" ? -1 : 1;
   candidates.sort((left, right) => direction * (Date.parse(left.job.createdAt) - Date.parse(right.job.createdAt)));
 

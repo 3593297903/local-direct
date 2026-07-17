@@ -61,6 +61,7 @@ const ALLOWED_CHANGED_FILES = new Set([
   "components/DashboardClient.tsx",
   "lib/batch-contract-preflight.ts",
   "lib/batch-event-feature-flags.ts",
+  "lib/file-job-store.ts",
   "lib/batch-render-operation.ts",
   "lib/batch-render-scheduler.ts",
   "lib/batch-repair-scheduler.ts",
