@@ -58,6 +58,7 @@ const ALLOWED_CHANGED_FILES = new Set([
   "lib/segment-batch-cache.ts",
   "lib/video-prompt-pack-codex-queue.ts",
   "scripts/benchmark-phase-3-contract-preflight.mjs",
+  "scripts/benchmark-batch-generation-pipeline.mjs",
   "scripts/finalize-task-one-phase-3.mjs",
   "test/batch-event-feature-flags.test.mjs",
   "test/batch-generation-regression.test.mjs",
@@ -403,6 +404,7 @@ function qualityChecks(report, count, taskCommit, baselineCommit) {
   const canonicalHashes = report?.extensions?.canonicalPromptHashes;
   const digest = Array.isArray(canonicalHashes) ? hashJson(canonicalHashes) : null;
   const invocationCounters = report?.invocationCounters || {};
+  const paired = inspectPairedQualityTimingEvidence(report);
   return [
     check(`quality${count}.report`, Boolean(report && typeof report === "object")),
     check(`quality${count}.gitCommit`, report?.gitCommit === taskCommit),
@@ -422,7 +424,237 @@ function qualityChecks(report, count, taskCommit, baselineCommit) {
     check(`quality${count}.p50Ratio`, finiteAtMost(report?.comparison?.full_local_pipeline_total?.p50Ratio, 1.05)),
     check(`quality${count}.p95Ratio`, finiteAtMost(report?.comparison?.full_local_pipeline_total?.p95Ratio, 1.05)),
     check(`quality${count}.queueScanSkipped`, report?.extensions?.queueScanStatus === "skipped_unchanged_scope"),
+    check(`quality${count}.pairedVersion`, paired.version),
+    check(`quality${count}.pairShape`, paired.pairShape),
+    check(`quality${count}.orderConservation`, paired.orderConservation),
+    check(`quality${count}.sampleConservation`, paired.sampleConservation),
+    check(`quality${count}.pairDigest`, paired.pairDigest),
+    check(`quality${count}.trialDigest`, paired.trialDigest),
+    check(`quality${count}.rawSummaryIntegrity`, paired.rawSummaryIntegrity),
+    check(`quality${count}.trialSummaryIntegrity`, paired.trialSummaryIntegrity),
+    check(`quality${count}.comparisonIntegrity`, paired.comparisonIntegrity),
+    check(`quality${count}.rawCvRecorded`, paired.rawCvRecorded),
+    check(`quality${count}.pairedMeanRatio`, paired.pairedMeanRatio),
+    check(`quality${count}.pairedRatioCv`, paired.pairedRatioCv),
+    check(`quality${count}.maxTrialRatio`, paired.maxTrialRatio),
+    check(`quality${count}.performanceAcceptance`, paired.performanceAcceptance),
   ];
+}
+
+export function inspectPairedQualityTimingEvidence(report) {
+  const evidence = report?.pairedTimingEvidence;
+  const rawPairs = Array.isArray(evidence?.rawPairs) ? evidence.rawPairs : [];
+  const pairShape = evidence?.totalPairs === 400
+    && evidence?.trialCount === 5
+    && evidence?.pairsPerTrial === 80
+    && rawPairs.length === 400
+    && rawPairs.every((pair, index) => {
+      const pairIndex = index + 1;
+      return pair?.pairIndex === pairIndex
+        && pair?.order === (pairIndex % 2 === 1 ? "baseline_first" : "task_first")
+        && Number.isFinite(pair?.baselineMs)
+        && pair.baselineMs > 0
+        && Number.isFinite(pair?.taskMs)
+        && pair.taskMs > 0;
+    });
+  const expected = pairShape ? recomputePairedQualityEvidence(rawPairs) : null;
+  const actualTrials = Array.isArray(evidence?.trials) ? evidence.trials : [];
+  const expectedComparison = expected ? {
+    baselineP50: expected.baselineRawTimingsMs.p50,
+    baselineP95: expected.baselineRawTimingsMs.p95,
+    taskP50: expected.taskRawTimingsMs.p50,
+    taskP95: expected.taskRawTimingsMs.p95,
+    p50Ratio: expected.taskRawTimingsMs.p50 / expected.baselineRawTimingsMs.p50,
+    p95Ratio: expected.taskRawTimingsMs.p95 / expected.baselineRawTimingsMs.p95,
+  } : null;
+  const actualComparison = report?.comparison?.full_local_pipeline_total;
+  const stability = evidence?.stability;
+  const performanceExpected = expected && expectedComparison
+    ? expectedPairedPerformanceAcceptance(expectedComparison, expected.stability)
+    : null;
+
+  return {
+    version: report?.qualityBenchmarkVersion === "phase-3-quality-paired-v1"
+      && evidence?.metric === "paired_trial_mean_ratio_cv_v1",
+    pairShape,
+    orderConservation: Boolean(expected)
+      && evidence?.orderConservation?.baselineFirstCount === expected.orderConservation.baselineFirstCount
+      && evidence?.orderConservation?.taskFirstCount === expected.orderConservation.taskFirstCount
+      && evidence?.orderConservation?.balanced === true,
+    sampleConservation: Boolean(expected)
+      && evidence?.sampleConservation?.expectedPairCount === 400
+      && evidence?.sampleConservation?.rawPairCount === 400
+      && evidence?.sampleConservation?.baselineSampleCount === 400
+      && evidence?.sampleConservation?.taskSampleCount === 400
+      && evidence?.sampleConservation?.trialPairCount === 400
+      && evidence?.sampleConservation?.preserved === true,
+    pairDigest: Boolean(expected) && evidence?.pairDigest === hashJson(rawPairs),
+    trialDigest: Boolean(expected) && evidence?.trialDigest === hashJson(expected.trials),
+    rawSummaryIntegrity: Boolean(expected)
+      && sameTimingSummary(evidence?.baselineRawTimingsMs, expected.baselineRawTimingsMs)
+      && sameTimingSummary(evidence?.taskRawTimingsMs, expected.taskRawTimingsMs)
+      && sameAggregateTimingSummary(
+        report?.baseline?.timingsMs?.full_local_pipeline_total,
+        expected.baselineRawTimingsMs,
+      )
+      && sameAggregateTimingSummary(
+        report?.timingsMs?.full_local_pipeline_total,
+        expected.taskRawTimingsMs,
+      ),
+    trialSummaryIntegrity: Boolean(expected)
+      && actualTrials.length === 5
+      && actualTrials.every((trial, index) => samePairedTimingTrial(trial, expected.trials[index]))
+      && stability?.metric === "paired_trial_mean_ratio_cv_v1"
+      && sameNumberArray(stability?.trialRatios, expected.stability.trialRatios)
+      && sameFiniteNumber(stability?.meanRatio, expected.stability.meanRatio)
+      && sameFiniteNumber(
+        stability?.standardDeviationOfRatios,
+        expected.stability.standardDeviationOfRatios,
+      )
+      && sameFiniteNumber(
+        stability?.coefficientOfVariation,
+        expected.stability.coefficientOfVariation,
+      )
+      && sameFiniteNumber(stability?.maxTrialRatio, expected.stability.maxTrialRatio),
+    comparisonIntegrity: Boolean(expectedComparison)
+      && sameComparisonSummary(actualComparison, expectedComparison),
+    rawCvRecorded: Boolean(expected)
+      && Number.isFinite(evidence?.baselineRawTimingsMs?.coefficientOfVariation)
+      && evidence.baselineRawTimingsMs.coefficientOfVariation >= 0
+      && Number.isFinite(evidence?.taskRawTimingsMs?.coefficientOfVariation)
+      && evidence.taskRawTimingsMs.coefficientOfVariation >= 0,
+    pairedMeanRatio: Boolean(expected)
+      && expected.stability.meanRatio <= 1.05,
+    pairedRatioCv: Boolean(expected)
+      && expected.stability.coefficientOfVariation <= 0.15,
+    maxTrialRatio: Boolean(expected)
+      && expected.stability.maxTrialRatio <= 1.10,
+    performanceAcceptance: Boolean(performanceExpected)
+      && samePerformanceAcceptance(report?.performanceAcceptance, performanceExpected),
+  };
+}
+
+function recomputePairedQualityEvidence(rawPairs) {
+  const baselineRawTimingsMs = summarizeTimingValues(rawPairs.map((pair) => pair.baselineMs));
+  const taskRawTimingsMs = summarizeTimingValues(rawPairs.map((pair) => pair.taskMs));
+  const trials = Array.from({ length: 5 }, (_, index) => {
+    const pairs = rawPairs.slice(index * 80, (index + 1) * 80);
+    const baseline = summarizeTimingValues(pairs.map((pair) => pair.baselineMs));
+    const task = summarizeTimingValues(pairs.map((pair) => pair.taskMs));
+    return {
+      trialIndex: index + 1,
+      pairCount: pairs.length,
+      baselineFirstCount: pairs.filter((pair) => pair.order === "baseline_first").length,
+      taskFirstCount: pairs.filter((pair) => pair.order === "task_first").length,
+      baseline: pickPairedTrialSummary(baseline),
+      task: pickPairedTrialSummary(task),
+      taskToBaselineMeanRatio: task.mean / baseline.mean,
+    };
+  });
+  const trialRatios = trials.map((trial) => trial.taskToBaselineMeanRatio);
+  const ratioSummary = summarizeTimingValues(trialRatios);
+  return {
+    baselineRawTimingsMs,
+    taskRawTimingsMs,
+    trials,
+    stability: {
+      trialRatios,
+      meanRatio: ratioSummary.mean,
+      standardDeviationOfRatios: ratioSummary.standardDeviation,
+      coefficientOfVariation: ratioSummary.coefficientOfVariation,
+      maxTrialRatio: ratioSummary.max,
+    },
+    orderConservation: {
+      baselineFirstCount: rawPairs.filter((pair) => pair.order === "baseline_first").length,
+      taskFirstCount: rawPairs.filter((pair) => pair.order === "task_first").length,
+    },
+  };
+}
+
+function expectedPairedPerformanceAcceptance(comparison, stability) {
+  const checks = [
+    pairedPerformanceCheck("quality.invariants", true, true, true),
+    pairedPerformanceCheck("quality.no_regression", true, true, true),
+    pairedPerformanceCheck("comparison.p50_ratio", comparison.p50Ratio <= 1.05, comparison.p50Ratio, 1.05),
+    pairedPerformanceCheck("comparison.p95_ratio", comparison.p95Ratio <= 1.05, comparison.p95Ratio, 1.05),
+    pairedPerformanceCheck("paired.mean_ratio", stability.meanRatio <= 1.05, stability.meanRatio, 1.05),
+    pairedPerformanceCheck(
+      "paired.trial_ratio_cv",
+      stability.coefficientOfVariation <= 0.15,
+      stability.coefficientOfVariation,
+      0.15,
+    ),
+    pairedPerformanceCheck("paired.max_trial_ratio", stability.maxTrialRatio <= 1.10, stability.maxTrialRatio, 1.10),
+  ];
+  const failedCheckIds = checks.filter((item) => !item.passed).map((item) => item.id);
+  return {
+    status: failedCheckIds.length ? "rejected" : "accepted",
+    checks,
+    failedCheckIds,
+  };
+}
+
+function pairedPerformanceCheck(id, passed, actual, limit) {
+  return { id, passed: passed === true, actual, limit };
+}
+
+function samePerformanceAcceptance(actual, expected) {
+  if (!actual || actual.status !== expected.status
+    || !Array.isArray(actual.checks) || actual.checks.length !== expected.checks.length
+    || !Array.isArray(actual.failedCheckIds)
+    || JSON.stringify(actual.failedCheckIds) !== JSON.stringify(expected.failedCheckIds)) {
+    return false;
+  }
+  return actual.checks.every((item, index) => {
+    const target = expected.checks[index];
+    return item?.id === target.id
+      && item?.passed === target.passed
+      && sameScalar(item?.actual, target.actual)
+      && sameScalar(item?.limit, target.limit);
+  });
+}
+
+function sameScalar(actual, expected) {
+  if (typeof expected === "boolean") return actual === expected;
+  return sameFiniteNumber(actual, expected);
+}
+
+function sameComparisonSummary(actual, expected) {
+  return Boolean(actual && expected)
+    && ["baselineP50", "baselineP95", "taskP50", "taskP95", "p50Ratio", "p95Ratio"]
+      .every((key) => sameFiniteNumber(actual[key], expected[key]));
+}
+
+function sameAggregateTimingSummary(actual, expected) {
+  return Boolean(actual && expected)
+    && ["p50", "p95", "max", "mean", "standardDeviation", "coefficientOfVariation"]
+      .every((key) => sameFiniteNumber(actual[key], expected[key]));
+}
+
+function samePairedTimingTrial(actual, expected) {
+  return actual?.trialIndex === expected?.trialIndex
+    && actual?.pairCount === expected?.pairCount
+    && actual?.baselineFirstCount === expected?.baselineFirstCount
+    && actual?.taskFirstCount === expected?.taskFirstCount
+    && samePairedTrialSummary(actual?.baseline, expected?.baseline)
+    && samePairedTrialSummary(actual?.task, expected?.task)
+    && sameFiniteNumber(actual?.taskToBaselineMeanRatio, expected?.taskToBaselineMeanRatio);
+}
+
+function samePairedTrialSummary(actual, expected) {
+  return Boolean(actual && expected)
+    && ["p50", "p95", "p99", "max", "mean"]
+      .every((key) => sameFiniteNumber(actual[key], expected[key]));
+}
+
+function pickPairedTrialSummary(summary) {
+  return {
+    p50: summary.p50,
+    p95: summary.p95,
+    p99: summary.p99,
+    max: summary.max,
+    mean: summary.mean,
+  };
 }
 
 function summarizeContract(report) {
@@ -448,6 +680,7 @@ function summarizeQuality(report) {
   if (!report) return null;
   const hashes = report.extensions?.canonicalPromptHashes;
   return {
+    qualityBenchmarkVersion: report.qualityBenchmarkVersion,
     fixtureId: report.fixtureId,
     fixtureHash: report.fixtureHash,
     accepted: report.quality?.accepted,
@@ -459,6 +692,20 @@ function summarizeQuality(report) {
     p95: report.timingsMs?.full_local_pipeline_total?.p95,
     p50Ratio: report.comparison?.full_local_pipeline_total?.p50Ratio,
     p95Ratio: report.comparison?.full_local_pipeline_total?.p95Ratio,
+    pairedTimingEvidence: report.pairedTimingEvidence ? {
+      totalPairs: report.pairedTimingEvidence.totalPairs,
+      trialCount: report.pairedTimingEvidence.trialCount,
+      pairsPerTrial: report.pairedTimingEvidence.pairsPerTrial,
+      baselineRawTimingsMs: report.pairedTimingEvidence.baselineRawTimingsMs,
+      taskRawTimingsMs: report.pairedTimingEvidence.taskRawTimingsMs,
+      trials: report.pairedTimingEvidence.trials,
+      stability: report.pairedTimingEvidence.stability,
+      orderConservation: report.pairedTimingEvidence.orderConservation,
+      sampleConservation: report.pairedTimingEvidence.sampleConservation,
+      pairDigest: report.pairedTimingEvidence.pairDigest,
+      trialDigest: report.pairedTimingEvidence.trialDigest,
+    } : null,
+    performanceAcceptance: report.performanceAcceptance,
   };
 }
 

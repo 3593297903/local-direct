@@ -703,7 +703,11 @@ function createPairedQualityTimingPairs({
   });
 }
 
-function createPhaseThreeAcceptanceFixture() {
+async function createPhaseThreeAcceptanceFixture() {
+  const {
+    evaluatePairedQualityPerformance,
+    summarizePairedQualityTimingTrials,
+  } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
   const taskCommit = "a".repeat(40);
   const baselineCommit = "b".repeat(40);
   const replay20 = replayFixture(fixture20);
@@ -743,7 +747,7 @@ function createPhaseThreeAcceptanceFixture() {
     comparison: { full_local_pipeline_total: { p50Ratio: 1, p95Ratio: 1 } },
     environment: { queueScan: "skipped" },
   });
-  return {
+  const fixture = {
     taskCommit,
     baselineCommit,
     sourceFingerprint: "e".repeat(64),
@@ -818,6 +822,33 @@ function createPhaseThreeAcceptanceFixture() {
       changedFiles: ["scripts/finalize-task-one-phase-3.mjs"],
     },
   };
+  for (const report of [fixture.reports.benchmark20, fixture.reports.benchmark30]) {
+    const pairedTimingEvidence = summarizePairedQualityTimingTrials(
+      createPairedQualityTimingPairs(),
+      { trialCount: 5, pairsPerTrial: 80 },
+    );
+    report.qualityBenchmarkVersion = "phase-3-quality-paired-v1";
+    report.pairedTimingEvidence = pairedTimingEvidence;
+    report.timingsMs.full_local_pipeline_total = { ...pairedTimingEvidence.taskRawTimingsMs };
+    report.baseline.timingsMs = {
+      full_local_pipeline_total: { ...pairedTimingEvidence.baselineRawTimingsMs },
+    };
+    report.comparison.full_local_pipeline_total = {
+      baselineP50: pairedTimingEvidence.baselineRawTimingsMs.p50,
+      baselineP95: pairedTimingEvidence.baselineRawTimingsMs.p95,
+      taskP50: pairedTimingEvidence.taskRawTimingsMs.p50,
+      taskP95: pairedTimingEvidence.taskRawTimingsMs.p95,
+      p50Ratio: 1,
+      p95Ratio: 1,
+    };
+    report.performanceAcceptance = evaluatePairedQualityPerformance({
+      comparison: report.comparison,
+      pairedTimingEvidence,
+      invariantPassed: true,
+      qualityPassed: true,
+    });
+  }
+  return fixture;
 }
 
 test("phase-three contract benchmark runs the production preflight without mutation", async () => {
@@ -1109,9 +1140,131 @@ test("quality benchmark writes a rejected report before returning failure", asyn
   }
 });
 
+test("phase-three finalizer requires paired v1 evidence for both quality reports", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = await createPhaseThreeAcceptanceFixture();
+  assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
+
+  for (const count of [20, 30]) {
+    const oldReport = structuredClone(valid);
+    delete oldReport.reports[`benchmark${count}`].qualityBenchmarkVersion;
+    delete oldReport.reports[`benchmark${count}`].pairedTimingEvidence;
+    delete oldReport.reports[`benchmark${count}`].performanceAcceptance;
+    assert.equal(evaluatePhaseThreeAcceptance(oldReport).status, "rejected", `legacy benchmark ${count}`);
+  }
+});
+
+test("phase-three finalizer independently rejects missing reordered or mutated raw pairs", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = await createPhaseThreeAcceptanceFixture();
+  const mutations = [
+    ["missing pair", (report) => report.pairedTimingEvidence.rawPairs.pop()],
+    ["mutated baseline", (report) => { report.pairedTimingEvidence.rawPairs[0].baselineMs = 51; }],
+    ["mutated task", (report) => { report.pairedTimingEvidence.rawPairs[0].taskMs = 51; }],
+    ["mutated index", (report) => { report.pairedTimingEvidence.rawPairs[0].pairIndex = 2; }],
+    ["mutated order", (report) => { report.pairedTimingEvidence.rawPairs[0].order = "task_first"; }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const forged = structuredClone(valid);
+    mutate(forged.reports.benchmark20);
+    assert.equal(evaluatePhaseThreeAcceptance(forged).status, "rejected", label);
+  }
+});
+
+test("phase-three finalizer independently rejects forged conservation digests trials and summaries", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = await createPhaseThreeAcceptanceFixture();
+  const mutations = [
+    ["order conservation", (report) => { report.pairedTimingEvidence.orderConservation.balanced = false; }],
+    ["sample conservation", (report) => { report.pairedTimingEvidence.sampleConservation.rawPairCount = 399; }],
+    ["pair digest", (report) => { report.pairedTimingEvidence.pairDigest = "0".repeat(64); }],
+    ["trial digest", (report) => { report.pairedTimingEvidence.trialDigest = "0".repeat(64); }],
+    ["raw summary", (report) => { report.pairedTimingEvidence.taskRawTimingsMs.p50 = 49; }],
+    ["trial ratio", (report) => { report.pairedTimingEvidence.trials[0].taskToBaselineMeanRatio = 0.5; }],
+    ["ratio cv", (report) => { report.pairedTimingEvidence.stability.coefficientOfVariation = 0.01; }],
+    ["max trial ratio", (report) => { report.pairedTimingEvidence.stability.maxTrialRatio = 1.01; }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const forged = structuredClone(valid);
+    mutate(forged.reports.benchmark30);
+    assert.equal(evaluatePhaseThreeAcceptance(forged).status, "rejected", label);
+  }
+});
+
+test("phase-three finalizer verifies top-level paired timing and performance acceptance", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = await createPhaseThreeAcceptanceFixture();
+  const mutations = [
+    ["task timing", (report) => { report.timingsMs.full_local_pipeline_total.p50 = 49; }],
+    ["baseline timing", (report) => { report.baseline.timingsMs.full_local_pipeline_total.p95 = 49; }],
+    ["comparison", (report) => { report.comparison.full_local_pipeline_total.p50Ratio = 0.5; }],
+    ["acceptance status", (report) => { report.performanceAcceptance.status = "rejected"; }],
+    ["acceptance check", (report) => { report.performanceAcceptance.checks[0].passed = false; }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const forged = structuredClone(valid);
+    mutate(forged.reports.benchmark20);
+    assert.equal(evaluatePhaseThreeAcceptance(forged).status, "rejected", label);
+  }
+
+  const concealedRegression = structuredClone(valid);
+  const report = concealedRegression.reports.benchmark20;
+  for (const pair of report.pairedTimingEvidence.rawPairs) pair.taskMs = pair.baselineMs * 1.06;
+  assert.equal(evaluatePhaseThreeAcceptance(concealedRegression).status, "rejected", "concealed regression");
+});
+
+test("phase-three finalizer accepts common-mode raw variance but rejects every paired hard gate", async () => {
+  const {
+    evaluatePairedQualityPerformance,
+    summarizePairedQualityTimingTrials,
+  } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const installEvidence = (report, pairs) => {
+    const pairedTimingEvidence = summarizePairedQualityTimingTrials(pairs, {
+      trialCount: 5,
+      pairsPerTrial: 80,
+    });
+    report.pairedTimingEvidence = pairedTimingEvidence;
+    report.timingsMs.full_local_pipeline_total = { ...pairedTimingEvidence.taskRawTimingsMs };
+    report.baseline.timingsMs.full_local_pipeline_total = { ...pairedTimingEvidence.baselineRawTimingsMs };
+    report.comparison.full_local_pipeline_total = {
+      baselineP50: pairedTimingEvidence.baselineRawTimingsMs.p50,
+      baselineP95: pairedTimingEvidence.baselineRawTimingsMs.p95,
+      taskP50: pairedTimingEvidence.taskRawTimingsMs.p50,
+      taskP95: pairedTimingEvidence.taskRawTimingsMs.p95,
+      p50Ratio: pairedTimingEvidence.taskRawTimingsMs.p50 / pairedTimingEvidence.baselineRawTimingsMs.p50,
+      p95Ratio: pairedTimingEvidence.taskRawTimingsMs.p95 / pairedTimingEvidence.baselineRawTimingsMs.p95,
+    };
+    report.performanceAcceptance = evaluatePairedQualityPerformance({
+      comparison: report.comparison,
+      pairedTimingEvidence,
+      invariantPassed: true,
+      qualityPassed: true,
+    });
+  };
+
+  const commonMode = await createPhaseThreeAcceptanceFixture();
+  installEvidence(commonMode.reports.benchmark20, createPairedQualityTimingPairs({
+    baselineForPair: (pairIndex) => (pairIndex === 1 ? 500 : 50),
+  }));
+  assert.ok(commonMode.reports.benchmark20.pairedTimingEvidence.taskRawTimingsMs.coefficientOfVariation > 0.15);
+  assert.equal(evaluatePhaseThreeAcceptance(commonMode).status, "accepted");
+
+  for (const [label, pairs] of [
+    ["stable six percent", createPairedQualityTimingPairs({ taskForPair: () => 53 })],
+    ["single slow trial", createPairedQualityTimingPairs({
+      taskForPair: (pairIndex, baselineMs) => (pairIndex > 320 ? 60 : baselineMs),
+    })],
+  ]) {
+    const regressed = await createPhaseThreeAcceptanceFixture();
+    installEvidence(regressed.reports.benchmark30, pairs);
+    assert.equal(evaluatePhaseThreeAcceptance(regressed).status, "rejected", label);
+  }
+});
+
 test("phase-three acceptance rejects missing stale dirty or failed evidence", async () => {
   const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
-  const valid = createPhaseThreeAcceptanceFixture();
+  const valid = await createPhaseThreeAcceptanceFixture();
   assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
 
   const missingReport = structuredClone(valid);
@@ -1137,7 +1290,7 @@ test("phase-three acceptance rejects missing stale dirty or failed evidence", as
 
 test("phase-three acceptance requires representative Contract evidence for 20 and 30 segments", async () => {
   const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
-  const valid = createPhaseThreeAcceptanceFixture();
+  const valid = await createPhaseThreeAcceptanceFixture();
   assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
 
   const missing20 = structuredClone(valid);
@@ -1165,7 +1318,7 @@ test("phase-three acceptance requires representative Contract evidence for 20 an
 
 test("phase-three acceptance requires v2 trial evidence, digests, and exact sample conservation", async () => {
   const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
-  const valid = createPhaseThreeAcceptanceFixture();
+  const valid = await createPhaseThreeAcceptanceFixture();
   assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
 
   const oldSchema = structuredClone(valid);
@@ -1217,7 +1370,7 @@ test("phase-three acceptance gates raw tails and trial stability without gating 
       timingsMs: { ...evidence.rawTimingsMs },
     });
   };
-  const valid = createPhaseThreeAcceptanceFixture();
+  const valid = await createPhaseThreeAcceptanceFixture();
   assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
 
   for (const [field, samples] of [
@@ -1251,14 +1404,14 @@ test("phase-three acceptance gates raw tails and trial stability without gating 
 
 test("phase-three acceptance allows the refresh recovery regression test in the Phase 3R diff", async () => {
   const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
-  const valid = createPhaseThreeAcceptanceFixture();
+  const valid = await createPhaseThreeAcceptanceFixture();
   valid.git.changedFiles.push("test/task-one-render-refresh-recovery.test.mjs");
   assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
 });
 
 test("phase-three acceptance permits only the exact Phase 3R-F test fixture files", async () => {
   const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
-  const valid = createPhaseThreeAcceptanceFixture();
+  const valid = await createPhaseThreeAcceptanceFixture();
   valid.git.changedFiles.push(
     "test/helpers/authoritative-render-pack-fixture.mjs",
     "test/codex-finalization-v1-compatibility.test.mjs",
@@ -1287,7 +1440,7 @@ test("phase-three acceptance JSON is UTF-8 without BOM and self-parseable", asyn
   const root = path.join(process.cwd(), ".tmp-batch-benchmark", `phase-three-json-${process.pid}-${Date.now()}`);
   const target = path.join(root, "acceptance.json");
   try {
-    const acceptance = await writePhaseThreeAcceptance(target, createPhaseThreeAcceptanceFixture());
+    const acceptance = await writePhaseThreeAcceptance(target, await createPhaseThreeAcceptanceFixture());
     assert.equal(acceptance.status, "accepted");
     const bytes = await readFile(target);
     assert.notDeepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
