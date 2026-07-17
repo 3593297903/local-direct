@@ -753,8 +753,23 @@ function createPhaseThreeAcceptanceFixture() {
 
 test("phase-three contract benchmark runs the production preflight without mutation", async () => {
   const { runContractPreflightBenchmark } = await import("../scripts/benchmark-phase-3-contract-preflight.mjs");
-  const report = await runContractPreflightBenchmark({ contracts: 30, iterations: 5, warmups: 1 });
+  const report = await runContractPreflightBenchmark({
+    contracts: 30,
+    iterations: 10,
+    trials: 5,
+    warmups: 1,
+  });
+  assert.equal(report.benchmarkVersion, "phase-3-contract-preflight-v2");
   assert.equal(report.contracts, 30);
+  assert.equal(report.totalIterations, 10);
+  assert.equal(report.trialCount, 5);
+  assert.equal(report.iterationsPerTrial, 2);
+  assert.equal(report.rawSamplesMs.length, 10);
+  assert.equal(report.rawTimingsMs.count, 10);
+  assert.equal(report.trials.length, 5);
+  assert.equal(report.trials.reduce((total, trial) => total + trial.sampleCount, 0), 10);
+  assert.match(report.sampleDigest, /^[a-f0-9]{64}$/);
+  assert.match(report.trialDigest, /^[a-f0-9]{64}$/);
   assert.equal(report.metrics.attempts, 30);
   assert.equal(report.metrics.invalid, 0);
   assert.equal(report.semanticDigestStable, true);
@@ -777,6 +792,82 @@ test("phase-three contract benchmark runs the production preflight without mutat
     fallback: 0,
     singleGeneration: 0,
   });
+});
+
+test("contract timing trials preserve every sample and isolate a single long tail", async () => {
+  const { summarizeContractTimingTrials } = await import("../scripts/benchmark-phase-3-contract-preflight.mjs");
+  const samples = Array.from({ length: 1_000 }, () => 50);
+  samples[199] = 300;
+
+  const summary = summarizeContractTimingTrials(samples, {
+    trialCount: 5,
+    iterationsPerTrial: 200,
+  });
+
+  assert.deepEqual(summary.rawSamplesMs, samples);
+  assert.equal(summary.rawTimingsMs.count, 1_000);
+  assert.equal(summary.rawTimingsMs.p50, 50);
+  assert.equal(summary.rawTimingsMs.p95, 50);
+  assert.equal(summary.rawTimingsMs.p99, 50);
+  assert.equal(summary.rawTimingsMs.max, 300);
+  assert.ok(summary.rawTimingsMs.coefficientOfVariation > 0.15);
+  assert.equal(summary.trials.length, 5);
+  assert.deepEqual(summary.trials.map((trial) => trial.sampleCount), [200, 200, 200, 200, 200]);
+  assert.equal(summary.trials.reduce((total, trial) => total + trial.sampleCount, 0), 1_000);
+  assert.ok(summary.stability.coefficientOfVariation <= 0.15);
+  assert.match(summary.sampleDigest, /^[a-f0-9]{64}$/);
+  assert.match(summary.trialDigest, /^[a-f0-9]{64}$/);
+});
+
+test("contract timing trials use deterministic percentiles and preserve sample order in the digest", async () => {
+  const { summarizeContractTimingTrials } = await import("../scripts/benchmark-phase-3-contract-preflight.mjs");
+  const samples = Array.from({ length: 1_000 }, (_, index) => index + 1);
+  const summary = summarizeContractTimingTrials(samples, {
+    trialCount: 5,
+    iterationsPerTrial: 200,
+  });
+  const repeated = summarizeContractTimingTrials(samples, {
+    trialCount: 5,
+    iterationsPerTrial: 200,
+  });
+  const reversed = summarizeContractTimingTrials([...samples].reverse(), {
+    trialCount: 5,
+    iterationsPerTrial: 200,
+  });
+
+  assert.equal(summary.rawTimingsMs.p50, 500);
+  assert.equal(summary.rawTimingsMs.p95, 950);
+  assert.equal(summary.rawTimingsMs.p99, 990);
+  assert.deepEqual(summary.stability.trialMeans, [100.5, 300.5, 500.5, 700.5, 900.5]);
+  assert.equal(summary.sampleDigest, repeated.sampleDigest);
+  assert.equal(summary.trialDigest, repeated.trialDigest);
+  assert.notEqual(summary.sampleDigest, reversed.sampleDigest);
+  assert.notEqual(summary.trialDigest, reversed.trialDigest);
+});
+
+test("contract timing trials reject sustained window slowdown and malformed sample conservation", async () => {
+  const { summarizeContractTimingTrials } = await import("../scripts/benchmark-phase-3-contract-preflight.mjs");
+  const sustainedSlowdown = [
+    ...Array.from({ length: 800 }, () => 50),
+    ...Array.from({ length: 200 }, () => 100),
+  ];
+  const summary = summarizeContractTimingTrials(sustainedSlowdown, {
+    trialCount: 5,
+    iterationsPerTrial: 200,
+  });
+
+  assert.ok(summary.stability.coefficientOfVariation > 0.15);
+  assert.throws(() => summarizeContractTimingTrials(sustainedSlowdown.slice(1), {
+    trialCount: 5,
+    iterationsPerTrial: 200,
+  }), /sample conservation/i);
+  assert.throws(() => summarizeContractTimingTrials([
+    ...sustainedSlowdown.slice(0, -1),
+    Number.NaN,
+  ], {
+    trialCount: 5,
+    iterationsPerTrial: 200,
+  }), /finite non-negative/i);
 });
 
 test("phase-three acceptance rejects missing stale dirty or failed evidence", async () => {
