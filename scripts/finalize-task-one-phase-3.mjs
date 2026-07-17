@@ -203,12 +203,21 @@ export async function finalizePhaseThree({ evidenceRoot, baselineRoot, taskRoot 
 }
 
 function contractPreflightChecks(report, taskCommit, sourceFingerprint) {
+  const timingEvidence = inspectContractTimingEvidence(report);
   return [
     check("contract.report", Boolean(report && typeof report === "object")),
+    check("contract.benchmarkVersion", report?.benchmarkVersion === "phase-3-contract-preflight-v2"),
     check("contract.gitCommit", report?.gitCommit === taskCommit),
     check("contract.sourceFingerprint", isSha256(sourceFingerprint) && report?.sourceFingerprint === sourceFingerprint),
     check("contract.contracts", report?.contracts === 30),
-    check("contract.iterations", Number(report?.iterations) >= 1_000),
+    check("contract.iterations", report?.iterations === 1_000 && report?.totalIterations === 1_000),
+    check("contract.trialShape", timingEvidence.trialShape),
+    check("contract.sampleConservation", timingEvidence.sampleConservation),
+    check("contract.sampleDigest", timingEvidence.sampleDigest),
+    check("contract.trialDigest", timingEvidence.trialDigest),
+    check("contract.rawSummaryIntegrity", timingEvidence.rawSummaryIntegrity),
+    check("contract.trialSummaryIntegrity", timingEvidence.trialSummaryIntegrity),
+    check("contract.rawCvRecorded", timingEvidence.rawCvRecorded),
     check("contract.attempts", report?.metrics?.attempts === 30),
     check("contract.invalid", report?.metrics?.invalid === 0),
     check("contract.semanticStable", report?.semanticDigestStable === true),
@@ -217,11 +226,125 @@ function contractPreflightChecks(report, taskCommit, sourceFingerprint) {
     check("contract.noCanceledNeighbors", report?.canceledValidNeighbors === 0),
     check("contract.noTamperedCreate", report?.tamperedQueueCreates === 0),
     check("contract.noModelCalls", zeroCallObject(report?.calls)),
-    check("contract.p95", finiteAtMost(report?.timingsMs?.p95, 100)),
-    check("contract.cv", finiteAtMost(report?.timingsMs?.coefficientOfVariation, 0.15)),
+    check("contract.p95", finiteAtMost(report?.rawTimingsMs?.p95, 100)),
+    check("contract.p99", finiteAtMost(report?.rawTimingsMs?.p99, 200)),
+    check("contract.max", finiteAtMost(report?.rawTimingsMs?.max, 300)),
+    check("contract.trialMeanCv", finiteAtMost(report?.stability?.coefficientOfVariation, 0.15)),
     ...representativeContractSetChecks(report, 20),
     ...representativeContractSetChecks(report, 30),
   ];
+}
+
+function inspectContractTimingEvidence(report) {
+  const samples = Array.isArray(report?.rawSamplesMs) ? report.rawSamplesMs : [];
+  const trials = Array.isArray(report?.trials) ? report.trials : [];
+  const rawSamplesValid = samples.length === 1_000
+    && samples.every((value) => Number.isFinite(value) && value >= 0);
+  const expectedRaw = rawSamplesValid ? summarizeTimingValues(samples) : null;
+  const trialShape = report?.trialCount === 5
+    && report?.iterationsPerTrial === 200
+    && trials.length === 5
+    && trials.every((trial, index) => (
+      trial?.trialIndex === index + 1
+      && trial?.sampleCount === 200
+      && [trial?.p50, trial?.p95, trial?.mean, trial?.max]
+        .every((value) => Number.isFinite(value) && value >= 0)
+    ));
+  const expectedTrials = rawSamplesValid
+    ? Array.from({ length: 5 }, (_, index) => {
+      const timing = summarizeTimingValues(samples.slice(index * 200, (index + 1) * 200));
+      return {
+        trialIndex: index + 1,
+        sampleCount: 200,
+        p50: timing.p50,
+        p95: timing.p95,
+        mean: timing.mean,
+        max: timing.max,
+      };
+    })
+    : [];
+  const trialValuesMatch = trialShape
+    && expectedTrials.every((expected, index) => sameTimingTrial(trials[index], expected));
+  const expectedTrialMeans = expectedTrials.map((trial) => trial.mean);
+  const expectedStability = expectedTrialMeans.length === 5
+    ? summarizeTimingValues(expectedTrialMeans)
+    : null;
+  const stability = report?.stability;
+  const stabilityMatches = trialValuesMatch
+    && stability?.metric === "trial_mean_coefficient_of_variation_v1"
+    && stability?.trialCount === 5
+    && stability?.iterationsPerTrial === 200
+    && stability?.totalSampleCount === 1_000
+    && sameNumberArray(stability?.trialMeans, expectedTrialMeans)
+    && sameFiniteNumber(stability?.meanOfTrialMeans, expectedStability?.mean)
+    && sameFiniteNumber(stability?.standardDeviationOfTrialMeans, expectedStability?.standardDeviation)
+    && sameFiniteNumber(stability?.coefficientOfVariation, expectedStability?.coefficientOfVariation);
+  const conservation = report?.sampleConservation;
+  const trialSampleCount = trials.reduce((total, trial) => total + (Number.isInteger(trial?.sampleCount) ? trial.sampleCount : 0), 0);
+  return {
+    trialShape,
+    sampleConservation: rawSamplesValid
+      && trialShape
+      && trialSampleCount === 1_000
+      && conservation?.expectedSampleCount === 1_000
+      && conservation?.rawSampleCount === 1_000
+      && conservation?.trialSampleCount === 1_000
+      && conservation?.preserved === true,
+    sampleDigest: rawSamplesValid
+      && isSha256(report?.sampleDigest)
+      && report.sampleDigest === hashJson(samples),
+    trialDigest: trialShape
+      && isSha256(report?.trialDigest)
+      && report.trialDigest === hashJson(trials),
+    rawSummaryIntegrity: rawSamplesValid && sameTimingSummary(report?.rawTimingsMs, expectedRaw),
+    trialSummaryIntegrity: stabilityMatches,
+    rawCvRecorded: Number.isFinite(report?.rawTimingsMs?.coefficientOfVariation)
+      && report.rawTimingsMs.coefficientOfVariation >= 0,
+  };
+}
+
+function summarizeTimingValues(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  const at = (fraction) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * fraction) - 1))] || 0;
+  const mean = sorted.reduce((total, value) => total + value, 0) / Math.max(1, sorted.length);
+  const variance = sorted.reduce((total, value) => total + ((value - mean) ** 2), 0) / Math.max(1, sorted.length);
+  const standardDeviation = Math.sqrt(variance);
+  return {
+    count: sorted.length,
+    min: sorted[0] || 0,
+    p50: at(0.5),
+    p95: at(0.95),
+    p99: at(0.99),
+    max: sorted.at(-1) || 0,
+    mean,
+    standardDeviation,
+    coefficientOfVariation: mean ? standardDeviation / mean : 0,
+  };
+}
+
+function sameTimingSummary(actual, expected) {
+  return Boolean(actual && expected)
+    && actual.count === expected.count
+    && ["min", "p50", "p95", "p99", "max", "mean", "standardDeviation", "coefficientOfVariation"]
+      .every((key) => sameFiniteNumber(actual[key], expected[key]));
+}
+
+function sameTimingTrial(actual, expected) {
+  return actual?.trialIndex === expected.trialIndex
+    && actual?.sampleCount === expected.sampleCount
+    && ["p50", "p95", "mean", "max"].every((key) => sameFiniteNumber(actual?.[key], expected[key]));
+}
+
+function sameNumberArray(actual, expected) {
+  return Array.isArray(actual)
+    && Array.isArray(expected)
+    && actual.length === expected.length
+    && actual.every((value, index) => sameFiniteNumber(value, expected[index]));
+}
+
+function sameFiniteNumber(actual, expected) {
+  if (!Number.isFinite(actual) || !Number.isFinite(expected)) return false;
+  return Math.abs(actual - expected) <= 1e-9 * Math.max(1, Math.abs(expected));
 }
 
 function representativeContractSetChecks(report, count) {
@@ -304,9 +427,15 @@ function qualityChecks(report, count, taskCommit, baselineCommit) {
 
 function summarizeContract(report) {
   return report ? {
+    benchmarkVersion: report.benchmarkVersion,
     metrics: report.metrics,
     representativeContractSets: report.representativeContractSets,
-    timingsMs: report.timingsMs,
+    rawTimingsMs: report.rawTimingsMs,
+    trials: report.trials,
+    stability: report.stability,
+    sampleDigest: report.sampleDigest,
+    trialDigest: report.trialDigest,
+    sampleConservation: report.sampleConservation,
     calls: report.calls,
   } : null;
 }

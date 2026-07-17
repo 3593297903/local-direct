@@ -634,6 +634,58 @@ const PHASE_THREE_COMMAND_IDS = [
   "git-merge-tree",
 ];
 
+function createPhaseThreeContractTimingFixture() {
+  const rawSamplesMs = Array.from({ length: 1_000 }, () => 50);
+  const trials = Array.from({ length: 5 }, (_, index) => ({
+    trialIndex: index + 1,
+    sampleCount: 200,
+    p50: 50,
+    p95: 50,
+    mean: 50,
+    max: 50,
+  }));
+  const rawTimingsMs = {
+    count: 1_000,
+    min: 50,
+    p50: 50,
+    p95: 50,
+    p99: 50,
+    max: 50,
+    mean: 50,
+    standardDeviation: 0,
+    coefficientOfVariation: 0,
+  };
+  return {
+    benchmarkVersion: "phase-3-contract-preflight-v2",
+    totalIterations: 1_000,
+    trialCount: 5,
+    iterationsPerTrial: 200,
+    globalWarmups: 30,
+    rawSamplesMs,
+    rawTimingsMs,
+    trials,
+    stability: {
+      metric: "trial_mean_coefficient_of_variation_v1",
+      trialCount: 5,
+      iterationsPerTrial: 200,
+      totalSampleCount: 1_000,
+      trialMeans: [50, 50, 50, 50, 50],
+      meanOfTrialMeans: 50,
+      standardDeviationOfTrialMeans: 0,
+      coefficientOfVariation: 0,
+    },
+    sampleDigest: createHash("sha256").update(JSON.stringify(rawSamplesMs), "utf8").digest("hex"),
+    trialDigest: createHash("sha256").update(JSON.stringify(trials), "utf8").digest("hex"),
+    sampleConservation: {
+      expectedSampleCount: 1_000,
+      rawSampleCount: 1_000,
+      trialSampleCount: 1_000,
+      preserved: true,
+    },
+    timingsMs: { ...rawTimingsMs },
+  };
+}
+
 function createPhaseThreeAcceptanceFixture() {
   const taskCommit = "a".repeat(40);
   const baselineCommit = "b".repeat(40);
@@ -681,6 +733,7 @@ function createPhaseThreeAcceptanceFixture() {
     reports: {
       contractPreflight: {
         schemaVersion: 1,
+        ...createPhaseThreeContractTimingFixture(),
         gitCommit: taskCommit,
         sourceFingerprint: "e".repeat(64),
         contracts: 30,
@@ -706,7 +759,6 @@ function createPhaseThreeAcceptanceFixture() {
         tamperedQueueCreates: 0,
         semanticDigestStable: true,
         sourceMutationCount: 0,
-        timingsMs: { p50: 5, p95: 8, coefficientOfVariation: 0.1 },
       },
       lifecycle: {
         status: "accepted",
@@ -922,6 +974,92 @@ test("phase-three acceptance requires representative Contract evidence for 20 an
   const oversized20 = structuredClone(valid);
   oversized20.reports.contractPreflight.representativeContractSets["20"].maxByteLength = 3_073;
   assert.equal(evaluatePhaseThreeAcceptance(oversized20).status, "rejected");
+});
+
+test("phase-three acceptance requires v2 trial evidence, digests, and exact sample conservation", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = createPhaseThreeAcceptanceFixture();
+  assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
+
+  const oldSchema = structuredClone(valid);
+  delete oldSchema.reports.contractPreflight.benchmarkVersion;
+  assert.equal(evaluatePhaseThreeAcceptance(oldSchema).status, "rejected");
+
+  const wrongTrialCount = structuredClone(valid);
+  wrongTrialCount.reports.contractPreflight.trialCount = 4;
+  assert.equal(evaluatePhaseThreeAcceptance(wrongTrialCount).status, "rejected");
+
+  const missingTrial = structuredClone(valid);
+  missingTrial.reports.contractPreflight.trials.pop();
+  assert.equal(evaluatePhaseThreeAcceptance(missingTrial).status, "rejected");
+
+  const missingSample = structuredClone(valid);
+  missingSample.reports.contractPreflight.rawSamplesMs.pop();
+  assert.equal(evaluatePhaseThreeAcceptance(missingSample).status, "rejected");
+
+  const forgedConservation = structuredClone(valid);
+  forgedConservation.reports.contractPreflight.sampleConservation.rawSampleCount = 999;
+  assert.equal(evaluatePhaseThreeAcceptance(forgedConservation).status, "rejected");
+
+  const forgedSampleDigest = structuredClone(valid);
+  forgedSampleDigest.reports.contractPreflight.sampleDigest = "0".repeat(64);
+  assert.equal(evaluatePhaseThreeAcceptance(forgedSampleDigest).status, "rejected");
+
+  const forgedTrialDigest = structuredClone(valid);
+  forgedTrialDigest.reports.contractPreflight.trialDigest = "0".repeat(64);
+  assert.equal(evaluatePhaseThreeAcceptance(forgedTrialDigest).status, "rejected");
+
+  const mutatedSample = structuredClone(valid);
+  mutatedSample.reports.contractPreflight.rawSamplesMs[0] = 51;
+  assert.equal(evaluatePhaseThreeAcceptance(mutatedSample).status, "rejected");
+
+  const wrongMetric = structuredClone(valid);
+  wrongMetric.reports.contractPreflight.stability.metric = "trial_mean_cv_legacy";
+  assert.equal(evaluatePhaseThreeAcceptance(wrongMetric).status, "rejected");
+});
+
+test("phase-three acceptance gates raw tails and trial stability without gating raw CV alone", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const { summarizeContractTimingTrials } = await import("../scripts/benchmark-phase-3-contract-preflight.mjs");
+  const installTimingEvidence = (fixture, samples) => {
+    const evidence = summarizeContractTimingTrials(samples, {
+      trialCount: 5,
+      iterationsPerTrial: 200,
+    });
+    Object.assign(fixture.reports.contractPreflight, evidence, {
+      timingsMs: { ...evidence.rawTimingsMs },
+    });
+  };
+  const valid = createPhaseThreeAcceptanceFixture();
+  assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
+
+  for (const [field, samples] of [
+    ["p95", Array.from({ length: 1_000 }, (_, index) => (index % 20 === 0 || index === 1 ? 101 : 50))],
+    ["p99", Array.from({ length: 1_000 }, (_, index) => (index % 100 === 0 || index === 1 ? 201 : 50))],
+    ["max", Array.from({ length: 1_000 }, (_, index) => (index === 0 ? 301 : 50))],
+  ]) {
+    const exceeded = structuredClone(valid);
+    installTimingEvidence(exceeded, samples);
+    assert.equal(evaluatePhaseThreeAcceptance(exceeded).status, "rejected", field);
+  }
+
+  const unstableTrials = structuredClone(valid);
+  installTimingEvidence(unstableTrials, [
+    ...Array.from({ length: 800 }, () => 50),
+    ...Array.from({ length: 200 }, () => 100),
+  ]);
+  assert.equal(evaluatePhaseThreeAcceptance(unstableTrials).status, "rejected");
+
+  const diagnosticRawCv = structuredClone(valid);
+  installTimingEvidence(diagnosticRawCv, Array.from({ length: 1_000 }, (_, index) => (index === 199 ? 300 : 50)));
+  assert.ok(diagnosticRawCv.reports.contractPreflight.rawTimingsMs.coefficientOfVariation > 0.15);
+  assert.equal(evaluatePhaseThreeAcceptance(diagnosticRawCv).status, "accepted");
+
+  for (const value of [undefined, -0.01, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const invalidRawCv = structuredClone(valid);
+    invalidRawCv.reports.contractPreflight.rawTimingsMs.coefficientOfVariation = value;
+    assert.equal(evaluatePhaseThreeAcceptance(invalidRawCv).status, "rejected");
+  }
 });
 
 test("phase-three acceptance allows the refresh recovery regression test in the Phase 3R diff", async () => {
