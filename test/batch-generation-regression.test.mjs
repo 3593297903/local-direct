@@ -59,6 +59,9 @@ const MODEL_KINDS = [
   "safety_rewrite",
   "contract_correction",
 ];
+const CONTRACT_SOURCE_FINGERPRINT = "c".repeat(64);
+const QUALITY_PRODUCTION_SOURCE_FINGERPRINT =
+  "805aa2b46f96d33fd89c5fa4a82a8d7390bde1983c0f62139a988e0d2a78a237";
 
 const REQUIRED_EXTERNAL_COMMAND_IDS = [
   "focused-tests",
@@ -711,7 +714,6 @@ async function createPhaseThreeAcceptanceFixture() {
   } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
   const taskCommit = "a".repeat(40);
   const baselineCommit = "b".repeat(40);
-  const sourceFingerprint = "805aa2b46f96d33fd89c5fa4a82a8d7390bde1983c0f62139a988e0d2a78a237";
   const replay20 = replayFixture(fixture20);
   const replay30 = replayFixture(fixture30);
   const zeroCalls = {
@@ -737,7 +739,7 @@ async function createPhaseThreeAcceptanceFixture() {
     },
     extensions: {
       adapterVersion: FROZEN_DASHBOARD_ADAPTER_VERSION,
-      productionSourceFingerprint: sourceFingerprint,
+      productionSourceFingerprint: QUALITY_PRODUCTION_SOURCE_FINGERPRINT,
       canonicalPromptHashes,
       localPatchOperations,
       queueScanStatus: "skipped_unchanged_scope",
@@ -760,13 +762,17 @@ async function createPhaseThreeAcceptanceFixture() {
   const fixture = {
     taskCommit,
     baselineCommit,
-    sourceFingerprint,
+    sourceFingerprints: {
+      contractPreflight: CONTRACT_SOURCE_FINGERPRINT,
+      taskDashboardQuality: QUALITY_PRODUCTION_SOURCE_FINGERPRINT,
+      baselineDashboardQuality: QUALITY_PRODUCTION_SOURCE_FINGERPRINT,
+    },
     reports: {
       contractPreflight: {
         schemaVersion: 1,
         ...createPhaseThreeContractTimingFixture(),
         gitCommit: taskCommit,
-        sourceFingerprint,
+        sourceFingerprint: CONTRACT_SOURCE_FINGERPRINT,
         contracts: 30,
         iterations: 1000,
         metrics: { attempts: 30, invalid: 0 },
@@ -1306,6 +1312,73 @@ test("phase-three finalizer accepts independently aggregated nonconstant quality
   assert.equal(inspection.rawSummaryIntegrity, true);
   assert.equal(inspection.comparisonIntegrity, true);
   assert.equal(evaluatePhaseThreeAcceptance(valid).status, "accepted");
+});
+
+test("phase-three finalizer accepts distinct contract and Dashboard source fingerprints", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const valid = await createPhaseThreeAcceptanceFixture();
+  assert.notEqual(
+    valid.sourceFingerprints.contractPreflight,
+    valid.sourceFingerprints.taskDashboardQuality,
+  );
+  const acceptance = evaluatePhaseThreeAcceptance(valid);
+  assert.equal(acceptance.status, "accepted");
+  assert.deepEqual(acceptance.sourceFingerprints, valid.sourceFingerprints);
+});
+
+test("phase-three finalizer rejects a Contract fingerprint copied into quality evidence", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const forged = await createPhaseThreeAcceptanceFixture();
+  forged.reports.benchmark20.extensions.productionSourceFingerprint = CONTRACT_SOURCE_FINGERPRINT;
+  forged.reports.benchmark30.extensions.productionSourceFingerprint = CONTRACT_SOURCE_FINGERPRINT;
+  const acceptance = evaluatePhaseThreeAcceptance(forged);
+  assert.equal(acceptance.status, "rejected");
+  assert.ok(acceptance.failedRequiredCheckIds.includes("quality20.productionSourceFingerprint"));
+  assert.ok(acceptance.failedRequiredCheckIds.includes("quality30.productionSourceFingerprint"));
+});
+
+test("phase-three finalizer rejects a Dashboard fingerprint copied into Contract evidence", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const forged = await createPhaseThreeAcceptanceFixture();
+  forged.reports.contractPreflight.sourceFingerprint = QUALITY_PRODUCTION_SOURCE_FINGERPRINT;
+  const acceptance = evaluatePhaseThreeAcceptance(forged);
+  assert.equal(acceptance.status, "rejected");
+  assert.ok(acceptance.failedRequiredCheckIds.includes("contract.sourceFingerprint"));
+});
+
+test("phase-three finalizer rejects task and baseline Dashboard fingerprint drift", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const drifted = await createPhaseThreeAcceptanceFixture();
+  drifted.sourceFingerprints.baselineDashboardQuality = "d".repeat(64);
+  const acceptance = evaluatePhaseThreeAcceptance(drifted);
+  assert.equal(acceptance.status, "rejected");
+  assert.ok(acceptance.failedRequiredCheckIds.includes("identity.dashboardQualitySourceParity"));
+});
+
+test("phase-three finalizer rejects the legacy ambiguous sourceFingerprint input", async () => {
+  const { evaluatePhaseThreeAcceptance } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const legacy = await createPhaseThreeAcceptanceFixture();
+  legacy.sourceFingerprint = QUALITY_PRODUCTION_SOURCE_FINGERPRINT;
+  delete legacy.sourceFingerprints;
+  const acceptance = evaluatePhaseThreeAcceptance(legacy);
+  assert.equal(acceptance.status, "rejected");
+  assert.ok(acceptance.failedRequiredCheckIds.includes("identity.sourceFingerprints"));
+});
+
+test("phase-three source fingerprints are derived independently from live roots", async () => {
+  const {
+    derivePhaseThreeSourceFingerprints,
+  } = await import("../scripts/finalize-task-one-phase-3.mjs");
+  const sourceFingerprints = await derivePhaseThreeSourceFingerprints(
+    process.cwd(),
+    process.cwd(),
+  );
+  const dashboardFingerprint =
+    extractDashboardProductionSourceFingerprint(process.cwd()).fingerprint;
+  assert.equal(sourceFingerprints.taskDashboardQuality, dashboardFingerprint);
+  assert.equal(sourceFingerprints.baselineDashboardQuality, dashboardFingerprint);
+  assert.equal(sourceFingerprints.taskDashboardQuality, QUALITY_PRODUCTION_SOURCE_FINGERPRINT);
+  assert.notEqual(sourceFingerprints.contractPreflight, sourceFingerprints.taskDashboardQuality);
 });
 
 for (const [label, mutate] of [

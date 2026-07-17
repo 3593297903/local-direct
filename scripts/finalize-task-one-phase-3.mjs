@@ -1,10 +1,20 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+process.env.TS_NODE_COMPILER_OPTIONS = JSON.stringify({
+  module: "commonjs",
+  moduleResolution: "node",
+});
+const require = createRequire(import.meta.url);
+require("ts-node/register/transpile-only");
+const {
+  extractDashboardProductionSourceFingerprint,
+} = require("../lib/batch-generation-metrics.ts");
 const PHASE_THREE_START_COMMIT = "de4443c09cbf34bc68bf8dbb0123391376025d47";
 const EXPECTED_QUALITY_ADAPTER_VERSION = "frozen-dashboard-local-v2";
 const EXPECTED_PRODUCTION_SOURCE_FINGERPRINT = "805aa2b46f96d33fd89c5fa4a82a8d7390bde1983c0f62139a988e0d2a78a237";
@@ -84,7 +94,12 @@ export function evaluatePhaseThreeAcceptance(input) {
   const checks = [];
   const taskCommit = input?.taskCommit;
   const baselineCommit = input?.baselineCommit;
-  const sourceFingerprint = input?.sourceFingerprint;
+  const sourceFingerprints = input?.sourceFingerprints && typeof input.sourceFingerprints === "object"
+    ? input.sourceFingerprints
+    : {};
+  const contractSourceFingerprint = sourceFingerprints.contractPreflight;
+  const taskDashboardQualitySourceFingerprint = sourceFingerprints.taskDashboardQuality;
+  const baselineDashboardQualitySourceFingerprint = sourceFingerprints.baselineDashboardQuality;
   const reports = input?.reports || {};
   const commandResults = input?.commandResults || {};
   const git = input?.git || {};
@@ -92,6 +107,21 @@ export function evaluatePhaseThreeAcceptance(input) {
   checks.push(
     check("identity.taskCommit", isHash(taskCommit)),
     check("identity.baselineCommit", isHash(baselineCommit)),
+    check("identity.sourceFingerprints", Boolean(input?.sourceFingerprints && typeof input.sourceFingerprints === "object")),
+    check("identity.legacySourceFingerprint", !Object.prototype.hasOwnProperty.call(input || {}, "sourceFingerprint")),
+    check("identity.contractSourceFingerprint", isSha256(contractSourceFingerprint)),
+    check("identity.taskDashboardQualitySourceFingerprint", isSha256(taskDashboardQualitySourceFingerprint)),
+    check("identity.baselineDashboardQualitySourceFingerprint", isSha256(baselineDashboardQualitySourceFingerprint)),
+    check(
+      "identity.dashboardQualitySourceParity",
+      taskDashboardQualitySourceFingerprint === baselineDashboardQualitySourceFingerprint,
+    ),
+    check(
+      "identity.sourceFingerprintSeparation",
+      isSha256(contractSourceFingerprint)
+        && isSha256(taskDashboardQualitySourceFingerprint)
+        && contractSourceFingerprint !== taskDashboardQualitySourceFingerprint,
+    ),
     check("commands.schemaVersion", commandResults.schemaVersion === 1),
     check("commands.taskCommit", commandResults.taskCommit === taskCommit),
     check("commands.baselineCommit", commandResults.baselineCommit === baselineCommit),
@@ -112,10 +142,24 @@ export function evaluatePhaseThreeAcceptance(input) {
     );
   }
 
-  checks.push(...contractPreflightChecks(reports.contractPreflight, taskCommit, sourceFingerprint));
+  checks.push(...contractPreflightChecks(reports.contractPreflight, taskCommit, contractSourceFingerprint));
   checks.push(...lifecycleChecks(reports.lifecycle));
-  checks.push(...qualityChecks(reports.benchmark20, 20, taskCommit, baselineCommit, sourceFingerprint));
-  checks.push(...qualityChecks(reports.benchmark30, 30, taskCommit, baselineCommit, sourceFingerprint));
+  checks.push(...qualityChecks(
+    reports.benchmark20,
+    20,
+    taskCommit,
+    baselineCommit,
+    taskDashboardQualitySourceFingerprint,
+    baselineDashboardQualitySourceFingerprint,
+  ));
+  checks.push(...qualityChecks(
+    reports.benchmark30,
+    30,
+    taskCommit,
+    baselineCommit,
+    taskDashboardQualitySourceFingerprint,
+    baselineDashboardQualitySourceFingerprint,
+  ));
 
   const mergeCommand = commands.find((command) => command?.commandId === "git-merge-tree");
   const changedFiles = Array.isArray(git.changedFiles) ? git.changedFiles : [];
@@ -141,6 +185,11 @@ export function evaluatePhaseThreeAcceptance(input) {
     baselineCommit: baselineCommit || null,
     checks,
     failedRequiredCheckIds,
+    sourceFingerprints: {
+      contractPreflight: contractSourceFingerprint || null,
+      taskDashboardQuality: taskDashboardQualitySourceFingerprint || null,
+      baselineDashboardQuality: baselineDashboardQualitySourceFingerprint || null,
+    },
     summaries: {
       contractPreflight: summarizeContract(reports.contractPreflight),
       lifecycle: summarizeLifecycle(reports.lifecycle),
@@ -183,11 +232,11 @@ export async function finalizePhaseThree({ evidenceRoot, baselineRoot, taskRoot 
     .split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
   const commands = Array.isArray(commandResults.commands) ? commandResults.commands : [];
   const mergeCommand = commands.find((command) => command?.commandId === "git-merge-tree");
-  const sourceFingerprint = await productionSourceFingerprint(taskRoot);
+  const sourceFingerprints = await derivePhaseThreeSourceFingerprints(taskRoot, resolvedBaselineRoot);
   const input = {
     taskCommit,
     baselineCommit,
-    sourceFingerprint,
+    sourceFingerprints,
     reports,
     commandResults,
     git: {
@@ -401,7 +450,14 @@ function lifecycleChecks(report) {
   ];
 }
 
-function qualityChecks(report, count, taskCommit, baselineCommit, sourceFingerprint) {
+function qualityChecks(
+  report,
+  count,
+  taskCommit,
+  baselineCommit,
+  taskDashboardQualitySourceFingerprint,
+  baselineDashboardQualitySourceFingerprint,
+) {
   const expected = EXPECTED_FIXTURES[count];
   const canonicalHashes = report?.extensions?.canonicalPromptHashes;
   const digest = Array.isArray(canonicalHashes) ? hashJson(canonicalHashes) : null;
@@ -415,8 +471,9 @@ function qualityChecks(report, count, taskCommit, baselineCommit, sourceFingerpr
     check(`quality${count}.adapterVersion`, report?.extensions?.adapterVersion === EXPECTED_QUALITY_ADAPTER_VERSION),
     check(
       `quality${count}.productionSourceFingerprint`,
-      sourceFingerprint === EXPECTED_PRODUCTION_SOURCE_FINGERPRINT
-        && report?.extensions?.productionSourceFingerprint === sourceFingerprint,
+      taskDashboardQualitySourceFingerprint === EXPECTED_PRODUCTION_SOURCE_FINGERPRINT
+        && baselineDashboardQualitySourceFingerprint === taskDashboardQualitySourceFingerprint
+        && report?.extensions?.productionSourceFingerprint === taskDashboardQualitySourceFingerprint,
     ),
     check(`quality${count}.accepted`, report?.quality?.accepted === count),
     check(`quality${count}.blocked`, report?.quality?.blocked === 0),
@@ -811,7 +868,15 @@ async function readJsonSafe(target) {
   }
 }
 
-async function productionSourceFingerprint(root) {
+export async function derivePhaseThreeSourceFingerprints(taskRoot, baselineRoot) {
+  return {
+    contractPreflight: await contractPreflightSourceFingerprint(taskRoot),
+    taskDashboardQuality: extractDashboardProductionSourceFingerprint(taskRoot).fingerprint,
+    baselineDashboardQuality: extractDashboardProductionSourceFingerprint(baselineRoot).fingerprint,
+  };
+}
+
+async function contractPreflightSourceFingerprint(root) {
   const files = [
     "lib/codex-prompt-input-compiler.ts",
     "lib/batch-contract-preflight.ts",
