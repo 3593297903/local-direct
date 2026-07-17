@@ -686,6 +686,23 @@ function createPhaseThreeContractTimingFixture() {
   };
 }
 
+function createPairedQualityTimingPairs({
+  pairCount = 400,
+  baselineForPair = () => 50,
+  taskForPair = (_pairIndex, baselineMs) => baselineMs,
+} = {}) {
+  return Array.from({ length: pairCount }, (_, index) => {
+    const pairIndex = index + 1;
+    const baselineMs = baselineForPair(pairIndex);
+    return {
+      pairIndex,
+      order: pairIndex % 2 === 1 ? "baseline_first" : "task_first",
+      baselineMs,
+      taskMs: taskForPair(pairIndex, baselineMs),
+    };
+  });
+}
+
 function createPhaseThreeAcceptanceFixture() {
   const taskCommit = "a".repeat(40);
   const baselineCommit = "b".repeat(40);
@@ -920,6 +937,176 @@ test("contract timing trials reject sustained window slowdown and malformed samp
     trialCount: 5,
     iterationsPerTrial: 200,
   }), /finite non-negative/i);
+});
+
+test("paired quality timing preserves all 400 pairs and 5x80 trials", async () => {
+  const { summarizePairedQualityTimingTrials } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const pairs = createPairedQualityTimingPairs();
+  const summary = summarizePairedQualityTimingTrials(pairs, {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  });
+
+  assert.deepEqual(summary.rawPairs, pairs);
+  assert.equal(summary.totalPairs, 400);
+  assert.equal(summary.trials.length, 5);
+  assert.deepEqual(summary.trials.map((trial) => trial.pairCount), [80, 80, 80, 80, 80]);
+  assert.equal(summary.sampleConservation.rawPairCount, 400);
+  assert.equal(summary.sampleConservation.baselineSampleCount, 400);
+  assert.equal(summary.sampleConservation.taskSampleCount, 400);
+  assert.equal(summary.sampleConservation.trialPairCount, 400);
+  assert.equal(summary.sampleConservation.preserved, true);
+  assert.match(summary.pairDigest, /^[a-f0-9]{64}$/);
+  assert.match(summary.trialDigest, /^[a-f0-9]{64}$/);
+});
+
+test("paired quality timing balances execution order in every trial", async () => {
+  const { summarizePairedQualityTimingTrials } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const summary = summarizePairedQualityTimingTrials(createPairedQualityTimingPairs(), {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  });
+
+  assert.deepEqual(
+    summary.trials.map((trial) => [trial.baselineFirstCount, trial.taskFirstCount]),
+    Array.from({ length: 5 }, () => [40, 40]),
+  );
+  assert.deepEqual(summary.orderConservation, {
+    baselineFirstCount: 200,
+    taskFirstCount: 200,
+    balanced: true,
+  });
+});
+
+test("paired quality timing records raw CV without using it as the only gate", async () => {
+  const {
+    evaluatePairedQualityPerformance,
+    summarizePairedQualityTimingTrials,
+  } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const summary = summarizePairedQualityTimingTrials(createPairedQualityTimingPairs({
+    baselineForPair: (pairIndex) => (pairIndex === 1 ? 500 : 50),
+  }), {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  });
+  const acceptance = evaluatePairedQualityPerformance({
+    comparison: { full_local_pipeline_total: { p50Ratio: 1, p95Ratio: 1 } },
+    pairedTimingEvidence: summary,
+    invariantPassed: true,
+    qualityPassed: true,
+  });
+
+  assert.ok(summary.baselineRawTimingsMs.coefficientOfVariation > 0.15);
+  assert.ok(summary.taskRawTimingsMs.coefficientOfVariation > 0.15);
+  assert.equal(acceptance.status, "accepted");
+});
+
+test("paired quality timing cancels common-mode whole-trial slowdown", async () => {
+  const { summarizePairedQualityTimingTrials } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const summary = summarizePairedQualityTimingTrials(createPairedQualityTimingPairs({
+    baselineForPair: (pairIndex) => (pairIndex > 320 ? 100 : 50),
+  }), {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  });
+
+  assert.deepEqual(summary.stability.trialRatios, [1, 1, 1, 1, 1]);
+  assert.equal(summary.stability.meanRatio, 1);
+  assert.equal(summary.stability.coefficientOfVariation, 0);
+  assert.equal(summary.stability.maxTrialRatio, 1);
+});
+
+test("paired quality timing rejects task-only sustained trial slowdown", async () => {
+  const {
+    evaluatePairedQualityPerformance,
+    summarizePairedQualityTimingTrials,
+  } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const summary = summarizePairedQualityTimingTrials(createPairedQualityTimingPairs({
+    taskForPair: (pairIndex, baselineMs) => (pairIndex > 320 ? 60 : baselineMs),
+  }), {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  });
+  const acceptance = evaluatePairedQualityPerformance({
+    comparison: { full_local_pipeline_total: { p50Ratio: 1, p95Ratio: 1 } },
+    pairedTimingEvidence: summary,
+    invariantPassed: true,
+    qualityPassed: true,
+  });
+
+  assert.equal(summary.stability.maxTrialRatio, 1.2);
+  assert.equal(acceptance.status, "rejected");
+  assert.ok(acceptance.failedCheckIds.includes("paired.max_trial_ratio"));
+});
+
+test("paired quality timing rejects a stable six-percent regression", async () => {
+  const {
+    evaluatePairedQualityPerformance,
+    summarizePairedQualityTimingTrials,
+  } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const summary = summarizePairedQualityTimingTrials(createPairedQualityTimingPairs({
+    taskForPair: () => 53,
+  }), {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  });
+  const acceptance = evaluatePairedQualityPerformance({
+    comparison: { full_local_pipeline_total: { p50Ratio: 1.06, p95Ratio: 1.06 } },
+    pairedTimingEvidence: summary,
+    invariantPassed: true,
+    qualityPassed: true,
+  });
+
+  assert.equal(summary.stability.coefficientOfVariation, 0);
+  assert.equal(summary.stability.meanRatio, 1.06);
+  assert.equal(acceptance.status, "rejected");
+  assert.ok(acceptance.failedCheckIds.includes("comparison.p50_ratio"));
+  assert.ok(acceptance.failedCheckIds.includes("comparison.p95_ratio"));
+  assert.ok(acceptance.failedCheckIds.includes("paired.mean_ratio"));
+});
+
+test("paired quality timing rejects missing reordered or non-finite pairs", async () => {
+  const { summarizePairedQualityTimingTrials } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const pairs = createPairedQualityTimingPairs();
+
+  assert.throws(() => summarizePairedQualityTimingTrials(pairs.slice(1), {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  }), /pair conservation/i);
+  assert.throws(() => summarizePairedQualityTimingTrials([
+    pairs[1],
+    pairs[0],
+    ...pairs.slice(2),
+  ], {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  }), /pairIndex|order/i);
+  const nonFinite = structuredClone(pairs);
+  nonFinite[10].taskMs = Number.NaN;
+  assert.throws(() => summarizePairedQualityTimingTrials(nonFinite, {
+    trialCount: 5,
+    pairsPerTrial: 80,
+  }), /finite positive/i);
+});
+
+test("quality benchmark writes a rejected report before returning failure", async () => {
+  const { writeQualityBenchmarkReport } = await import("../scripts/benchmark-batch-generation-pipeline.mjs");
+  const root = path.join(process.cwd(), ".tmp-batch-benchmark", `paired-write-${process.pid}-${Date.now()}`);
+  const target = path.join(root, "rejected.json");
+  const report = {
+    qualityBenchmarkVersion: "phase-3-quality-paired-v1",
+    performanceAcceptance: {
+      status: "rejected",
+      checks: [{ id: "paired.mean_ratio", passed: false, actual: 1.06, limit: 1.05 }],
+      failedCheckIds: ["paired.mean_ratio"],
+    },
+  };
+  try {
+    await assert.rejects(writeQualityBenchmarkReport(target, report), /paired.mean_ratio/);
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), report);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("phase-three acceptance rejects missing stale dirty or failed evidence", async () => {

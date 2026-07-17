@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -28,13 +29,17 @@ const OBSERVED_QUEUE_PAYLOAD_BYTES = Object.freeze({
 });
 const QUEUE_SCAN_COUNTS = Object.freeze([0, 100, 500, 1000]);
 const VALID_JOB_STATUSES = new Set(["pending", "running", "completed", "failed"]);
+const PAIRED_QUALITY_BENCHMARK_VERSION = "phase-3-quality-paired-v1";
+const PAIRED_QUALITY_METRIC = "paired_trial_mean_ratio_cv_v1";
 
 export async function runBenchmarkCli(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   const fixtureNumber = args.fixture === "30" ? 30 : args.fixture === "20" ? 20 : 0;
   if (!fixtureNumber) throw new Error("--fixture must be 20 or 30");
   const iterations = positiveInteger(args.iterations, 400);
-  if (iterations < 400) throw new Error("--iterations must be at least 400 for an accepted Phase 0 report");
+  const trialCount = positiveInteger(args.trials, 5);
+  if (iterations !== 400) throw new Error("--iterations must be exactly 400 for an accepted Phase 3 quality report");
+  if (trialCount !== 5) throw new Error("--trials must be exactly 5 for an accepted Phase 3 quality report");
   const warmups = 30;
   const taskRoot = path.resolve(scriptRoot);
   const baselineRoot = path.resolve(args["baseline-root"] || taskRoot);
@@ -67,14 +72,26 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
 
   const baselineRuns = [];
   const taskRuns = [];
+  const pairedRuns = [];
   for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const pairIndex = iteration + 1;
+    let baselineRun;
+    let taskRun;
     if (iteration % 2 === 0) {
-      baselineRuns.push(runTimedBatchFixtureReplay(fixture, baselineAdapter));
-      taskRuns.push(runTimedBatchFixtureReplay(fixture, taskAdapter));
+      baselineRun = runTimedBatchFixtureReplay(fixture, baselineAdapter);
+      taskRun = runTimedBatchFixtureReplay(fixture, taskAdapter);
     } else {
-      taskRuns.push(runTimedBatchFixtureReplay(fixture, taskAdapter));
-      baselineRuns.push(runTimedBatchFixtureReplay(fixture, baselineAdapter));
+      taskRun = runTimedBatchFixtureReplay(fixture, taskAdapter);
+      baselineRun = runTimedBatchFixtureReplay(fixture, baselineAdapter);
     }
+    baselineRuns.push(baselineRun);
+    taskRuns.push(taskRun);
+    pairedRuns.push({
+      pairIndex,
+      order: pairIndex % 2 === 1 ? "baseline_first" : "task_first",
+      baselineMs: baselineRun.timingsMs.full_local_pipeline_total,
+      taskMs: taskRun.timingsMs.full_local_pipeline_total,
+    });
   }
 
   const outputPath = path.resolve(args.output || path.join(
@@ -110,32 +127,42 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
     extensions: createBenchmarkExtensions(taskAdapter, quality, queueBenchmark.extensions),
     generatedAt: new Date().toISOString(),
   });
-  assertBatchBenchmarkInvariants(report);
+  const invariantResult = captureBenchmarkAssertion(() => assertBatchBenchmarkInvariants(report));
   const pipelineVariation = report.timingsMs.full_local_pipeline_total.coefficientOfVariation;
-  if (pipelineVariation >= 0.15) {
-    throw new Error(`Benchmark environment is unstable: full pipeline coefficient of variation ${pipelineVariation.toFixed(4)}`);
-  }
 
+  const comparison = compareAggregates(baselineAggregate, taskAggregate);
+  const pairedTimingEvidence = summarizePairedQualityTimingTrials(pairedRuns, {
+    trialCount,
+    pairsPerTrial: iterations / trialCount,
+  });
+  const qualityResult = captureBenchmarkAssertion(() => {
+    assertReplayQualityNotRegressed(baselineRuns.at(-1).quality, quality);
+  });
+  const performanceAcceptance = evaluatePairedQualityPerformance({
+    comparison,
+    pairedTimingEvidence,
+    invariantPassed: invariantResult.passed,
+    qualityPassed: qualityResult.passed,
+  });
   const finalReport = {
     ...report,
+    qualityBenchmarkVersion: PAIRED_QUALITY_BENCHMARK_VERSION,
     baseline: {
       root: baselineRoot,
       gitCommit: gitValue(baselineRoot, ["rev-parse", "HEAD"]),
       timingsMs: baselineAggregate.timingsMs,
       payloadBytes: baselineAggregate.payloadBytes,
     },
-    comparison: compareAggregates(baselineAggregate, taskAggregate),
+    comparison,
+    pairedTimingEvidence,
+    performanceAcceptance,
+    assertionDiagnostics: {
+      invariants: invariantResult,
+      quality: qualityResult,
+    },
     environment: await collectEnvironment(taskRoot, { skipQueueScan }),
   };
-  const fullPipelineComparison = finalReport.comparison.full_local_pipeline_total;
-  if (fullPipelineComparison.p50Ratio > 1.05 || fullPipelineComparison.p95Ratio > 1.05) {
-    throw new Error(
-      `Frozen pipeline regression exceeds 105%: p50=${fullPipelineComparison.p50Ratio.toFixed(4)}, p95=${fullPipelineComparison.p95Ratio.toFixed(4)}`,
-    );
-  }
-  assertReplayQualityNotRegressed(baselineRuns.at(-1).quality, quality);
-  await mkdir(path.dirname(outputPath), { recursive: true });
-  await writeFile(outputPath, `${JSON.stringify(finalReport, null, 2)}\n`, "utf8");
+  await writeQualityBenchmarkReport(outputPath, finalReport);
   console.log(JSON.stringify({
     reportPath: outputPath,
     fixtureId: report.fixtureId,
@@ -148,6 +175,200 @@ export async function runBenchmarkCli(argv = process.argv.slice(2)) {
     extensions: report.extensions,
   }, null, 2));
   return finalReport;
+}
+
+export function summarizePairedQualityTimingTrials(pairs, options) {
+  const trialCount = Number(options?.trialCount);
+  const pairsPerTrial = Number(options?.pairsPerTrial);
+  if (!Number.isInteger(trialCount) || trialCount <= 0
+    || !Number.isInteger(pairsPerTrial) || pairsPerTrial <= 0) {
+    throw new Error("Paired quality timing requires positive integer trialCount and pairsPerTrial");
+  }
+  const expectedPairCount = trialCount * pairsPerTrial;
+  if (!Array.isArray(pairs) || pairs.length !== expectedPairCount) {
+    throw new Error(`Paired quality timing pair conservation failed: expected ${expectedPairCount}, received ${pairs?.length ?? 0}`);
+  }
+
+  const rawPairs = pairs.map((pair, index) => {
+    const pairIndex = index + 1;
+    const expectedOrder = pairIndex % 2 === 1 ? "baseline_first" : "task_first";
+    if (pair?.pairIndex !== pairIndex) {
+      throw new Error(`Paired quality timing pairIndex must be contiguous at ${pairIndex}`);
+    }
+    if (pair?.order !== expectedOrder) {
+      throw new Error(`Paired quality timing order mismatch at pairIndex ${pairIndex}`);
+    }
+    if (!Number.isFinite(pair?.baselineMs) || pair.baselineMs <= 0
+      || !Number.isFinite(pair?.taskMs) || pair.taskMs <= 0) {
+      throw new Error(`Paired quality timing values must be finite positive numbers at pairIndex ${pairIndex}`);
+    }
+    return {
+      pairIndex,
+      order: expectedOrder,
+      baselineMs: pair.baselineMs,
+      taskMs: pair.taskMs,
+    };
+  });
+
+  const baselineSamples = rawPairs.map((pair) => pair.baselineMs);
+  const taskSamples = rawPairs.map((pair) => pair.taskMs);
+  const trials = Array.from({ length: trialCount }, (_, trialOffset) => {
+    const trialPairs = rawPairs.slice(
+      trialOffset * pairsPerTrial,
+      (trialOffset + 1) * pairsPerTrial,
+    );
+    const baselineFirstCount = trialPairs.filter((pair) => pair.order === "baseline_first").length;
+    const taskFirstCount = trialPairs.filter((pair) => pair.order === "task_first").length;
+    if (baselineFirstCount !== pairsPerTrial / 2 || taskFirstCount !== pairsPerTrial / 2) {
+      throw new Error(`Paired quality timing trial ${trialOffset + 1} is not order-balanced`);
+    }
+    const baseline = summarizePairedSamples(trialPairs.map((pair) => pair.baselineMs));
+    const task = summarizePairedSamples(trialPairs.map((pair) => pair.taskMs));
+    return {
+      trialIndex: trialOffset + 1,
+      pairCount: trialPairs.length,
+      baselineFirstCount,
+      taskFirstCount,
+      baseline: pickTrialTimingSummary(baseline),
+      task: pickTrialTimingSummary(task),
+      taskToBaselineMeanRatio: task.mean / baseline.mean,
+    };
+  });
+  const trialRatios = trials.map((trial) => trial.taskToBaselineMeanRatio);
+  const ratioSummary = summarizePairedSamples(trialRatios);
+  const baselineFirstCount = rawPairs.filter((pair) => pair.order === "baseline_first").length;
+  const taskFirstCount = rawPairs.length - baselineFirstCount;
+  const trialPairCount = trials.reduce((total, trial) => total + trial.pairCount, 0);
+
+  return {
+    metric: PAIRED_QUALITY_METRIC,
+    totalPairs: rawPairs.length,
+    trialCount,
+    pairsPerTrial,
+    rawPairs,
+    baselineRawTimingsMs: summarizePairedSamples(baselineSamples),
+    taskRawTimingsMs: summarizePairedSamples(taskSamples),
+    trials,
+    stability: {
+      metric: PAIRED_QUALITY_METRIC,
+      trialRatios,
+      meanRatio: ratioSummary.mean,
+      standardDeviationOfRatios: ratioSummary.standardDeviation,
+      coefficientOfVariation: ratioSummary.coefficientOfVariation,
+      maxTrialRatio: ratioSummary.max,
+    },
+    orderConservation: {
+      baselineFirstCount,
+      taskFirstCount,
+      balanced: baselineFirstCount === taskFirstCount,
+    },
+    sampleConservation: {
+      expectedPairCount,
+      rawPairCount: rawPairs.length,
+      baselineSampleCount: baselineSamples.length,
+      taskSampleCount: taskSamples.length,
+      trialPairCount,
+      preserved: rawPairs.length === expectedPairCount
+        && baselineSamples.length === expectedPairCount
+        && taskSamples.length === expectedPairCount
+        && trialPairCount === expectedPairCount,
+    },
+    pairDigest: hashJson(rawPairs),
+    trialDigest: hashJson(trials),
+  };
+}
+
+export function evaluatePairedQualityPerformance({
+  comparison,
+  pairedTimingEvidence,
+  invariantPassed,
+  qualityPassed,
+}) {
+  const fullPipeline = comparison?.full_local_pipeline_total || {};
+  const stability = pairedTimingEvidence?.stability || {};
+  const checks = [
+    acceptanceCheck("quality.invariants", invariantPassed, invariantPassed, true),
+    acceptanceCheck("quality.no_regression", qualityPassed, qualityPassed, true),
+    acceptanceCheck("comparison.p50_ratio", fullPipeline.p50Ratio <= 1.05, fullPipeline.p50Ratio, 1.05),
+    acceptanceCheck("comparison.p95_ratio", fullPipeline.p95Ratio <= 1.05, fullPipeline.p95Ratio, 1.05),
+    acceptanceCheck("paired.mean_ratio", stability.meanRatio <= 1.05, stability.meanRatio, 1.05),
+    acceptanceCheck(
+      "paired.trial_ratio_cv",
+      stability.coefficientOfVariation <= 0.15,
+      stability.coefficientOfVariation,
+      0.15,
+    ),
+    acceptanceCheck("paired.max_trial_ratio", stability.maxTrialRatio <= 1.10, stability.maxTrialRatio, 1.10),
+  ];
+  const failedCheckIds = checks.filter((check) => !check.passed).map((check) => check.id);
+  return {
+    status: failedCheckIds.length ? "rejected" : "accepted",
+    checks,
+    failedCheckIds,
+  };
+}
+
+export async function writeQualityBenchmarkReport(outputPath, finalReport) {
+  await mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
+  await writeFile(outputPath, `${JSON.stringify(finalReport, null, 2)}\n`, "utf8");
+  const parsed = JSON.parse(await readFile(outputPath, "utf8"));
+  if (parsed?.performanceAcceptance?.status !== "accepted") {
+    const failed = parsed?.performanceAcceptance?.failedCheckIds || ["performanceAcceptance"];
+    throw new Error(`Quality benchmark rejected: ${failed.join(", ")}`);
+  }
+  return parsed;
+}
+
+function summarizePairedSamples(values) {
+  if (!Array.isArray(values) || !values.length || values.some((value) => !Number.isFinite(value) || value <= 0)) {
+    throw new Error("Paired timing summary requires finite positive samples");
+  }
+  const sorted = [...values].sort((left, right) => left - right);
+  const mean = sorted.reduce((total, value) => total + value, 0) / sorted.length;
+  const variance = sorted.reduce((total, value) => total + ((value - mean) ** 2), 0) / sorted.length;
+  const standardDeviation = Math.sqrt(variance);
+  return {
+    count: sorted.length,
+    min: sorted[0],
+    p50: nearestRank(sorted, 0.5),
+    p95: nearestRank(sorted, 0.95),
+    p99: nearestRank(sorted, 0.99),
+    max: sorted.at(-1),
+    mean,
+    standardDeviation,
+    coefficientOfVariation: mean ? standardDeviation / mean : 0,
+  };
+}
+
+function nearestRank(sorted, fraction) {
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * fraction) - 1))];
+}
+
+function pickTrialTimingSummary(summary) {
+  return {
+    p50: summary.p50,
+    p95: summary.p95,
+    p99: summary.p99,
+    max: summary.max,
+    mean: summary.mean,
+  };
+}
+
+function hashJson(value) {
+  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+}
+
+function acceptanceCheck(id, passed, actual, limit) {
+  return { id, passed: passed === true, actual, limit };
+}
+
+function captureBenchmarkAssertion(run) {
+  try {
+    run();
+    return { passed: true, error: null };
+  } catch (error) {
+    return { passed: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 export function assertMatchingProductionSourceFingerprints(baselineFingerprint, taskFingerprint) {
