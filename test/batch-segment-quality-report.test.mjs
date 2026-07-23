@@ -13,9 +13,30 @@ require("ts-node/register/transpile-only");
 const {
   createSegmentQualityReport,
   detectSegmentSafetyRisk,
+  segmentQualityReportStatusFromState,
   summarizeSegmentQualityReports,
   updateSegmentQualityReportStatus,
 } = require("../lib/batch-segment-quality-report.ts");
+const {
+  evaluateBatchSegmentQuality,
+} = require("../lib/batch-segment-quality-gate.ts");
+
+test("quality report keeps needs_review while saving and after review save", () => {
+  const baseState = {
+    index: 1,
+    generationStatus: "settled",
+    qualityStatus: "needs_review",
+    saveStatus: "saving",
+    revision: 4,
+    saveRetryCount: 0,
+    updatedAt: 1,
+  };
+  assert.equal(segmentQualityReportStatusFromState(baseState, "needs_review"), "needs_review");
+  assert.equal(
+    segmentQualityReportStatusFromState({ ...baseState, saveStatus: "review_saved" }, "needs_review"),
+    "needs_review",
+  );
+});
 
 function makeResult(overrides = {}) {
   const storyboard = overrides.storyboard || [
@@ -208,7 +229,106 @@ test("quality report summary exposes average score, review count, highest risk, 
   assert.equal(summary.totalReports, 2);
   assert.ok(summary.averageQualityScore > 0);
   assert.equal(summary.suggestedReviewCount, 1);
+  assert.equal(summary.blockingCount, 0);
+  assert.equal(summary.patchableCount, 0);
+  assert.equal(summary.warningCount, 0);
+  assert.equal(summary.riskCount, 0);
+  assert.equal(summary.localPatchCount, 0);
+  assert.equal(summary.codexRepairCount, 0);
   assert.equal(summary.highestSafetyRisk, "high");
   assert.equal(summary.slowestSegmentIndex, 2);
   assert.equal(summary.slowestDurationMs, 150000);
+});
+
+test("quality report reuses quality gate counts and local patch diffs", () => {
+  const result = makeResult({ fullVideoPrompt: "\u516c\u5b89\u5c40\u95e8\u53e3\u51fa\u73b0\u8b66\u5fbd\uff0c\u4eba\u7269\u4fdd\u6301\u514b\u5236\u3002".repeat(30) });
+  const gate = evaluateBatchSegmentQuality(result, {
+    fullPromptText: result.workflow.fullVideoPrompt,
+    minFullPromptLength: 20,
+  });
+  const report = createSegmentQualityReport({
+    batchId: "batch-gate",
+    segmentIndex: 3,
+    title: "\u7b2c3\u6bb5",
+    result,
+    sourceText: "\u7b2c\u4e09\u6bb5\u539f\u6587",
+    status: "cached",
+    scheduleProfile: "ADAPTIVE",
+    qualityGate: gate,
+    patchDiffs: [
+      {
+        path: "workflow.fullVideoPrompt",
+        code: "sensitive_term",
+        severity: "risk",
+        before: "\u516c\u5b89\u5c40",
+        after: "\u57ce\u5e02\u529e\u6848\u5efa\u7b51",
+        patchSource: "local",
+        reason: "local safety rewrite",
+      },
+    ],
+  });
+
+  assert.equal(report.blockingCount, gate.blockingFindings.length);
+  assert.equal(report.patchableCount, gate.patchableFindings.length);
+  assert.equal(report.warningCount, gate.warningFindings.length);
+  assert.equal(report.riskCount, gate.riskFindings.length);
+  assert.equal(report.localPatchCount, 1);
+  assert.equal(report.codexPatchCount, 0);
+  assert.equal(report.codexRepairSegmentCount, 0);
+  assert.equal(report.patchDiffs[0].path, "workflow.fullVideoPrompt");
+
+  const summary = summarizeSegmentQualityReports([report]);
+  assert.equal(summary.blockingCount, report.blockingCount);
+  assert.equal(summary.patchableCount, report.patchableCount);
+  assert.equal(summary.warningCount, report.warningCount);
+  assert.equal(summary.riskCount, report.riskCount);
+  assert.equal(summary.localPatchCount, 1);
+  assert.equal(summary.codexPatchCount, 0);
+  assert.equal(summary.codexRepairCount, 0);
+  assert.equal(summary.codexRepairSegmentCount, 0);
+});
+
+test("quality report separates local patch, codex patch, and codex repair segment counts", () => {
+  const result = makeResult();
+  const report = createSegmentQualityReport({
+    batchId: "batch-patch-split",
+    segmentIndex: 4,
+    title: "\u7b2c4\u6bb5",
+    result,
+    sourceText: "\u7b2c\u56db\u6bb5\u539f\u6587",
+    status: "repaired",
+    scheduleProfile: "ADAPTIVE",
+    codexRepairAttempted: true,
+    patchDiffs: [
+      {
+        path: "storyboard[0].scene",
+        code: "field_below_target",
+        severity: "patchable",
+        before: "\u5ba4\u5185",
+        after: "\u5ba4\u5185\u684c\u524d\u8fd1\u666f",
+        patchSource: "local",
+        reason: "local deterministic patch",
+      },
+      {
+        path: "storyboard[1].videoPrompt",
+        code: "field_below_hard_minimum",
+        severity: "patchable",
+        before: "\u63a8\u8fd1",
+        after: "\u955c\u5934\u7f13\u6162\u63a8\u8fd1\u684c\u9762\u8bc1\u636e\uff0c\u4eba\u7269\u53cd\u5e94\u4e0e\u51b7\u5149\u5c42\u6b21\u540c\u65f6\u5448\u73b0\u3002",
+        patchSource: "codex",
+        reason: "codex path patch",
+      },
+    ],
+  });
+
+  assert.equal(report.localPatchCount, 1);
+  assert.equal(report.codexPatchCount, 1);
+  assert.equal(report.codexRepairAttempted, true);
+  assert.equal(report.codexRepairSegmentCount, 1);
+
+  const summary = summarizeSegmentQualityReports([report]);
+  assert.equal(summary.localPatchCount, 1);
+  assert.equal(summary.codexPatchCount, 1);
+  assert.equal(summary.codexRepairCount, 1);
+  assert.equal(summary.codexRepairSegmentCount, 1);
 });

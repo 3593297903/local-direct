@@ -3,6 +3,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
+import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
+import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
+import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.STORYBOARD_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -15,6 +18,13 @@ const messageDir = path.join(rootDir, ".tmp-storyboard-codex", "codex-messages")
 const logDir = path.join(rootDir, ".tmp-storyboard-codex", "codex-logs");
 const sourceManifestDir = path.join(rootDir, ".tmp-storyboard-codex", "source-manifests");
 const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const workerLock = await acquireWorkerFleetLock("storyboard-worker", { rootDir });
+if (!workerLock.acquired) {
+  console.log(`Storyboard worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
+  process.exit(0);
+}
+const runtimeHealth = await startCodexWorkerRuntimeHealth("storyboard", { rootDir });
+installWorkerShutdown(workerLock);
 
 console.log("Local Director storyboard Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -27,6 +37,7 @@ const activeTasks = new Set();
 
 while (true) {
   try {
+    runtimeHealth.assertHealthy();
     while (activeTasks.size < concurrency) {
       const task = await claimTask();
       if (!task) break;
@@ -54,7 +65,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed storyboard panel ${task.id} for job ${task.jobId} (shot ${task.shotNumber}).`);
   try {
-    await runCodex(task);
+    await withCodexCliSlot("visual_asset", task.id, () => runCodex(task));
     await normalizePngToExpectedSize(task.outputPath, task.size);
     await assertOutputFile(task.outputPath, task.size);
     const metadata = await buildCompletionMetadata(task);
@@ -467,4 +478,16 @@ function safeFileName(value) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function installWorkerShutdown(lock) {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await lock.release().catch(() => undefined);
+    process.exit(0);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
 }

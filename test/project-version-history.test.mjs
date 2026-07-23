@@ -25,7 +25,8 @@ test("Nest project save returns project and version ids for later storyboard ima
   assert.match(service, /prisma\.projectVersion\.create/);
   assert.match(service, /versionNumber/);
   assert.match(service, /fullVideoPrompt: input\.fullVideoPrompt/);
-  assert.match(service, /return \{ saved: true, projectId: result\.project\.id, versionId: result\.version\.id/);
+  assert.match(service, /saved:\s*true,[\s\S]*projectId:\s*result\.project\.id,[\s\S]*versionId:\s*result\.version\.id/);
+  assert.match(service, /idempotentReplay:\s*result\.idempotentReplay/);
   assert.match(controller, /saveStoryboardImage/);
 });
 

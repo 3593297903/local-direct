@@ -68,6 +68,10 @@ export class CreateStoryboardShotDto {
 
 export class CreateProjectDto {
   @IsOptional()
+  @IsString()
+  idempotencyKey?: string;
+
+  @IsOptional()
   @IsUUID()
   projectId?: string;
 

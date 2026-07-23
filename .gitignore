@@ -3,6 +3,9 @@ node_modules
 .next-test
 dist
 .tmp-*
+/.tmp_utf8_probe.txt
+/scripts/render-pack-*.js
+/scripts/write-render-pack-*.js
 .superpowers
 .claude/
 .env
@@ -19,3 +22,4 @@ public/project-assets/
 .backup-previews-original-*/
 .compressed-previews-*/
 backups/
+/.worktrees/

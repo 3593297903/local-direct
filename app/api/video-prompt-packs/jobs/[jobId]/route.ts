@@ -1,23 +1,24 @@
 import { NextResponse } from "next/server";
-import { failVideoPromptPackCodexJob, getVideoPromptPackCodexJob } from "@/lib/video-prompt-pack-codex-queue";
+import {
+  getVideoPromptPackCodexJob,
+  toVideoPromptPackCodexJobStatusDto,
+} from "@/lib/video-prompt-pack-codex-queue";
 import { getCodexRuntimeState } from "@/lib/codex-runtime-state";
+import { fileJobRouteError } from "@/lib/file-job-route-error";
 
 export const runtime = "nodejs";
 
 export async function GET(_request: Request, context: { params: Promise<{ jobId: string }> }) {
   try {
     const params = await context.params;
-    let job = await getVideoPromptPackCodexJob(params.jobId);
+    const job = await getVideoPromptPackCodexJob(params.jobId);
+    const status = toVideoPromptPackCodexJobStatusDto(job);
     const codexState = await getCodexRuntimeState();
     if (!codexState.available && (job.status === "pending" || job.status === "running")) {
-      job = await failVideoPromptPackCodexJob(params.jobId, codexState.message);
-      return NextResponse.json({ ok: true, job, codexUnavailable: codexState });
+      return NextResponse.json({ ok: true, job: status, codexUnavailable: codexState });
     }
-    return NextResponse.json({ ok: true, job });
+    return NextResponse.json({ ok: true, job: status });
   } catch (error: any) {
-    return NextResponse.json(
-      { ok: false, error: error?.message || "Video prompt render pack Codex job not found" },
-      { status: 404 },
-    );
+    return fileJobRouteError(error, "Video prompt render pack Codex job not found");
   }
 }

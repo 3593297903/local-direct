@@ -6,8 +6,79 @@ import { CopyButton } from "@/components/CopyButton";
 import { Drawer } from "@/components/Drawer";
 import { PreviewAnimation } from "@/components/PreviewAnimation";
 import { matchShotReferences, ShotReferenceMatches } from "@/lib/reference-matcher";
-import { buildSegmentContractHash, findMissingSegmentContractRequiredEvents, type SegmentContract } from "@/lib/batch-segment-contract";
+import { DEFAULT_COVERAGE_POLICY_VERSION, type SegmentContract } from "@/lib/batch-segment-contract";
+import {
+  coverageStageInvokesJudge,
+  coverageStageUsesLocalGate,
+  normalizeBatchEventFeatureSnapshot,
+  type BatchEventFeatureSnapshot,
+} from "@/lib/batch-event-feature-flags";
+import { applyPromptSafetyPolicyDeep } from "@/lib/prompt-safety-policy";
+import type { CompiledSegmentContractBlock } from "@/lib/codex-prompt-input-compiler";
 import { buildRenderPacks } from "@/lib/batch-render-scheduler";
+import {
+  buildPreflightedRenderPacks,
+  partitionPreflightedRenderPackAfterRejection,
+  preflightSegmentContracts,
+  type PreflightedRenderPack,
+} from "@/lib/batch-contract-preflight";
+import {
+  collectContiguousBatchSaveIndexes,
+  createInitialSegmentStates,
+  createResumableBatchSaveController,
+  deriveBatchPhaseFromSegmentStates,
+  progressStatusFromSegmentState,
+  reduceSegmentState,
+  resolveBatchGenerationPhase,
+  summarizeBatchSegmentProgress,
+  type BatchSegmentProgressStatus,
+  type ResumableBatchSaveResult,
+  type SegmentStateEvent,
+  type SegmentStateRecord,
+} from "@/lib/batch-segment-progress";
+import {
+  createBatchInvocationLedger,
+  createBatchRepairScheduler,
+  decideLateRepairMerge,
+  shouldContinueDetachedRepairObservation,
+  type BatchInvocationLedgerEvent,
+  REPAIR_FRONTEND_WAIT_TIMEOUT_MS,
+} from "@/lib/batch-repair-scheduler";
+import {
+  SEGMENT_BATCH_RECOVERY_REGISTRY_KEY,
+  buildSegmentBatchLeaseOwnerKey,
+  buildSegmentBatchRecoveryKey,
+  buildSegmentBatchRecoveryKeys,
+  buildStableBatchContractHash,
+  parseSegmentBatchRecoveryRegistry,
+  removeSegmentBatchRecoveryPointer,
+  upsertSegmentBatchRecoveryPointer,
+  type SegmentBatchRecoveryPointer,
+} from "@/lib/segment-batch-cache-identity";
+import type { SegmentBatchCacheDocumentV2 } from "@/lib/segment-batch-cache";
+import {
+  attachRenderOperationJob,
+  createRenderOperationDraftFromPreflightPack,
+  detachRenderOperation,
+  retainBoundedRenderOperationAudits,
+  terminateRenderOperation,
+  type RenderOperationRefV2,
+} from "@/lib/batch-render-operation";
+import {
+  applyPreparedRenderPackReconciliation,
+  createRenderPackObserverRegistry,
+  hasActiveRenderRecovery,
+  hasSaveableUnsavedResults,
+  isBatchRenderLateReconciliationEnabled,
+  listRecoverableRenderOperations,
+  observeRenderPackJob,
+  prepareRenderPackReconciliation,
+  reconcileDetachedRenderPack,
+  retryCreatingRenderOperation,
+  shouldRetainRenderRecoveryPointer,
+  startConcurrentRenderRecoveryObservers,
+  type RenderObservationOutcome,
+} from "@/lib/batch-render-reconciliation";
 import {
   findInternalPromptToken,
   sanitizeInternalPromptTokens,
@@ -15,6 +86,7 @@ import {
 } from "@/lib/internal-prompt-token-sanitizer";
 import {
   createSegmentQualityReport,
+  segmentQualityReportStatusFromState,
   summarizeSegmentQualityReports,
   updateSegmentQualityReportStatus,
   type BatchQualityReportSummary,
@@ -22,13 +94,36 @@ import {
   type SegmentQualityStatus,
 } from "@/lib/batch-segment-quality-report";
 import {
-  applyDeterministicQualityPatch,
+  applyDeterministicQualityPatchWithDiff,
   buildTargetedRepairReason,
   evaluateBatchSegmentQuality,
+  selectDeterministicQualityPatchFindings,
   shouldRepairWithCodex,
   summarizeQualityFindings,
+  type BatchSegmentQualityGate,
   type BatchSegmentQualityFinding,
+  type QualityPatchDiff,
 } from "@/lib/batch-segment-quality-gate";
+import {
+  applyBatchSegmentRepairPatch,
+  assertBatchSegmentRepairPatchIsolation,
+  buildBatchSegmentResultHash,
+  getBatchSegmentRepairValueAtPath,
+  isAllowedBatchSegmentRepairPath,
+  normalizeBatchSegmentRepairPath,
+  type BatchSegmentRepairPatchResult,
+} from "@/lib/batch-segment-repair-patch";
+import {
+  collectEventCoverageInspectedFields,
+  validateSegmentEventCoverage,
+  type CoverageDecision,
+  type SegmentCoverageSidecar,
+} from "@/lib/batch-event-coverage";
+import {
+  routeBatchSegmentOutcome,
+  type BatchEventCoverageStage,
+  type BatchSegmentOutcomeRoute,
+} from "@/lib/batch-segment-outcome-router";
 import { Clock, Download, FileText, Film, ImageIcon, Loader2, Maximize2, ScanLine, Send, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
 
 type StoryboardImageState = {
@@ -43,6 +138,60 @@ type ProjectSaveState = {
   versionId?: string;
   versionNumber?: number;
   reason?: string;
+  message?: string;
+  errorCode?: string;
+  retryable?: boolean;
+  requestId?: string;
+  idempotentReplay?: boolean;
+};
+
+type BatchSaveRecoveryDescriptor = {
+  recoveryKey: string;
+  durableBatchId: string;
+  sourceHash: string;
+  projectId?: string | null;
+  fromRegistry?: boolean;
+};
+
+type BatchRecoveryDiscovery =
+  | { status: "none"; descriptor: null }
+  | { status: "recoverable"; descriptor: BatchSaveRecoveryDescriptor }
+  | { status: "unavailable"; descriptor: null; message: string };
+
+function readBatchRecoveryRegistry() {
+  if (typeof window === "undefined") return [];
+  return parseSegmentBatchRecoveryRegistry(
+    window.localStorage.getItem(SEGMENT_BATCH_RECOVERY_REGISTRY_KEY),
+  );
+}
+
+function writeBatchRecoveryRegistry(registry: readonly SegmentBatchRecoveryPointer[]) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(
+    SEGMENT_BATCH_RECOVERY_REGISTRY_KEY,
+    JSON.stringify(registry),
+  );
+}
+
+function rememberBatchRecoveryPointer(pointer: SegmentBatchRecoveryPointer) {
+  writeBatchRecoveryRegistry(
+    upsertSegmentBatchRecoveryPointer(readBatchRecoveryRegistry(), pointer),
+  );
+}
+
+function forgetBatchRecoveryPointer(durableBatchId: string) {
+  writeBatchRecoveryRegistry(
+    removeSegmentBatchRecoveryPointer(readBatchRecoveryRegistry(), durableBatchId),
+  );
+}
+
+type CachedRenderedEpisode = {
+  episodeIndex?: number;
+  title?: string;
+  sourceText?: string;
+  promptText?: string;
+  result?: AnalysisResult;
+  status?: SegmentQualityStatus | "review_saved" | "saved";
 };
 
 type StoryboardCodexPanel = {
@@ -80,8 +229,47 @@ type VideoPromptCodexJob = {
   error?: string | null;
 };
 
+type BatchSegmentRepairCodexJob = {
+  id: string;
+  contractHash?: string;
+  resultHash: string;
+  status: "pending" | "running" | "completed" | "failed";
+  result?: BatchSegmentRepairPatchResult | null;
+  error?: string | null;
+};
+
+type BatchSegmentRepairPollResult =
+  | { status: "completed"; job: BatchSegmentRepairCodexJob }
+  | { status: "detached"; job: BatchSegmentRepairCodexJob };
+
+type EventCoverageJudgeDecision = {
+  segmentIndex: number;
+  slotId: string;
+  status: "covered" | "missing" | "contradiction" | "uncertain";
+  evidence: Array<{ path: string; quote: string }>;
+  inspectedPaths: string[];
+};
+
+type EventCoverageCodexJob = {
+  id: string;
+  waveId: string;
+  status: "pending" | "running" | "completed" | "failed";
+  result?: { schemaVersion: 1; waveId: string; decisions: EventCoverageJudgeDecision[] } | null;
+  error?: string | null;
+};
+
 type VideoPromptPackCodexJob = {
   id: string;
+  protocolVersion?: number;
+  stage?: string;
+  batchId?: string;
+  operationToken?: string;
+  sourceHash?: string;
+  aggregateContractHash?: string;
+  segmentIndexes?: number[];
+  contractHashes?: Record<string, string>;
+  resultAvailable?: boolean;
+  resultHash?: string;
   status: "pending" | "running" | "completed" | "failed";
   createdAt?: string;
   startedAt?: string;
@@ -92,6 +280,8 @@ type VideoPromptPackCodexJob = {
       episodeIndex: number;
       outputPath: string;
       result: AnalysisResult;
+      resultHash?: string;
+      coverageSidecar?: SegmentCoverageSidecar | null;
     }>;
   } | null;
   error?: string | null;
@@ -125,6 +315,7 @@ type SeasonPackCodexJob = {
   requestedEpisodeCount?: number | null;
   resolvedEpisodeCount?: number | null;
   episodeCount: number;
+  featureFlags?: BatchEventFeatureSnapshot;
   result?: {
     episodes: SeasonPackEpisodeResult[];
     manifest?: Record<string, unknown> | null;
@@ -163,6 +354,58 @@ class CodexVideoPromptJobFailedError extends Error {
   }
 }
 
+class RenderPackPollingInfrastructureError extends Error {
+  readonly jobId: string;
+
+  constructor(jobId: string, message: string) {
+    super(message);
+    this.name = "RenderPackPollingInfrastructureError";
+    this.jobId = jobId;
+  }
+}
+
+class ContractPreflightCreateError extends Error {
+  readonly code: string;
+  readonly segmentIndexes: number[];
+
+  constructor(code: string, message: string, segmentIndexes: number[] = []) {
+    super(message);
+    this.name = "ContractPreflightCreateError";
+    this.code = code;
+    this.segmentIndexes = [...segmentIndexes];
+  }
+}
+
+const CONTRACT_PREFLIGHT_ERROR_CODES = new Set([
+  "CONTRACT_PREFLIGHT_V2_CREATE_PAUSED",
+  "CONTRACT_PREFLIGHT_REQUIRED",
+  "CONTRACT_PREFLIGHT_MISMATCH",
+  "CONTRACT_BUDGET_EXCEEDED",
+  "CONTRACT_HASH_INVALID",
+  "CONTRACT_SCHEMA_INVALID",
+]);
+
+function isContractPreflightCreateError(error: unknown): error is ContractPreflightCreateError {
+  return error instanceof ContractPreflightCreateError
+    || Boolean(error && typeof error === "object" && CONTRACT_PREFLIGHT_ERROR_CODES.has(String((error as { code?: unknown }).code || "")));
+}
+
+class StaleSegmentOperationError extends Error {
+  readonly code = "STALE_SEGMENT_OPERATION";
+
+  constructor(
+    readonly segmentIndex: number,
+    readonly operation: "render" | "repair",
+  ) {
+    super(`Segment ${segmentIndex} ${operation} result is stale`);
+    this.name = "StaleSegmentOperationError";
+  }
+}
+
+function isRenderPackPollingInfrastructureError(error: unknown): error is RenderPackPollingInfrastructureError {
+  return error instanceof RenderPackPollingInfrastructureError;
+}
+
 type BatchPromptSection = {
   segment: {
     index: number;
@@ -175,8 +418,19 @@ type BatchPromptSection = {
 type DurationMode = "auto" | "fixed";
 type SegmentCountMode = "fixed" | "auto";
 type RenderPackCodexMode = "standard" | "strictUtf8";
-type BatchGenerationPhase = "planning" | "rendering" | "repairing" | "saving" | "completed" | "failed";
-type BatchSegmentStatus = "pending" | "running" | "repairing" | "cached" | "completed" | "saving" | "saved" | "failed";
+type BatchGenerationPhase =
+  | "planning"
+  | "rendering"
+  | "validating"
+  | "adjudicating"
+  | "patching"
+  | "repairing"
+  | "saving"
+  | "needs_review"
+  | "quota_paused"
+  | "completed"
+  | "failed";
+type BatchSegmentStatus = BatchSegmentProgressStatus;
 type BatchRepairReasonType =
   | "encoding"
   | "schema"
@@ -209,10 +463,30 @@ type BatchGenerationProgress = {
   runningCount: number;
   pendingCount: number;
   repairingCount: number;
+  adjudicatingCount: number;
+  needsReviewCount: number;
   savingCount: number;
   currentMessage: string;
   segments: BatchSegmentProgress[];
   qualityReportSummary?: BatchQualityReportSummary;
+  invocationMetrics?: {
+    renderPackCalls: number;
+    singleRegenerationCalls: number;
+    pathPatchJobCreated: number;
+    pathPatchCompleted: number;
+    judgeCalls: number;
+    localPatchOperations: number;
+    contractPreflightAttempts: number;
+    contractPreflightCompacted: number;
+    contractPreflightIsolated: number;
+    contractPreflightInvalid: number;
+  };
+  timingMetrics?: {
+    renderWallMs: number;
+    repairWaitMs: number;
+    saveMs: number;
+    criticalPathMs: number;
+  };
 };
 
 const MAX_EPISODE_BATCH_COUNT = 30;
@@ -223,14 +497,36 @@ const MAX_BATCH_REPAIR_ATTEMPTS_PER_REASON = 1;
 const SLOW_RENDER_PACK_WARNING_MS = 8 * 60_000;
 const STRICT_UTF8_RENDER_PACK_MODE: RenderPackCodexMode = "strictUtf8";
 const MIN_BATCH_FULL_PROMPT_LENGTH = 900;
-const BATCH_SEGMENT_CACHE_PREFIX = "localdirector:segment-batch:";
+const TASK_ONE_SAFETY_ENABLED = process.env.NEXT_PUBLIC_TASK_ONE_SAFETY !== "0";
+const TASK_ONE_STATE_REDUCER_ENABLED = process.env.NEXT_PUBLIC_TASK_ONE_STATE_REDUCER !== "0";
+const TASK_ONE_CACHE_RECOVERY_ENABLED = process.env.NEXT_PUBLIC_TASK_ONE_CACHE_RECOVERY !== "0";
+const TASK_ONE_REPAIR_SCHEDULER_ENABLED = process.env.NEXT_PUBLIC_TASK_ONE_REPAIR_SCHEDULER !== "0";
+const BATCH_RENDER_LATE_RECONCILIATION_ENABLED = isBatchRenderLateReconciliationEnabled(
+  process.env.NEXT_PUBLIC_BATCH_RENDER_LATE_RECONCILIATION,
+);
 const segmentTerminologyPattern = /(?:\u7b2c\s*[0-9\u4e00-\u9fa5]+\s*\u96c6|\u672c\u96c6|\u5355\u96c6|\u5267\u96c6)/;
-const GENERIC_SEASON_TEMPLATE_PHRASES = [
-  "人物、地点和关键物件按案件逻辑分层",
-  "缓慢推进后停住",
-  "同期环境声、脚步声、纸张声或市场声",
-  "保留北方县城真实空间感",
-];
+
+function waitForRenderObservation(delayMs: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      const error = new Error("Render observation aborted");
+      error.name = "AbortError";
+      reject(error);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      const error = new Error("Render observation aborted");
+      error.name = "AbortError";
+      reject(error);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, Math.max(0, delayMs));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 function formatBatchDurationMs(ms: number) {
   if (!Number.isFinite(ms) || ms <= 0) return "0s";
@@ -260,40 +556,6 @@ function formatBatchSafetyRisk(risk: BatchQualityReportSummary["highestSafetyRis
   };
   return labels[risk] || risk;
 }
-const REQUIRED_BATCH_SEGMENT_SHOT_FIELDS = [
-  "timeRange",
-  "scene",
-  "visual",
-  "shotType",
-  "composition",
-  "cameraMovement",
-  "lighting",
-  "sound",
-  "dialogue",
-  "emotion",
-  "transition",
-  "shotPurpose",
-  "firstFramePrompt",
-  "videoPrompt",
-  "lastFramePrompt",
-  "negativePrompt",
-] as const;
-const MIN_BATCH_FIELD_LENGTHS: Partial<Record<(typeof REQUIRED_BATCH_SEGMENT_SHOT_FIELDS)[number], number>> = {
-  scene: 8,
-  visual: 36,
-  composition: 24,
-  cameraMovement: 2,
-  lighting: 20,
-  sound: 16,
-  emotion: 4,
-  transition: 2,
-  shotPurpose: 20,
-  firstFramePrompt: 24,
-  videoPrompt: 40,
-  lastFramePrompt: 24,
-  negativePrompt: 16,
-};
-
 const CODEX_QUOTA_EXHAUSTED_CODE = "CODEX_QUOTA_EXHAUSTED";
 const CODEX_QUOTA_EXHAUSTED_DISPLAY_MESSAGE = "Codex 额度已用完或暂时受限，请恢复额度后再继续生成。";
 const CODEX_QUOTA_ERROR_PATTERN =
@@ -492,7 +754,7 @@ function sanitizeBatchNegativePrompt(value: unknown) {
   const cleaned = sanitizeBatchSegmentText(raw)
     .replace(/\bundefined\b/gi, "\u7a7a\u5b57\u6bb5")
     .replace(/\bnull\b/gi, "\u7a7a\u503c");
-  const baseItems = ["\u7a7a\u5b57\u6bb5\u6216\u5360\u4f4d\u6587\u672c", "\u540c\u4e0a", "\u5982\u4e0a", "\u7565", "16:9\u7ad6\u5c4f"];
+  const baseItems = ["\u7a7a\u5b57\u6bb5\u5360\u4f4d\u8868\u8fbe", "\u8de8\u6bb5\u5f15\u7528\u5360\u4f4d\u8868\u8fbe", "\u4e0d\u53ef\u6267\u884c\u7701\u7565\u63cf\u8ff0", "16:9\u753b\u5e45\u65b9\u5411\u51b2\u7a81"];
   const parts = cleaned
     .split(/[,\uff0c\u3001]/)
     .map((part) => part.trim())
@@ -543,28 +805,6 @@ function canonicalizeBatchSegmentResult(result: AnalysisResult): AnalysisResult 
   };
 }
 
-function containsBatchNullishValue(value: unknown, path = "result"): string {
-  if (value === null || value === undefined) return path;
-  if (typeof value === "string") {
-    if (/(?:negativePrompt|fullNegativePrompt)$/i.test(path)) return "";
-    return /\b(?:undefined|null)\b/i.test(value) ? path : "";
-  }
-  if (Array.isArray(value)) {
-    for (let index = 0; index < value.length; index += 1) {
-      const found = containsBatchNullishValue(value[index], `${path}[${index}]`);
-      if (found) return found;
-    }
-    return "";
-  }
-  if (typeof value === "object") {
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      const found = containsBatchNullishValue(item, `${path}.${key}`);
-      if (found) return found;
-    }
-  }
-  return "";
-}
-
 function sanitizeBatchSegmentOutput<T>(value: T): T {
   return sanitizeInternalPromptTokensDeep(
     (function sanitizeSegmentLabels(item: unknown): unknown {
@@ -603,8 +843,15 @@ function batchRepairReasonLabel(reasonType: BatchRepairReasonType) {
   return labels[reasonType];
 }
 
-function buildBatchRepairAttemptKey(episodeIndex: number, reasonType: BatchRepairReasonType) {
-  return `${episodeIndex}:${reasonType}`;
+function buildBatchRepairAttemptKey(
+  episodeIndex: number,
+  reasonType: BatchRepairReasonType,
+  findings: BatchSegmentQualityFinding[] = [],
+) {
+  const slotIds = Array.from(new Set(findings.map((finding) => finding.slotId).filter(Boolean))).sort();
+  if (slotIds.length) return `${episodeIndex}:slot:${slotIds.join("+")}`;
+  const paths = Array.from(new Set(findings.map((finding) => normalizeBatchSegmentRepairPath(finding.path)).filter(Boolean))).sort();
+  return `${episodeIndex}:${reasonType}:${paths.join("+") || "segment"}`;
 }
 
 function normalizeBatchEpisodeResult(
@@ -800,190 +1047,141 @@ function maximumBatchStoryboardShotCount(result: AnalysisResult, requestedDurati
   return 0;
 }
 
-function comparableBatchShotText(value: unknown) {
-  return cleanPromptValue(value, "")
-    .replace(/\s+/g, "")
-    .replace(/[，。；：、“”‘’《》【】（）()|｜\-—_]/g, "")
-    .toLowerCase();
-}
-
 function minimumBatchFullPromptLength(storyboard: unknown[]) {
-  if (storyboard.length >= 4) return MIN_BATCH_FULL_PROMPT_LENGTH;
-  if (storyboard.length === 3) return 1100;
-  return 900;
+  return storyboard.length ? MIN_BATCH_FULL_PROMPT_LENGTH : 900;
 }
 
-function assertBatchShotFieldLength(episodeIndex: number, shotIndex: number, field: string, value: unknown) {
-  const minimum = MIN_BATCH_FIELD_LENGTHS[field as keyof typeof MIN_BATCH_FIELD_LENGTHS];
-  if (!minimum) return;
-  const text = cleanPromptValue(value, "").replace(/\s+/g, "");
-  if (text.length < minimum) {
-    throw new Error(
-      `第 ${episodeIndex} 段生成失败：镜头 ${shotIndex + 1} 的 ${field} 字段过短，疑似摘要版，至少需要 ${minimum} 个有效字符。`,
-    );
-  }
-}
-
-function normalizeContractCheckText(value: unknown) {
-  return cleanPromptValue(value, "")
-    .replace(/\s+/g, "")
-    .replace(/[，。；：、""''《》【】（）()|\-—–]/g, "")
-    .toLowerCase();
-}
-
-function assertBatchSegmentContractQuality(
+function legacyFatalCheck(
   episodeIndex: number,
   result: AnalysisResult,
-  contract: SegmentContract | undefined,
+  gate: ReturnType<typeof evaluateBatchSegmentQuality>,
 ) {
-  if (!contract) return;
-  const storyboard = Array.isArray(result.storyboard) ? result.storyboard : [];
-  if (storyboard.length !== contract.shotCount) {
-    throw new Error(`Segment ${episodeIndex} failed contract check: storyboard count ${storyboard.length} does not match SegmentContract shotCount ${contract.shotCount}.`);
+  if (!result || typeof result !== "object") throw new Error(`第 ${episodeIndex} 段生成失败：结果不是有效对象。`);
+  if (!Array.isArray(result.storyboard)) throw new Error(`第 ${episodeIndex} 段生成失败：storyboard 不是数组。`);
+  if (gate.blockingFindings.length > 0) throw new Error(buildTargetedRepairReason(gate));
+  try {
+    JSON.stringify(result);
+  } catch {
+    throw new Error(`第 ${episodeIndex} 段生成失败：结果无法序列化。`);
   }
-  const resultDurationSeconds = parsePromptDurationSeconds(result.duration);
-  if (resultDurationSeconds > 0 && resultDurationSeconds > contract.durationSeconds + 0.2) {
-    throw new Error(`Segment ${episodeIndex} failed contract check: duration ${resultDurationSeconds}s exceeds SegmentContract ${contract.durationSeconds}s.`);
-  }
-  const fullPromptText = normalizeContractCheckText(buildVideoGenerationPromptText(result));
-  for (const forbidden of contract.forbiddenFutureEvents || []) {
-    const normalizedForbidden = normalizeContractCheckText(forbidden);
-    if (normalizedForbidden.length >= 4 && fullPromptText.includes(normalizedForbidden)) {
-      throw new Error(`Segment ${episodeIndex} failed contract check: prompt reveals forbidden future event "${forbidden}".`);
-    }
-  }
-  const missingRequiredEvents = findMissingSegmentContractRequiredEvents(buildVideoGenerationPromptText(result), contract);
-  if (missingRequiredEvents.length) {
-    throw new Error(`Segment ${episodeIndex} failed contract check: prompt does not cover SegmentContract requiredEvents: ${missingRequiredEvents.join(" / ")}`);
+  if (!cleanPromptValue(buildVideoGenerationPromptText(result), "")) {
+    throw new Error(`第 ${episodeIndex} 段生成失败：保存前 canonical prompt 为空。`);
   }
 }
 
-const BATCH_EXECUTABLE_PLACEHOLDER_PATTERN = /同上|如上|见上文|其他\s*[：:]\s*无|其它\s*[：:]\s*无|(?:^|[，。；、\s])略(?:[，。；、\s]|$)/m;
+class BatchSegmentQualityValidationError extends Error {
+  gate: ReturnType<typeof evaluateBatchSegmentQuality>;
+  findings: BatchSegmentQualityFinding[];
+  result?: AnalysisResult;
+  coverageDecisions: CoverageDecision[];
 
-function containsBatchExecutablePlaceholderText(result: AnalysisResult) {
-  const workflow = (result.workflow || {}) as Partial<NonNullable<AnalysisResult["workflow"]>>;
-  const values = [
-    result.optimizedScript,
-    workflow.sourceAnalysis,
-    workflow.screenplay,
-    workflow.filmScript,
-    workflow.concisePrompt,
-    workflow.fullVideoPrompt,
-    ...(Array.isArray(result.storyboard)
-      ? result.storyboard.flatMap((shot) => [
-          shot.scene,
-          shot.visual,
-          shot.shotType,
-          shot.composition,
-          shot.cameraMovement,
-          shot.lighting,
-          shot.sound,
-          shot.dialogue,
-          shot.emotion,
-          shot.transition,
-          shot.shotPurpose,
-          shot.firstFramePrompt,
-          shot.videoPrompt,
-          shot.lastFramePrompt,
-        ])
-      : []),
-  ];
-
-  return values.some((value) => {
-    if (typeof value !== "string") return false;
-    BATCH_EXECUTABLE_PLACEHOLDER_PATTERN.lastIndex = 0;
-    return BATCH_EXECUTABLE_PLACEHOLDER_PATTERN.test(value);
-  });
+  constructor(
+    gate: ReturnType<typeof evaluateBatchSegmentQuality>,
+    result?: AnalysisResult,
+    coverageDecisions: CoverageDecision[] = [],
+  ) {
+    super(buildTargetedRepairReason(gate));
+    this.name = "BatchSegmentQualityValidationError";
+    this.gate = gate;
+    this.findings = gate.blockingFindings.length ? gate.blockingFindings : gate.findings;
+    this.result = result;
+    this.coverageDecisions = coverageDecisions;
+  }
 }
 
-function assertBatchSegmentQuality(
+function qualityGateWithBlockingFindings(
+  gate: BatchSegmentQualityGate,
+  blockingFindings: BatchSegmentQualityFinding[],
+): BatchSegmentQualityGate {
+  const blockingSet = new Set(blockingFindings);
+  const findings = gate.findings.filter((finding) => finding.severity !== "blocking" || blockingSet.has(finding));
+  return {
+    ...gate,
+    findings,
+    blockingFindings,
+  };
+}
+
+function qualityErrorForRoute(
+  gate: BatchSegmentQualityGate,
+  route: BatchSegmentOutcomeRoute,
+  result?: AnalysisResult,
+  coverageDecisions: CoverageDecision[] = [],
+) {
+  const candidateFindings = route.repairFindings.length ? route.repairFindings : route.structuralFindings;
+  const firstSlotId = candidateFindings.find((finding) => finding.slotId)?.slotId;
+  const repairFindings = firstSlotId
+    ? candidateFindings.filter((finding) => finding.slotId === firstSlotId)
+    : candidateFindings;
+  return new BatchSegmentQualityValidationError(
+    qualityGateWithBlockingFindings(gate, repairFindings),
+    result,
+    coverageDecisions,
+  );
+}
+
+function normalizePatchAndEvaluateBatchSegment(
   baseScript: string,
   episodeIndex: number,
   result: AnalysisResult,
   requestedDuration: string,
   contract?: SegmentContract,
+  coverageSidecar?: SegmentCoverageSidecar | null,
+  coverageDecisionOverrides?: CoverageDecision[],
+  coverageMode: "shadow" | "active" = "shadow",
 ) {
-  assertBatchSegmentContractQuality(episodeIndex, result, contract);
+  const normalizedResult = normalizeBatchSegmentResultForQuality(result);
   const sourceInfo = inferBatchEpisodeSourceInfo(baseScript, episodeIndex);
-  const storyboard = Array.isArray(result.storyboard) ? result.storyboard : [];
-  const maximumShotCount = maximumBatchStoryboardShotCount(result, requestedDuration);
-  if (maximumShotCount > 0 && storyboard.length > maximumShotCount) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：15 秒默认 4-5 镜头，当前 ${storyboard.length} 个镜头过密。`);
-  }
-  if (sourceInfo.shotCount > 0 && (!maximumShotCount || sourceInfo.shotCount <= maximumShotCount) && storyboard.length !== sourceInfo.shotCount) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：源文案有 ${sourceInfo.shotCount} 个镜头，但结果只有 ${storyboard.length} 个镜头。`);
-  }
-  const minimumShotCount = sourceInfo.shotCount > 0 ? 0 : minimumBatchStoryboardShotCount(result, requestedDuration);
-  if (minimumShotCount > 0 && storyboard.length < minimumShotCount) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：镜头数量过少，至少需要 ${minimumShotCount} 个，实际 ${storyboard.length} 个。`);
-  }
-
-  const fullPrompt = buildVideoGenerationPromptText(result);
-  const serializedResult = JSON.stringify(result);
-  const internalTokenHit = findInternalPromptToken(serializedResult) || findInternalPromptToken(fullPrompt);
-  if (internalTokenHit) {
-    throw new Error(
-      `Segment ${episodeIndex} failed quality check: user-facing prompt contains internal token "${internalTokenHit.token}".`,
-    );
-  }
-  const nullishPath = containsBatchNullishValue(result);
-  if (nullishPath) {
-    throw new Error(`Segment ${episodeIndex} failed quality check: ${nullishPath} contains undefined/null.`);
-  }
-  if (segmentTerminologyPattern.test(serializedResult)) {
-    throw new Error(`Segment ${episodeIndex} failed quality check: serialized result still contains episode terminology.`);
-  }
-  const fullPromptNullishPath = containsBatchNullishValue(fullPrompt, "workflow.fullVideoPrompt");
-  if (fullPromptNullishPath) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：提示词中包含空字段或占位文本。`);
-  }
-  if (/16\s*:\s*9\s*竖屏|竖屏\s*16\s*:\s*9|横屏\s*竖屏/.test(fullPrompt)) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：提示词包含 16:9 竖屏这类自相矛盾描述。`);
-  }
-  if (containsBatchExecutablePlaceholderText(result)) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：提示词包含如上/同上/略等不可执行占位。`);
-  }
-  if (/第\s*[0-9一二三四五六七八九十百]+\s*集/.test(fullPrompt)) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：提示词混入了“第 X 集”编号，应统一为“第 X 段”。`);
-  }
-  const minimumFullPrompt = minimumBatchFullPromptLength(storyboard);
-  if (fullPrompt.length < minimumFullPrompt) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：完整视频提示词过短，疑似摘要版，至少需要 ${minimumFullPrompt} 字。`);
-  }
-  const templateHits = GENERIC_SEASON_TEMPLATE_PHRASES.reduce(
-    (count, phrase) => count + fullPrompt.split(phrase).length - 1,
-    0,
-  );
-  if (templateHits >= 2) {
-    throw new Error(`第 ${episodeIndex} 段生成失败：提示词仍是模板化概要，没有生成具体镜头。`);
-  }
-
-  const seenVisuals = new Map<string, number>();
-  storyboard.forEach((shot, index) => {
-    for (const field of REQUIRED_BATCH_SEGMENT_SHOT_FIELDS) {
-      const value = shot[field];
-      if (typeof value !== "string" || !value.trim()) {
-        throw new Error(`第 ${episodeIndex} 段生成失败：镜头 ${index + 1} 缺少 ${field} 字段。`);
-      }
-      assertBatchShotFieldLength(episodeIndex, index, field, value);
-    }
-    const visual = comparableBatchShotText(shot.visual || shot.videoPrompt);
-    if (!visual || visual.length < 24) return;
-    const previous = seenVisuals.get(visual);
-    if (previous !== undefined) {
-      throw new Error(`第 ${episodeIndex} 段生成失败：镜头 ${previous + 1} 和镜头 ${index + 1} 的画面重复。`);
-    }
-    seenVisuals.set(visual, index);
+  const coverageStartedAt = Date.now();
+  const buildQualityOptions = (candidate: AnalysisResult) => {
+    const maxShotCount = maximumBatchStoryboardShotCount(candidate, requestedDuration);
+    const minShotCount = sourceInfo.shotCount > 0 ? 0 : minimumBatchStoryboardShotCount(candidate, requestedDuration);
+    return {
+      segmentIndex: episodeIndex,
+      expectedShotCount: contract?.shotCount,
+      sourceShotCount: sourceInfo.shotCount,
+      minShotCount,
+      maxShotCount,
+      requestedDuration,
+      contract,
+      coverageDecisions: contract
+        ? coverageDecisionOverrides || validateSegmentEventCoverage(candidate, contract, coverageSidecar)
+        : undefined,
+      coverageMode,
+      fullPromptText: buildVideoGenerationPromptText(candidate),
+      minFullPromptLength: minimumBatchFullPromptLength(candidate.storyboard || []),
+    };
+  };
+  const firstGate = evaluateBatchSegmentQuality(normalizedResult, {
+    ...buildQualityOptions(normalizedResult),
   });
-}
+  const deterministicPatchFindings = selectDeterministicQualityPatchFindings(
+    firstGate.findings,
+    { safetyEnabled: TASK_ONE_SAFETY_ENABLED },
+  );
+  const patched = applyDeterministicQualityPatchWithDiff(
+    normalizedResult,
+    deterministicPatchFindings,
+  );
+  const hasDeterministicChanges = patched.patchDiffs.length > 0;
+  const patchedResult = canonicalizeBatchSegmentResult(patched.result);
+  const finalGate = hasDeterministicChanges
+    ? evaluateBatchSegmentQuality(patchedResult, {
+        ...buildQualityOptions(patchedResult),
+      })
+    : firstGate;
 
-const SOFT_BATCH_FIELD_LENGTH_NAMES = Object.keys(MIN_BATCH_FIELD_LENGTHS);
-
-function isLegacySoftFieldLengthError(reason: string) {
-  if (!reason) return false;
-  const mentionsKnownField = SOFT_BATCH_FIELD_LENGTH_NAMES.some((field) => reason.includes(field));
-  if (!mentionsKnownField) return false;
-  return /too short|field length|minimum|有效字符|字段过短|瀛楁杩囩煭|杩囩煭/i.test(reason) || /\d+/.test(reason);
+  return {
+    result: patchedResult,
+    firstGate,
+    gate: finalGate,
+    patchDiffs: patched.patchDiffs,
+    localPatchSummary: summarizeQualityFindings([...firstGate.findings, ...finalGate.findings]),
+    coverageDecisions: contract
+      ? coverageDecisionOverrides || validateSegmentEventCoverage(patchedResult, contract, coverageSidecar)
+      : [],
+    coverageDurationMs: Math.max(0, Date.now() - coverageStartedAt),
+  };
 }
 
 function normalizePatchAndValidateBatchSegment(
@@ -992,52 +1190,25 @@ function normalizePatchAndValidateBatchSegment(
   result: AnalysisResult,
   requestedDuration: string,
   contract?: SegmentContract,
+  coverageSidecar?: SegmentCoverageSidecar | null,
+  coverageDecisionOverrides?: CoverageDecision[],
+  coverageMode: "shadow" | "active" = "shadow",
 ) {
-  const normalizedResult = normalizeBatchSegmentResultForQuality(result);
-  const firstGate = evaluateBatchSegmentQuality(normalizedResult, {
-    expectedShotCount: contract?.shotCount,
-    fullPromptText: buildVideoGenerationPromptText(normalizedResult),
-    minFullPromptLength: minimumBatchFullPromptLength(normalizedResult.storyboard || []),
-  });
-  const patchedResult = canonicalizeBatchSegmentResult(
-    applyDeterministicQualityPatch(normalizedResult, firstGate.findings),
+  const evaluated = normalizePatchAndEvaluateBatchSegment(
+    baseScript,
+    episodeIndex,
+    result,
+    requestedDuration,
+    contract,
+    coverageSidecar,
+    coverageDecisionOverrides,
+    coverageMode,
   );
-  const finalGate = evaluateBatchSegmentQuality(patchedResult, {
-    expectedShotCount: contract?.shotCount,
-    fullPromptText: buildVideoGenerationPromptText(patchedResult),
-    minFullPromptLength: minimumBatchFullPromptLength(patchedResult.storyboard || []),
-  });
-
-  if (shouldRepairWithCodex(finalGate)) {
-    throw new Error(buildTargetedRepairReason(finalGate));
+  if (shouldRepairWithCodex(evaluated.gate)) {
+    throw new BatchSegmentQualityValidationError(evaluated.gate, evaluated.result, evaluated.coverageDecisions);
   }
-
-  try {
-    assertBatchSegmentQuality(baseScript, episodeIndex, patchedResult, requestedDuration, contract);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    if (isLegacySoftFieldLengthError(reason) && !shouldRepairWithCodex(finalGate)) {
-      const warning: BatchSegmentQualityFinding = {
-        severity: "warning",
-        code: "field_below_target",
-        message: reason,
-      };
-      finalGate.findings.push(warning);
-      finalGate.warningFindings.push(warning);
-      return {
-        result: patchedResult,
-        gate: finalGate,
-        localPatchSummary: summarizeQualityFindings([...firstGate.findings, ...finalGate.findings]),
-      };
-    }
-    throw error;
-  }
-
-  return {
-    result: patchedResult,
-    gate: finalGate,
-    localPatchSummary: summarizeQualityFindings([...firstGate.findings, ...finalGate.findings]),
-  };
+  legacyFatalCheck(episodeIndex, evaluated.result, evaluated.gate);
+  return evaluated;
 }
 
 function inferPromptContentType(sourceText: string) {
@@ -1104,41 +1275,6 @@ function buildBatchEpisodeRenderScript(episodeInput: SeasonPackEpisodeInput, epi
   ].join("\n");
 }
 
-function buildBatchSegmentRepairScript(renderScript: string, episodeIndex: number, episodeCount: number, reason: string, failedResult: AnalysisResult) {
-  return [
-    renderScript,
-    "",
-    "当前段生成结果未通过 Local Director 保存前质量闸门，需要只重修当前段。",
-    `当前段：第 ${episodeIndex} / ${episodeCount} 段。`,
-    `失败原因：${reason}`,
-    "",
-    "重修要求：",
-    "1. 不要重写成新故事，只修当前段提示词和 storyboard。",
-    "2. 保留原段人物、地点、事件顺序、情绪推进和项目记忆。",
-    "3. 每个镜头必须补齐 timeRange、scene、visual、shotType、composition、cameraMovement、lighting、sound、dialogue、emotion、transition、shotPurpose、firstFramePrompt、videoPrompt、lastFramePrompt、negativePrompt。",
-    "4. 没有台词时 dialogue 必须写“无”。",
-    "5. 最终标题和提示词必须使用“第 N 段”，不要写“第 N 集”。",
-    "6. 15 秒默认 4-5 镜头；除非用户明确要求密集镜头版，否则 10-20 秒最多 5 个镜头。",
-    "7. 不要输出空字段、占位文本、如上、同上、略、其他：无、16:9竖屏。",
-    "8. 这是字段级补强，不是整段重写；上一版已经合格的镜头、字段、人物、地点、事件顺序和情绪推进必须尽量原样保留。",
-    "9. 如果失败原因是某个 visual、composition、lighting、sound、shotPurpose、firstFramePrompt、videoPrompt 或 lastFramePrompt 过短，只扩写对应字段到更具体可拍的镜头描述，不要压缩其它镜头。",
-    "10. 修复后的 workflow.fullVideoPrompt、workflow.filmScript 和 storyboard 必须互相一致，不能比上一版更短、更概括或更模板化。",
-    "11. 不要把内部英文 ID、schema 名称、文件格式名或工程字段名写进 title、contentType、scene、visual、workflow 或 storyboard 字段；所有道具、证据、场景和人物都必须使用中文自然称呼。",
-    "",
-    "未通过校验的上次结果摘要：",
-    sanitizeInternalPromptTokens(JSON.stringify({
-      title: failedResult.title,
-      duration: failedResult.duration,
-      style: failedResult.style,
-      storyboardCount: Array.isArray(failedResult.storyboard) ? failedResult.storyboard.length : 0,
-      optimizedScript: failedResult.optimizedScript,
-    }, null, 2)),
-    "",
-    "上一版完整结果 JSON（只修失败字段，其余字段尽量原样保留）：",
-    sanitizeInternalPromptTokens(JSON.stringify(failedResult, null, 2)),
-  ].join("\n");
-}
-
 function episodeSourceText(baseScript: string, episodeIndex: number, episodeCount: number, episodeInput: SeasonPackEpisodeInput, episodeResult: AnalysisResult) {
   return [
     `整段规划 + 单段同款生成：第 ${episodeIndex} / ${episodeCount} 段`,
@@ -1178,6 +1314,16 @@ export function DashboardClient() {
   const [episodeCount, setEpisodeCount] = useState(1);
   const [segmentCountMode, setSegmentCountMode] = useState<SegmentCountMode>("fixed");
   const [batchProgress, setBatchProgress] = useState<BatchGenerationProgress | null>(null);
+  const [batchSaveRecovery, setBatchSaveRecovery] = useState<BatchSaveRecoveryDescriptor | null>(null);
+  const [batchRecoveryChecking, setBatchRecoveryChecking] = useState(false);
+  const batchRecoveryLookupRef = useRef<Promise<BatchRecoveryDiscovery> | null>(null);
+  const batchRecoveryLookupKeyRef = useRef("");
+  const renderRecoveryObserverRegistryRef = useRef(
+    createRenderPackObserverRegistry<RenderObservationOutcome<VideoPromptPackCodexJob>>(),
+  );
+  const renderPackObserverRegistryRef = useRef(
+    createRenderPackObserverRegistry<void>(),
+  );
   const [batchProgressTick, setBatchProgressTick] = useState(0);
   const [episodeCountPickerOpen, setEpisodeCountPickerOpen] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState("");
@@ -1196,6 +1342,11 @@ export function DashboardClient() {
     return () => window.clearInterval(timer);
   }, [batchProgress?.startedAtMs, batchProgress?.phase]);
 
+  useEffect(() => () => {
+    renderRecoveryObserverRegistryRef.current.abortAll();
+    renderPackObserverRegistryRef.current.abortAll();
+  }, []);
+
   useEffect(() => {
     let active = true;
     fetch("/api/library")
@@ -1212,6 +1363,207 @@ export function DashboardClient() {
       active = false;
     };
   }, []);
+
+  async function discoverBatchSaveRecovery(): Promise<BatchRecoveryDiscovery> {
+    if (!TASK_ONE_CACHE_RECOVERY_ENABLED || typeof window === "undefined") {
+      return { status: "none", descriptor: null };
+    }
+    type RecoveryCandidate = {
+      recoveryKey: string;
+      durableBatchId?: string;
+      sourceHash: string;
+      projectId?: string | null;
+      fromRegistry: boolean;
+    };
+    const registryCandidates = readBatchRecoveryRegistry().map((pointer) => ({
+      recoveryKey: pointer.recoveryKey,
+      durableBatchId: pointer.durableBatchId,
+      sourceHash: pointer.sourceHash,
+      projectId: pointer.projectId,
+      fromRegistry: true as const,
+    }));
+    const legacySourceHash = script.trim()
+      ? buildBatchSegmentResultHash({
+          mode: segmentCountMode,
+          episodeCount,
+          duration: selectedDurationValue(),
+          sourceText: script,
+        })
+      : "";
+    const legacyCandidates = script.trim()
+      ? buildSegmentBatchRecoveryKeys({
+          projectId: resumeProjectId || null,
+          sourceHash: legacySourceHash,
+          mode: segmentCountMode,
+          requestedCount: segmentCountMode === "auto" ? null : episodeCount,
+          duration: selectedDurationValue(),
+        }).map((recoveryKey) => ({
+          recoveryKey,
+          sourceHash: legacySourceHash,
+          projectId: resumeProjectId || null,
+          fromRegistry: false as const,
+        }))
+      : [];
+    const candidates = [...registryCandidates, ...legacyCandidates] as RecoveryCandidate[];
+    if (!candidates.length) return { status: "none", descriptor: null };
+
+    let infrastructureFailure = "";
+    const inspectedBatchIds = new Set<string>();
+    try {
+      for (const candidate of candidates) {
+        let durableBatchId = candidate.durableBatchId || "";
+        if (!candidate.fromRegistry) {
+          try {
+            const raw = window.localStorage.getItem(candidate.recoveryKey);
+            const index = raw ? JSON.parse(raw) as Record<string, unknown> : null;
+            durableBatchId = typeof index?.durableBatchId === "string"
+              ? index.durableBatchId
+              : typeof index?.batchId === "string" ? index.batchId : "";
+            if (!durableBatchId || index?.sourceHash !== candidate.sourceHash) continue;
+          } catch (legacyIndexError) {
+            console.warn("Failed to read legacy batch recovery index", legacyIndexError);
+            window.localStorage.removeItem(candidate.recoveryKey);
+            continue;
+          }
+        }
+        if (inspectedBatchIds.has(durableBatchId)) continue;
+        inspectedBatchIds.add(durableBatchId);
+
+        let response: Response;
+        try {
+          response = await fetch(`/api/segment-batch-cache/${encodeURIComponent(durableBatchId)}`, {
+            method: "GET",
+            cache: "no-store",
+          });
+        } catch (cacheReadError) {
+          console.warn("Failed to read batch recovery cache", cacheReadError);
+          infrastructureFailure ||= formatUserFacingError(
+            cacheReadError,
+            "分段缓存服务暂时不可用，无法确认是否存在待保存结果。",
+          );
+          continue;
+        }
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          if ([400, 404, 410].includes(response.status)) {
+            window.localStorage.removeItem(candidate.recoveryKey);
+            forgetBatchRecoveryPointer(durableBatchId);
+            continue;
+          }
+          infrastructureFailure ||= formatUserFacingError(
+            data?.error || `分段缓存服务返回 ${response.status}`,
+            "分段缓存服务暂时不可用，无法确认是否存在待保存结果。",
+          );
+          continue;
+        }
+        if (!data?.ok || !data.cache) {
+          infrastructureFailure ||= "分段缓存服务返回了无效数据，无法确认是否存在待保存结果。";
+          continue;
+        }
+
+        const cache = data.cache as SegmentBatchCacheDocumentV2;
+        const activeProjectMatches = !resumeProjectId || !cache.projectId || cache.projectId === resumeProjectId;
+        if (!activeProjectMatches) continue;
+        const pointerProjectMatches = !candidate.projectId || !cache.projectId || cache.projectId === candidate.projectId;
+        const cacheIdentityMatches = cache.schemaVersion === 2
+          && cache.durableBatchId === durableBatchId
+          && cache.sourceHash === candidate.sourceHash
+          && pointerProjectMatches
+          && Array.isArray(cache.segments)
+          && Array.isArray(cache.segmentStates);
+        if (!cacheIdentityMatches) {
+          window.localStorage.removeItem(candidate.recoveryKey);
+          forgetBatchRecoveryPointer(durableBatchId);
+          continue;
+        }
+        const hasUnsavedSegments = cache.segmentStates.some(
+          (state) => state.saveStatus !== "saved" && state.saveStatus !== "review_saved",
+        ) && cache.segments.length > 0;
+        if (hasUnsavedSegments) {
+          return {
+            status: "recoverable",
+            descriptor: {
+              recoveryKey: candidate.recoveryKey,
+              durableBatchId,
+              sourceHash: candidate.sourceHash,
+              projectId: cache.projectId || candidate.projectId,
+              fromRegistry: candidate.fromRegistry,
+            },
+          };
+        }
+        window.localStorage.removeItem(candidate.recoveryKey);
+        forgetBatchRecoveryPointer(durableBatchId);
+      }
+    } catch (recoveryIndexError) {
+      console.warn("Failed to read batch recovery index", recoveryIndexError);
+      infrastructureFailure ||= formatUserFacingError(
+        recoveryIndexError,
+        "无法读取分段恢复索引，暂不能开始新的分段生成。",
+      );
+    }
+    if (infrastructureFailure) {
+      return { status: "unavailable", descriptor: null, message: infrastructureFailure };
+    }
+    return { status: "none", descriptor: null };
+  }
+
+  function ensureBatchSaveRecoveryDiscovery() {
+    if (!TASK_ONE_CACHE_RECOVERY_ENABLED) {
+      return Promise.resolve({ status: "none", descriptor: null } satisfies BatchRecoveryDiscovery);
+    }
+    const lookupKey = JSON.stringify({
+      duration: selectedDurationValue(),
+      episodeCount,
+      projectId: resumeProjectId || null,
+      script,
+      segmentCountMode,
+    });
+    if (batchRecoveryLookupRef.current && batchRecoveryLookupKeyRef.current === lookupKey) {
+      return batchRecoveryLookupRef.current;
+    }
+    const lookup = discoverBatchSaveRecovery();
+    batchRecoveryLookupKeyRef.current = lookupKey;
+    batchRecoveryLookupRef.current = lookup;
+    void lookup.finally(() => {
+      if (batchRecoveryLookupRef.current === lookup) {
+        batchRecoveryLookupRef.current = null;
+        batchRecoveryLookupKeyRef.current = "";
+      }
+    });
+    return lookup;
+  }
+
+  useEffect(() => {
+    if (!TASK_ONE_CACHE_RECOVERY_ENABLED || batchGenerating) {
+      if (!batchGenerating) setBatchSaveRecovery(null);
+      setBatchRecoveryChecking(false);
+      return;
+    }
+    let active = true;
+    setBatchRecoveryChecking(true);
+    void ensureBatchSaveRecoveryDiscovery()
+      .then((discovery) => {
+        if (!active) return;
+        setBatchSaveRecovery(discovery.descriptor);
+        if (discovery.status === "unavailable") {
+          setError(discovery.message);
+        }
+      })
+      .finally(() => {
+        if (active) setBatchRecoveryChecking(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    batchGenerating,
+    durationMode,
+    durationSeconds,
+    episodeCount,
+    resumeProjectId,
+    script,
+    segmentCountMode,
+  ]);
 
   useEffect(() => {
     const resumeScript = window.localStorage.getItem("vd_resume_script");
@@ -1300,6 +1652,196 @@ export function DashboardClient() {
     return data.job as VideoPromptCodexJob;
   }
 
+  async function createBatchSegmentRepairCodexJob(input: {
+    projectId?: string;
+    batchId: string;
+    segmentIndex: number;
+    slotId?: string;
+    contractHash: string;
+    resultHash: string;
+    sourceTextForModel: string;
+    allowedPaths: string[];
+    currentValues: Record<string, string>;
+    findings: Array<{ code: string; message: string; path?: string; slotId?: string }>;
+    forbiddenFutureEvents?: string[];
+  }) {
+    await assertCodexWorkerRuntimeHealthy("batch-segment-repair");
+    const res = await fetch("/api/batch-segment-repair/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.error || "Codex 路径级修复任务创建失败");
+    }
+    return data.job as BatchSegmentRepairCodexJob;
+  }
+
+  async function pollBatchSegmentRepairCodexJob(jobId: string): Promise<BatchSegmentRepairPollResult> {
+    const startedAt = Date.now();
+    const timeoutMs = REPAIR_FRONTEND_WAIT_TIMEOUT_MS;
+    let lastStatus = "";
+    let lastJob: BatchSegmentRepairCodexJob | null = null;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const currentJob = await queryBatchSegmentRepairCodexJob(jobId);
+      lastJob = currentJob;
+      if (currentJob.status !== lastStatus) {
+        lastStatus = currentJob.status;
+        setGenerationProgress(
+          currentJob.status === "running"
+            ? "Codex 正在只修复未通过质量闸的字段..."
+            : `Codex 路径级修复任务状态：${currentJob.status}`,
+        );
+      }
+      if (currentJob.status === "completed") return { status: "completed", job: currentJob };
+      if (currentJob.status === "failed") {
+        throw new CodexVideoPromptJobFailedError(currentJob.error || "Codex 路径级修复任务失败");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    return {
+      status: "detached",
+      job: lastJob || { id: jobId, resultHash: "", status: "running" },
+    };
+  }
+
+  async function queryBatchSegmentRepairCodexJob(jobId: string) {
+    const res = await fetch(`/api/batch-segment-repair/jobs/${encodeURIComponent(jobId)}`, { cache: "no-store" });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) {
+      throw new Error(data?.error || "Codex 路径级修复任务读取失败");
+    }
+    return data.job as BatchSegmentRepairCodexJob;
+  }
+
+  async function requestBatchSegmentRepairPatchWithContext(input: {
+    projectId?: string;
+    batchId: string;
+    segmentIndex: number;
+    segmentContract?: SegmentContract;
+    sourceText: string;
+    failedResult: AnalysisResult;
+    findings: BatchSegmentQualityFinding[];
+    onJobCreated?: (input: { jobId: string; contractHash: string; resultHash: string }) => void;
+  }) {
+    const targetedFindings = input.findings
+      .map((finding) => ({
+        finding,
+        path: normalizeBatchSegmentRepairPath(finding.path),
+      }))
+      .filter((item) => item.path && isAllowedBatchSegmentRepairPath(item.path))
+      .slice(0, 16);
+    if (!targetedFindings.length) {
+      throw new Error(`第 ${input.segmentIndex} 段没有可安全路径修复的字段，已阻止整段结果 fallback。`);
+    }
+
+    const allowedPaths = Array.from(new Set(targetedFindings.map((item) => item.path)));
+    const findingSlotIds = Array.from(new Set(targetedFindings.map((item) => item.finding.slotId).filter(Boolean)));
+    const slotId = findingSlotIds.length === 1 ? findingSlotIds[0] : undefined;
+    const currentValues = Object.fromEntries(
+      allowedPaths.map((path) => [path, String(getBatchSegmentRepairValueAtPath(input.failedResult, path) ?? "")]),
+    );
+    const resultHash = buildBatchSegmentResultHash(input.failedResult);
+    const contractHash = input.segmentContract?.contractHash
+      || buildBatchSegmentResultHash({ segmentIndex: input.segmentIndex, sourceText: input.sourceText });
+    const repairModelInput = applyPromptSafetyPolicyDeep({
+      segmentIndex: input.segmentIndex,
+      title: input.segmentContract?.title || input.failedResult.title,
+      sourceText: input.segmentContract?.sourceText || input.sourceText,
+      requiredEvents: input.segmentContract?.requiredEvents || [],
+      requiredShotBeats: input.segmentContract?.requiredShotBeats || [],
+      characters: input.segmentContract?.characters || [],
+      locations: input.segmentContract?.locations || [],
+      props: input.segmentContract?.props || [],
+    }, { phase: "repair" });
+    const sourceTextForModel = JSON.stringify(repairModelInput.sourceTextForModel);
+    const job = await createBatchSegmentRepairCodexJob({
+      projectId: input.projectId,
+      batchId: input.batchId,
+      segmentIndex: input.segmentIndex,
+      slotId,
+      contractHash,
+      resultHash,
+      sourceTextForModel,
+      allowedPaths,
+      currentValues,
+      findings: targetedFindings.map(({ finding, path }) => ({
+        code: finding.code,
+        message: finding.message,
+        path,
+        slotId: finding.slotId,
+      })),
+      forbiddenFutureEvents: input.segmentContract?.forbiddenFutureEvents || [],
+    });
+    input.onJobCreated?.({ jobId: job.id, contractHash, resultHash });
+    const polled = await pollBatchSegmentRepairCodexJob(job.id);
+    if (polled.status === "detached") {
+      return { detached: true as const, jobId: job.id, contractHash, resultHash };
+    }
+    const completedJob = polled.job;
+    if (completedJob.resultHash !== resultHash) {
+      throw new Error(`第 ${input.segmentIndex} 段同一事件槽已完成过一次修复，当前结果已变化，停止重复 patch。`);
+    }
+    if (!completedJob.result) {
+      throw new CodexVideoPromptJobFailedError("Codex 路径级修复任务完成但没有返回 patch");
+    }
+    return {
+      detached: false as const,
+      jobId: completedJob.id,
+      contractHash,
+      resultHash,
+      patch: completedJob.result,
+    };
+  }
+
+  async function createEventCoverageCodexJob(input: {
+    batchId: string;
+    renderRound: string | number;
+    cases: Array<{
+      segmentIndex: number;
+      slotId: string;
+      label: string;
+      importance: "blocking";
+      contractHash: string;
+      resultHash: string;
+      anchorGroups: string[][];
+      conceptGroups: string[][];
+      contradictionGroups: string[][];
+      sourceExcerpt: string;
+      characterLocks: SegmentContract["characterLocks"];
+      forbiddenFutureEvents: string[];
+      evidenceSelectors: SegmentContract["requiredEventSlots"][number]["evidenceSelectors"];
+      inspectedFields: Array<{ path: string; text: string }>;
+    }>;
+  }) {
+    await assertCodexWorkerRuntimeHealthy("event-coverage");
+    const res = await fetch("/api/event-coverage/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) throw new Error(data?.error || "Codex 事件覆盖裁决任务创建失败");
+    return data.job as EventCoverageCodexJob;
+  }
+
+  async function pollEventCoverageCodexJob(jobId: string) {
+    const startedAt = Date.now();
+    const timeoutMs = 12 * 60_000;
+    while (Date.now() - startedAt < timeoutMs) {
+      const res = await fetch(`/api/event-coverage/jobs/${encodeURIComponent(jobId)}`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "Codex 事件覆盖裁决任务读取失败");
+      const job = data.job as EventCoverageCodexJob;
+      if (job.status === "completed") return job;
+      if (job.status === "failed") throw new CodexVideoPromptJobFailedError(job.error || "Codex 事件覆盖裁决任务失败");
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    throw new Error("Codex 事件覆盖裁决任务等待超时，请确认 event-coverage:codex-worker 正在运行。");
+  }
+
   async function createVideoPromptPackCodexJob(
     segments: Array<{
       episodeIndex: number;
@@ -1309,24 +1851,65 @@ export function DashboardClient() {
       duration: string;
       shotCount: number;
       segmentContract?: SegmentContract;
+      compiledContract: Extract<CompiledSegmentContractBlock, { status: "ready" | "compacted" }>;
     }>,
     projectId: string | undefined,
     mode: RenderPackCodexMode = STRICT_UTF8_RENDER_PACK_MODE,
+    coverageSidecarEnabled = true,
+    operationIdentity?: Pick<RenderOperationRefV2, "batchId" | "operationToken" | "idempotencyKey">,
   ) {
-    const res = await fetch("/api/video-prompt-packs/jobs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        projectId: projectId || undefined,
-        mode,
-        segments,
-      }),
+    await assertCodexWorkerRuntimeHealthy("video-prompt-pack");
+    const body = JSON.stringify({
+      batchId: operationIdentity?.batchId,
+      operationToken: operationIdentity?.operationToken,
+      idempotencyKey: operationIdentity?.idempotencyKey,
+      projectId: projectId || undefined,
+      mode,
+      coverageSidecarEnabled,
+      segments,
     });
-    const data = await res.json().catch(() => null);
-    if (!res.ok || !data?.ok) {
-      throw new Error(data?.error || "Codex render pack job creation failed");
+    let lastTransportError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let res: Response;
+      try {
+        res = await fetch("/api/video-prompt-packs/jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+      } catch (error) {
+        lastTransportError = error;
+        if (attempt > 0) throw error;
+        continue;
+      }
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        const code = String(data?.errorCode || data?.code || "");
+        if (CONTRACT_PREFLIGHT_ERROR_CODES.has(code)) {
+          throw new ContractPreflightCreateError(
+            code,
+            data?.error || "Contract preflight rejected Render Pack creation",
+            Array.isArray(data?.segmentIndexes) ? data.segmentIndexes : [],
+          );
+        }
+        throw new Error(data?.error || "Codex render pack job creation failed");
+      }
+      return data.job as VideoPromptPackCodexJob;
     }
-    return data.job as VideoPromptPackCodexJob;
+    throw lastTransportError instanceof Error ? lastTransportError : new Error("Codex render pack job creation failed");
+  }
+
+  async function assertCodexWorkerRuntimeHealthy(workerName: string) {
+    const res = await fetch(`/api/codex-runtime/health?worker=${encodeURIComponent(workerName)}`, { cache: "no-store" });
+    const data = await res.json().catch(() => null);
+    if (res.ok && data?.ok && data?.health?.status === "healthy") return;
+    if (data?.code === "CODEX_SKILL_CONFIG_INVALID") {
+      const files = Array.isArray(data?.errors)
+        ? data.errors.slice(0, 5).map((item: { path?: string; message?: string }) => `${item.path || "未知文件"}: ${item.message || "配置无效"}`)
+        : [];
+      throw new Error(`Codex Skill 配置无效，请修复后重启 worker。${files.length ? ` ${files.join("；")}` : ""}`);
+    }
+    throw new Error(data?.error || "本地 Codex worker 尚未运行，请启动 worker 后重试。");
   }
 
   async function createSeasonPackCodexJob(
@@ -1336,6 +1919,7 @@ export function DashboardClient() {
     mode: SegmentCountMode,
     requestedCount: number,
   ) {
+    await assertCodexWorkerRuntimeHealthy("season-pack");
     const body: Record<string, unknown> = {
       script: inputScript,
       duration: inputDuration,
@@ -1407,35 +1991,50 @@ export function DashboardClient() {
     return Math.max(0, completedAt - startedAt);
   }
 
+  async function readVideoPromptPackCodexJob(jobId: string, signal?: AbortSignal) {
+    const response = await fetch(`/api/video-prompt-packs/jobs/${encodeURIComponent(jobId)}`, {
+      cache: "no-store",
+      signal,
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data?.ok || !data.job) {
+      throw Object.assign(
+        new Error(data?.error || `Codex render pack job read failed (${response.status})`),
+        { status: response.status, code: data?.errorCode || data?.code },
+      );
+    }
+    return data.job as VideoPromptPackCodexJob;
+  }
+
   async function pollVideoPromptPackCodexJob(jobId: string, segmentCount: number) {
-    const startedAt = Date.now();
-    const timeoutMs = Math.max(30 * 60_000, segmentCount * 600_000);
+    const attentionMs = Math.max(30 * 60_000, segmentCount * 600_000);
     let lastStatus = "";
-
-    while (Date.now() - startedAt < timeoutMs) {
-      const res = await fetch(`/api/video-prompt-packs/jobs/${jobId}`, { cache: "no-store" });
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || "Codex render pack job read failed");
-      }
-
-      const currentJob = data.job as VideoPromptPackCodexJob;
-      if (currentJob.status !== lastStatus) {
+    const outcome = await observeRenderPackJob({
+      jobId,
+      mode: "foreground",
+      attentionMs,
+      readJob: readVideoPromptPackCodexJob,
+      sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+      onStage(currentJob) {
+        if (currentJob.status === lastStatus) return;
         lastStatus = currentJob.status;
         setGenerationProgress(
           currentJob.status === "running"
             ? `Codex 正在本地生成 ${segmentCount} 段 Render Pack...`
             : `Codex Render Pack 任务状态：${currentJob.status}`,
         );
-      }
-      if (currentJob.status === "completed") return currentJob;
-      if (currentJob.status === "failed") {
-        throw new CodexVideoPromptJobFailedError(currentJob.error || "Codex render pack job failed");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 2500));
+      },
+    });
+    if (outcome.status === "completed") return outcome.job;
+    if (outcome.status === "terminal_failed" && outcome.job?.status === "failed") {
+      throw new CodexVideoPromptJobFailedError(outcome.job.error || "Codex render pack job failed");
     }
-
-    throw new Error("Codex Render Pack 任务等待超时，请确认 video-prompt-pack:codex-worker 正在运行。");
+    throw new RenderPackPollingInfrastructureError(
+      jobId,
+      outcome.status === "detached"
+        ? "Codex Render Pack 前台等待已结束；原任务仍保留，不会降级为逐段重新生成。"
+        : `Codex Render Pack 状态不可继续读取（${outcome.status === "terminal_failed" ? outcome.reasonCode : "aborted"}）。`,
+    );
   }
 
   async function pollVideoPromptCodexJob(jobId: string) {
@@ -1610,12 +2209,16 @@ export function DashboardClient() {
     fullVideoPrompt: string,
     projectId: string | undefined = resumeProjectId || undefined,
     versionId: string | undefined = getActiveResumeVersionId(),
+    idempotencyKey?: string,
+    status?: string,
   ): Promise<ProjectSaveState> {
     try {
       const res = await fetch("/api/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          idempotencyKey,
+          status,
           projectId,
           versionId,
           originalScript,
@@ -1625,28 +2228,704 @@ export function DashboardClient() {
       });
       const data = await res.json().catch(() => null);
       if (!res.ok || !data?.ok) {
-        return { saved: false, reason: data?.error || "Project save failed" };
+        return {
+          saved: false,
+          reason: data?.message || data?.error || "Project save failed",
+          message: data?.message || data?.error || "Project save failed",
+          errorCode: data?.errorCode || "PROJECT_API_UNAVAILABLE",
+          retryable: Boolean(data?.retryable),
+          requestId: data?.requestId,
+        };
       }
       return (data.save || { saved: true }) as ProjectSaveState;
     } catch (err) {
       return {
         saved: false,
         reason: err instanceof Error ? err.message : "Project save failed",
+        message: err instanceof Error ? err.message : "Project save failed",
+        errorCode: "PROJECT_API_UNAVAILABLE",
+        retryable: true,
       };
     }
   }
 
+  async function resumeCachedRenderOperations(input: {
+    cache: SegmentBatchCacheDocumentV2;
+    stateByIndex: Map<number, SegmentStateRecord>;
+    persist: () => Promise<void>;
+    recordRecoveredRenderPackCall?: (identity: { operationToken: string; jobId: string }) => void;
+  }) {
+    const { cache, stateByIndex, persist, recordRecoveredRenderPackCall } = input;
+    let recoveryPersistChain = Promise.resolve();
+    const persistRecoveryState = () => {
+      const next = recoveryPersistChain.then(() => persist());
+      recoveryPersistChain = next.then(() => undefined, () => undefined);
+      return next;
+    };
+    let operations = retainBoundedRenderOperationAudits(cache.renderOperations || []);
+    const replaceOperation = (operation: RenderOperationRefV2) => {
+      operations = retainBoundedRenderOperationAudits([
+        ...operations.filter((item) => item.operationToken !== operation.operationToken),
+        operation,
+      ]);
+      cache.renderOperations = operations;
+      cache.activeJobIds = operations
+        .filter((item) => ["observing", "detached"].includes(item.state) && item.jobId)
+        .map((item) => String(item.jobId));
+    };
+    const dispatch = (segmentIndex: number, event: SegmentStateEvent) => {
+      const current = stateByIndex.get(segmentIndex);
+      if (!current) return;
+      stateByIndex.set(segmentIndex, reduceSegmentState(current, {
+        ...event,
+        baseRevision: current.revision,
+      }));
+    };
+    const markInfrastructureFailure = async (operation: RenderOperationRefV2, errorCode: string) => {
+      const failed = terminateRenderOperation(operation, { state: "failed", errorCode });
+      replaceOperation(failed);
+      for (const segmentIndex of operation.segmentIndexes) {
+        dispatch(segmentIndex, {
+          type: "RENDER_OPERATION_FAILED",
+          operationToken: operation.operationToken,
+          errorCode,
+          message: "原 Render Pack 无法继续读取，已保留批次现场，不会触发补生成。",
+        });
+      }
+      await persistRecoveryState();
+    };
+
+    const creatingOperations = operations.filter((operation) => operation.state === "creating");
+    await Promise.allSettled(creatingOperations.map(async (draft) => {
+      const context = draft.reconciliationContext;
+      const creationContext = draft.creationContext;
+      if (!context?.segments.length || !creationContext?.segments.length) {
+        await markInfrastructureFailure(draft, "CONTRACT_PREFLIGHT_REQUIRED");
+        return;
+      }
+      const compiledBySegment = new Map(creationContext.segments.map((segment) => [segment.episodeIndex, segment]));
+      const segments = context.segments.map((segment) => {
+        const compiledContract = compiledBySegment.get(segment.episodeIndex)?.compiledContract;
+        if (!compiledContract) throw new Error(`Segment ${segment.episodeIndex} is missing its persisted compiled Contract`);
+        const episodeInput: SeasonPackEpisodeInput = {
+          episodeIndex: segment.episodeIndex,
+          title: segment.title,
+          sourceText: segment.sourceText,
+          duration: segment.duration,
+          contentType: "短剧",
+          style: "写实",
+          storyBible: null,
+          episodeChain: null,
+          blueprint: null,
+          shotCount: segment.shotCount || segment.segmentContract?.shotCount || 4,
+          renderInputScript: segment.sourceText,
+          segmentContract: segment.segmentContract,
+        };
+        return {
+          episodeIndex: segment.episodeIndex,
+          title: segment.title,
+          script: segment.sourceText,
+          renderInputScript: buildBatchEpisodeRenderScript(episodeInput, cache.resolvedSegmentCount),
+          duration: segment.duration,
+          shotCount: episodeInput.shotCount,
+          segmentContract: segment.segmentContract,
+          compiledContract,
+        };
+      });
+      const createResult = await retryCreatingRenderOperation({
+        operation: draft,
+        maxAttempts: 3,
+        create: () => createVideoPromptPackCodexJob(
+          segments,
+          cache.projectId || undefined,
+          STRICT_UTF8_RENDER_PACK_MODE,
+          true,
+          draft,
+        ),
+        sleep: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+      });
+      if (createResult.status === "created") {
+        const job = createResult.value;
+        const observing = attachRenderOperationJob(draft, {
+          jobId: job.id,
+          sourceHash: String(job.sourceHash || ""),
+          aggregateContractHash: job.aggregateContractHash || null,
+        });
+        recordRecoveredRenderPackCall?.({
+          operationToken: observing.operationToken,
+          jobId: job.id,
+        });
+        replaceOperation(observing);
+        for (const segmentIndex of observing.segmentIndexes) {
+          dispatch(segmentIndex, {
+            type: "RENDER_OPERATION_OBSERVING",
+            operationToken: observing.operationToken,
+            jobId: job.id,
+            expectedSourceHash: String(job.sourceHash || ""),
+          });
+        }
+        await persistRecoveryState();
+        return;
+      }
+      if (createResult.status === "transient") {
+        replaceOperation({ ...draft, lastErrorCode: createResult.errorCode });
+        await persistRecoveryState();
+        return;
+      }
+      await markInfrastructureFailure(draft, createResult.errorCode);
+    }));
+
+    async function reconcileRecoveredJob(operation: RenderOperationRefV2, job: VideoPromptPackCodexJob) {
+      const jobId = String(operation.jobId || job.id || "");
+      const currentSegments = Object.fromEntries(operation.segmentIndexes.map((segmentIndex) => {
+        const state = stateByIndex.get(segmentIndex);
+        return [String(segmentIndex), {
+          operationToken: state?.renderOperationToken,
+          sourceHash: state?.expectedSourceHash,
+          contractHash: state?.expectedContractHash || state?.contractHash,
+          resultHash: state?.resultHash,
+        }];
+      }));
+      const decision = reconcileDetachedRenderPack({
+        operation,
+        job,
+        manifestValidated: job.protocolVersion === 2
+          && job.resultAvailable === true
+          && Boolean(job.resultHash),
+        currentSegments,
+      });
+      if (decision.status === "failed") {
+        await markInfrastructureFailure(operation, decision.errorCode);
+        return;
+      }
+      if (decision.status === "ignored") {
+        replaceOperation(terminateRenderOperation(operation, {
+          state: "ignored",
+          reasonCode: decision.reasonCode,
+        }));
+        for (const segmentIndex of decision.segmentIndexes) {
+          dispatch(segmentIndex, {
+            type: "RENDER_OPERATION_IGNORED",
+            operationToken: operation.operationToken,
+            reasonCode: decision.reasonCode,
+          });
+        }
+        await persistRecoveryState();
+        return;
+      }
+      if (decision.status === "waiting") return;
+      if (decision.status === "replay") {
+        if (operation.state !== "merged") {
+          replaceOperation(terminateRenderOperation(operation, {
+            state: "merged",
+            finalManifestHash: String(job.resultHash),
+            resultHashes: decision.resultHashes,
+          }));
+          await persistRecoveryState();
+        }
+        return;
+      }
+
+      const context = operation.reconciliationContext;
+      try {
+        const prepared = prepareRenderPackReconciliation({
+          operation,
+          eligibleSegmentIndexes: decision.segmentIndexes,
+          contexts: context?.segments || [],
+          results: job.result?.segments || [],
+          prepareSegment: ({ segmentIndex, context: segmentContext, result: packed }) => {
+            const normalized = normalizeBatchEpisodeResult(
+              context?.sourceText || segmentContext.sourceText,
+              segmentIndex,
+              cache.resolvedSegmentCount,
+              packed.result,
+              segmentContext.duration,
+            );
+            const coverageStage = (cache.coverageStage || "shadow") as BatchEventCoverageStage;
+            const evaluated = normalizePatchAndEvaluateBatchSegment(
+              context?.sourceText || segmentContext.sourceText,
+              segmentIndex,
+              normalized,
+              segmentContext.duration,
+              segmentContext.segmentContract,
+              packed.coverageSidecar as SegmentCoverageSidecar | null | undefined,
+              undefined,
+              coverageStageUsesLocalGate(coverageStage) ? "active" : "shadow",
+            );
+            const outcome = routeBatchSegmentOutcome({
+              gate: evaluated.gate,
+              hasUsableResult: true,
+              coverageStage,
+            });
+            const needsReview = outcome.action !== "accept";
+            return {
+              segmentContext,
+              packed,
+              evaluated,
+              needsReview,
+              reason: buildTargetedRepairReason(evaluated.gate),
+            };
+          },
+        });
+
+        await applyPreparedRenderPackReconciliation(prepared, {
+          applySegment: ({ segmentContext, packed, evaluated, needsReview, reason }, segmentIndex) => {
+            dispatch(segmentIndex, {
+              type: "RENDER_OPERATION_RECONCILED",
+              operationToken: operation.operationToken,
+              jobId,
+              resultHash: packed.resultHash!,
+              contractHash: segmentContext.segmentContract?.contractHash,
+            });
+            dispatch(segmentIndex, needsReview
+              ? { type: "QUALITY_NEEDS_REVIEW", message: reason }
+              : { type: "QUALITY_PASSED" });
+            dispatch(segmentIndex, { type: "CACHE_READY" });
+            const cachedSegment: CachedRenderedEpisode = {
+              episodeIndex: segmentIndex,
+              title: segmentContext.title,
+              sourceText: segmentContext.sourceText,
+              promptText: buildVideoGenerationPromptText(evaluated.result),
+              result: evaluated.result,
+              status: needsReview ? "needs_review" : "cached",
+            };
+            cache.segments = [
+              ...(cache.segments as CachedRenderedEpisode[])
+                .filter((segment) => Number(segment.episodeIndex) !== segmentIndex),
+              cachedSegment,
+            ].sort((left, right) => Number(left.episodeIndex) - Number(right.episodeIndex));
+            if (needsReview) {
+              cache.needsReviewSegments = [
+                ...(cache.needsReviewSegments as Array<Record<string, unknown>>)
+                  .filter((segment) => Number(segment.episodeIndex) !== segmentIndex),
+                { episodeIndex: segmentIndex, reason, result: evaluated.result },
+              ];
+            }
+          },
+          finalize: async () => {
+            replaceOperation(terminateRenderOperation(operation, {
+              state: "merged",
+              finalManifestHash: String(job.resultHash),
+              resultHashes: decision.resultHashes,
+            }));
+            await persistRecoveryState();
+          },
+        });
+      } catch {
+        const detached = detachRenderOperation(operation, {
+          errorCode: "RENDER_RECONCILIATION_PREPARATION_FAILED",
+        });
+        replaceOperation(detached);
+        for (const segmentIndex of operation.segmentIndexes) {
+          dispatch(segmentIndex, {
+            type: "RENDER_OPERATION_DETACHED",
+            operationToken: operation.operationToken,
+            jobId,
+          });
+        }
+        await persistRecoveryState();
+      }
+    }
+
+    const recoverable = listRecoverableRenderOperations(operations);
+    const recoveryObservers = startConcurrentRenderRecoveryObservers<
+      VideoPromptPackCodexJob,
+      RenderObservationOutcome<VideoPromptPackCodexJob>
+    >({
+      operations: recoverable,
+      registry: renderRecoveryObserverRegistryRef.current,
+      observe: (operation, signal) => observeRenderPackJob({
+        jobId: String(operation.jobId),
+        mode: "background",
+        signal,
+        readJob: readVideoPromptPackCodexJob,
+        sleep: waitForRenderObservation,
+        isHidden: () => typeof document !== "undefined" && document.hidden,
+      }),
+      async onOutcome(operation, outcome) {
+        if (outcome.status === "completed") {
+          await reconcileRecoveredJob(operation, outcome.job);
+          return;
+        }
+        if (outcome.status === "terminal_failed") {
+          if (outcome.job) {
+            await reconcileRecoveredJob(operation, outcome.job);
+          } else {
+            await markInfrastructureFailure(operation, outcome.reasonCode);
+          }
+        }
+      },
+    });
+    void recoveryObservers.settled;
+
+    const segmentStates = [...stateByIndex.values()];
+    return hasActiveRenderRecovery(operations)
+      || hasSaveableUnsavedResults(segmentStates);
+  }
+
+  async function resumeCachedBatchSavesOnly(
+    descriptor: BatchSaveRecoveryDescriptor | null = batchSaveRecovery,
+  ) {
+    if (!descriptor || !TASK_ONE_CACHE_RECOVERY_ENABLED) return false;
+    setBatchGenerating(true);
+    setError("");
+    const startedAtMs = Date.now();
+    try {
+      const response = await fetch(`/api/segment-batch-cache/${encodeURIComponent(descriptor.durableBatchId)}`, {
+        method: "GET",
+        cache: "no-store",
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.ok || !data.cache) {
+        if ((response.ok && !data?.cache) || [400, 404, 410].includes(response.status)) {
+          window.localStorage.removeItem(descriptor.recoveryKey);
+          forgetBatchRecoveryPointer(descriptor.durableBatchId);
+          setBatchSaveRecovery(null);
+          return false;
+        }
+        throw new Error(data?.error || "分段缓存服务暂时不可用，稍后仍可继续保存。");
+      }
+      const cache = data.cache as SegmentBatchCacheDocumentV2;
+      if (
+        cache.schemaVersion !== 2
+        || cache.durableBatchId !== descriptor.durableBatchId
+        || cache.sourceHash !== descriptor.sourceHash
+        || (resumeProjectId && cache.projectId && cache.projectId !== resumeProjectId)
+        || !Array.isArray(cache.segments)
+      ) {
+        window.localStorage.removeItem(descriptor.recoveryKey);
+        forgetBatchRecoveryPointer(descriptor.durableBatchId);
+        setBatchSaveRecovery(null);
+        return false;
+      }
+      let segments = (cache.segments as CachedRenderedEpisode[])
+        .filter((segment) => Number.isInteger(Number(segment.episodeIndex)) && segment.result && segment.promptText && segment.sourceText)
+        .sort((left, right) => Number(left.episodeIndex) - Number(right.episodeIndex));
+      const stateByIndex = new Map(cache.segmentStates.map((state) => [state.index, { ...state }]));
+
+      const leaseStorageKey = buildSegmentBatchLeaseOwnerKey(descriptor.durableBatchId);
+      let leaseOwnerId = window.sessionStorage.getItem(leaseStorageKey) || "";
+      if (!leaseOwnerId) {
+        leaseOwnerId = typeof globalThis.crypto?.randomUUID === "function"
+          ? globalThis.crypto.randomUUID()
+          : `lease-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        window.sessionStorage.setItem(leaseStorageKey, leaseOwnerId);
+      }
+      if (
+        cache.leaseOwnerId
+        && cache.leaseOwnerId !== leaseOwnerId
+        && Number.isFinite(Date.parse(cache.leaseExpiresAt || ""))
+        && Date.parse(cache.leaseExpiresAt || "") > Date.now()
+      ) {
+        throw new Error("该批次正在另一个标签页继续保存，请勿重复操作。");
+      }
+
+      let activeProjectId = cache.projectId || resumeProjectId || "";
+      const recoveryIndexKeys = new Set(buildSegmentBatchRecoveryKeys({
+        projectId: activeProjectId || null,
+        sourceHash: descriptor.sourceHash,
+        mode: cache.mode || segmentCountMode,
+        requestedCount: cache.requestedCount ?? (segmentCountMode === "auto" ? null : episodeCount),
+        duration: cache.duration || selectedDurationValue(),
+      }));
+      recoveryIndexKeys.add(descriptor.recoveryKey);
+      const invocationLedger = createBatchInvocationLedger(cache.invocationEvents || []);
+      const completed: BatchPromptSection[] = [];
+      let latestSave: ProjectSaveState | null = null;
+      let totalSaveMs = 0;
+
+      const persistRecoveryCache = async () => {
+        cache.revision += 1;
+        cache.projectId = activeProjectId || null;
+        cache.updatedAt = new Date().toISOString();
+        cache.segmentStates = [...stateByIndex.values()].sort((left, right) => left.index - right.index);
+        cache.leaseOwnerId = leaseOwnerId;
+        cache.leaseExpiresAt = new Date(Date.now() + 15 * 60_000).toISOString();
+        cache.invocationEvents = invocationLedger.summary().events;
+        const putResponse = await fetch(`/api/segment-batch-cache/${encodeURIComponent(descriptor.durableBatchId)}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(cache),
+        });
+        const putData = await putResponse.json().catch(() => null);
+        if (!putResponse.ok || !putData?.ok) throw new Error(putData?.error || "服务端分段缓存写入失败");
+        const activeRecoveryKey = buildSegmentBatchRecoveryKey({
+          projectId: activeProjectId || null,
+          sourceHash: descriptor.sourceHash,
+          mode: cache.mode || segmentCountMode,
+          requestedCount: cache.requestedCount ?? (segmentCountMode === "auto" ? null : episodeCount),
+          duration: cache.duration || selectedDurationValue(),
+        });
+        recoveryIndexKeys.add(activeRecoveryKey);
+        const recoveryIndex = JSON.stringify({
+          durableBatchId: descriptor.durableBatchId,
+          projectId: activeProjectId || null,
+          sourceHash: descriptor.sourceHash,
+          mode: cache.mode,
+          requestedCount: cache.requestedCount,
+          duration: cache.duration,
+          updatedAt: cache.updatedAt,
+        });
+        for (const recoveryKey of recoveryIndexKeys) {
+          window.localStorage.setItem(recoveryKey, recoveryIndex);
+        }
+        rememberBatchRecoveryPointer({
+          schemaVersion: 1,
+          durableBatchId: descriptor.durableBatchId,
+          recoveryKey: activeRecoveryKey,
+          sourceHash: descriptor.sourceHash,
+          projectId: activeProjectId || null,
+          updatedAt: cache.updatedAt,
+        });
+      };
+
+      const publishSaveOnlyProgress = (message: string) => {
+        const states = [...stateByIndex.values()].sort((left, right) => left.index - right.index);
+        const summary = summarizeBatchSegmentProgress(
+          states.map((state) => ({ index: state.index, status: progressStatusFromSegmentState(state) })),
+          cache.resolvedSegmentCount,
+        );
+        const invocationMetrics = invocationLedger.summary();
+        setBatchProgress({
+          mode: cache.mode || segmentCountMode,
+          phase: summary.isSettled ? summary.terminalPhase || "completed" : "saving",
+          requestedCount: cache.requestedCount ?? (segmentCountMode === "auto" ? null : episodeCount),
+          resolvedSegmentCount: cache.resolvedSegmentCount,
+          startedAtMs,
+          updatedAtMs: Date.now(),
+          finishedAtMs: summary.isSettled ? Date.now() : undefined,
+          elapsedMs: Math.max(0, Date.now() - startedAtMs),
+          completedCount: summary.savedCount,
+          savedCount: summary.savedCount,
+          cachedCount: summary.cachedCount,
+          runningCount: 0,
+          pendingCount: summary.pendingCount,
+          repairingCount: 0,
+          adjudicatingCount: 0,
+          needsReviewCount: summary.needsReviewCount,
+          savingCount: summary.savingCount,
+          currentMessage: message,
+          segments: states.map((state) => ({
+            index: state.index,
+            status: progressStatusFromSegmentState(state),
+            message: state.message,
+          })),
+          qualityReportSummary: summarizeSegmentQualityReports(cache.qualityReports as SegmentQualityReport[]),
+          invocationMetrics: {
+            renderPackCalls: invocationMetrics.renderPackCalls,
+            singleRegenerationCalls: invocationMetrics.singleRegenerationCalls,
+            pathPatchJobCreated: invocationMetrics.pathPatchJobCreated,
+            pathPatchCompleted: invocationMetrics.pathPatchCompleted,
+            judgeCalls: invocationMetrics.judgeCalls,
+            localPatchOperations: invocationMetrics.localPatchOperations,
+            contractPreflightAttempts: invocationMetrics.contractPreflightAttempts,
+            contractPreflightCompacted: invocationMetrics.contractPreflightCompacted,
+            contractPreflightIsolated: invocationMetrics.contractPreflightIsolated,
+            contractPreflightInvalid: invocationMetrics.contractPreflightInvalid,
+          },
+          timingMetrics: {
+            renderWallMs: 0,
+            repairWaitMs: 0,
+            saveMs: totalSaveMs,
+            criticalPathMs: Math.max(0, Date.now() - startedAtMs),
+          },
+        });
+        setGenerationProgress(message);
+      };
+
+      const retainRecoveryPointer = await resumeCachedRenderOperations({
+        cache,
+        stateByIndex,
+        persist: persistRecoveryCache,
+        recordRecoveredRenderPackCall: ({ operationToken, jobId }) => {
+          invocationLedger.record("renderPackCalls", {
+            count: 1,
+            fingerprint: `render:${operationToken}:${jobId}`,
+          });
+        },
+      });
+      segments = (cache.segments as CachedRenderedEpisode[])
+        .filter((segment) => Number.isInteger(Number(segment.episodeIndex)) && segment.result && segment.promptText && segment.sourceText)
+        .sort((left, right) => Number(left.episodeIndex) - Number(right.episodeIndex));
+      const unsaved = segments.filter((segment) => {
+        const state = stateByIndex.get(Number(segment.episodeIndex));
+        return state?.saveStatus !== "saved" && state?.saveStatus !== "review_saved";
+      });
+      if (!unsaved.length) {
+        if (retainRecoveryPointer) {
+          await persistRecoveryCache();
+          publishSaveOnlyProgress("已恢复原 Render Pack 观察，等待原任务完成，不会创建新的生成任务。");
+          setBatchGenerating(false);
+          return true;
+        }
+        window.localStorage.removeItem(descriptor.recoveryKey);
+        forgetBatchRecoveryPointer(descriptor.durableBatchId);
+        setBatchSaveRecovery(null);
+        setBatchGenerating(false);
+        return false;
+      }
+
+      publishSaveOnlyProgress(`检测到 ${unsaved.length} 段已生成结果，仅继续保存，不会调用模型。`);
+      for (const segment of segments) {
+        const segmentIndex = Number(segment.episodeIndex);
+        let state = stateByIndex.get(segmentIndex) || createInitialSegmentStates(cache.resolvedSegmentCount)[segmentIndex - 1];
+        if (!state || state.saveStatus === "saved" || state.saveStatus === "review_saved") {
+          if (segment.result && segment.sourceText && segment.promptText) {
+            completed.push({
+              segment: { index: segmentIndex, text: segment.sourceText },
+              result: segment.result,
+              promptText: segment.promptText,
+            });
+          }
+          continue;
+        }
+        const dispatch = (event: SegmentStateEvent) => {
+          const next = reduceSegmentState(state, { ...event, baseRevision: state.revision });
+          state = next;
+          stateByIndex.set(segmentIndex, next);
+        };
+        if (!state.resultHash && segment.result) {
+          dispatch({ type: "RENDER_SUCCEEDED", resultHash: buildBatchSegmentResultHash(segment.result) });
+        }
+        if (state.qualityStatus === "unknown") {
+          dispatch(segment.status === "needs_review" || segment.status === "review_saved"
+            ? { type: "QUALITY_NEEDS_REVIEW", message: "恢复待检查结果" }
+            : { type: "QUALITY_PASSED" });
+        }
+        if (state.saveStatus === "not_ready") dispatch({ type: "CACHE_READY" });
+        if (state.saveStatus === "save_failed") dispatch({ type: "SAVE_RESUMED" });
+        dispatch({ type: "SAVE_STARTED" });
+        publishSaveOnlyProgress(`正在仅保存第 ${segmentIndex} / ${cache.resolvedSegmentCount} 段...`);
+        const saveStartedAt = Date.now();
+        let save: ProjectSaveState = { saved: false, retryable: true, errorCode: "PROJECT_API_UNAVAILABLE" };
+        const retryDelays = [1_000, 3_000, 8_000] as const;
+        for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+          save = await saveAnalysisProject(
+            segment.sourceText || "",
+            segment.result as AnalysisResult,
+            segment.promptText || "",
+            activeProjectId || undefined,
+            undefined,
+            `${descriptor.durableBatchId}:${segmentIndex}`,
+            state.qualityStatus === "needs_review" ? "needs_review" : "draft",
+          );
+          if (save.saved || !save.retryable || attempt >= retryDelays.length) break;
+          await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
+        }
+        totalSaveMs += Math.max(0, Date.now() - saveStartedAt);
+        if (!save.saved || !save.projectId || !save.versionId || !save.versionNumber) {
+          dispatch({
+            type: "SAVE_FAILED",
+            errorCode: save.errorCode || "PROJECT_API_UNAVAILABLE",
+            message: save.message || save.reason || "项目保存失败",
+          });
+          await persistRecoveryCache();
+          publishSaveOnlyProgress(`第 ${segmentIndex} 段保存失败，已保留完整缓存，可稍后继续保存。`);
+          setError(save.message || save.reason || "项目保存失败");
+          setBatchGenerating(false);
+          return true;
+        }
+        activeProjectId = save.projectId;
+        latestSave = save;
+        const reviewSave = state.qualityStatus === "needs_review";
+        dispatch({ type: "SAVE_SUCCEEDED", review: reviewSave });
+        segment.status = reviewSave ? "review_saved" : "saved";
+        completed.push({
+          segment: { index: segmentIndex, text: segment.sourceText || "" },
+          result: segment.result as AnalysisResult,
+          promptText: segment.promptText || "",
+        });
+        const reportIndex = (cache.qualityReports as SegmentQualityReport[])
+          .findIndex((report) => report.segmentIndex === segmentIndex);
+        if (reportIndex >= 0) {
+          const report = (cache.qualityReports as SegmentQualityReport[])[reportIndex];
+          (cache.qualityReports as SegmentQualityReport[])[reportIndex] = updateSegmentQualityReportStatus(
+            report,
+            state.qualityStatus === "needs_review" ? "needs_review" : "saved",
+          );
+        }
+        await persistRecoveryCache();
+      }
+
+      setBatchResults(completed.sort((left, right) => left.segment.index - right.segment.index));
+      const last = completed.at(-1);
+      if (last) setResult(last.result);
+      if (latestSave) {
+        setProjectSave(latestSave);
+        if (latestSave.projectId) setResumeProjectId(latestSave.projectId);
+        if (latestSave.versionId) setResumeVersionId(latestSave.versionId);
+      }
+      const keepRecoveryPointer = shouldRetainRenderRecoveryPointer({
+        operations: cache.renderOperations || [],
+        segmentStates: [...stateByIndex.values()],
+      });
+      if (!keepRecoveryPointer) {
+        for (const recoveryKey of recoveryIndexKeys) window.localStorage.removeItem(recoveryKey);
+        forgetBatchRecoveryPointer(descriptor.durableBatchId);
+        window.sessionStorage.removeItem(leaseStorageKey);
+        setBatchSaveRecovery(null);
+      }
+      publishSaveOnlyProgress(keepRecoveryPointer
+        ? `已保存当前可用的 ${completed.length} 段，仍在观察原 Render Pack，不会创建补生成任务。`
+        : `已仅继续保存 ${completed.length} / ${cache.resolvedSegmentCount} 段，模型调用增量为 0。`);
+      setBatchGenerating(false);
+      return true;
+    } catch (resumeError) {
+      const message = formatUserFacingError(resumeError, "继续保存缓存失败");
+      setError(message);
+      setGenerationProgress(message);
+      setBatchGenerating(false);
+      return true;
+    }
+  }
+
   async function runBatchEpisodeGeneration() {
+    const recoveryDiscovery = batchSaveRecovery
+      ? { status: "recoverable", descriptor: batchSaveRecovery } as const
+      : await ensureBatchSaveRecoveryDiscovery();
+    if (recoveryDiscovery.status === "unavailable") {
+      setError(recoveryDiscovery.message);
+      setGenerationProgress(recoveryDiscovery.message);
+      return;
+    }
+    if (
+      recoveryDiscovery.status === "recoverable"
+      && await resumeCachedBatchSavesOnly(recoveryDiscovery.descriptor)
+    ) return;
     const completed: BatchPromptSection[] = [];
     let activeProjectId = resumeProjectId || "";
     const latestSaveRef: { current: ProjectSaveState | null } = { current: null };
     const mode = segmentCountMode;
     const requestedCount = mode === "auto" ? null : episodeCount;
+    const requestedDuration = selectedDurationValue();
+    const batchSourceHash = buildBatchSegmentResultHash({
+      mode,
+      episodeCount,
+      duration: requestedDuration,
+      sourceText: script,
+    });
+    let batchProjectId = activeProjectId || null;
+    const batchRecoveryKey = buildSegmentBatchRecoveryKey({
+      projectId: batchProjectId,
+      sourceHash: batchSourceHash,
+      mode,
+      requestedCount,
+      duration: requestedDuration,
+    });
+    const batchRecoveryIndexKeys = new Set([batchRecoveryKey]);
     let resolvedSegmentCount = requestedCount || null;
     let segmentProgressItems: BatchSegmentProgress[] = [];
+    let segmentStateRecords: SegmentStateRecord[] = [];
     const qualityReports = new Map<number, SegmentQualityReport>();
+    const invocationLedger = createBatchInvocationLedger();
     const batchStartedAtMs = Date.now();
+    let renderPhaseStartedAtMs = 0;
+    let renderPhaseFinishedAtMs = 0;
+    let repairFirstQueuedAtMs = 0;
+    let repairFinishedAtMs = 0;
+    let totalSaveDurationMs = 0;
     let batchFinishedAtMs: number | undefined;
+    let currentBatchPhase: BatchGenerationPhase = "planning";
     setBatchGenerating(true);
 
     function qualityReportSummary() {
@@ -1655,20 +2934,42 @@ export function DashboardClient() {
 
     function publishBatchProgress(phase: BatchGenerationPhase, currentMessage: string) {
       const nowMs = Date.now();
-      if ((phase === "completed" || phase === "failed") && !batchFinishedAtMs) {
+      const summary = summarizeBatchSegmentProgress(segmentProgressItems, resolvedSegmentCount);
+      const savedCount = summary.savedCount;
+      const cachedCount = summary.cachedCount;
+      const completedCount = savedCount;
+      const runningCount = summary.runningCount;
+      const repairingCount = summary.repairingCount;
+      const adjudicatingCount = summary.adjudicatingCount;
+      const needsReviewCount = summary.needsReviewCount;
+      const savingCount = summary.savingCount;
+      const pendingCount = summary.pendingCount;
+      const derivedPhase = segmentStateRecords.length && phase !== "planning"
+        ? deriveBatchPhaseFromSegmentStates(segmentStateRecords)
+        : null;
+      const normalizedPhase = phase === "failed" || phase === "quota_paused"
+        ? phase
+        : derivedPhase || resolveBatchGenerationPhase(phase, summary);
+      const normalizedMessage = summary.isSettled
+        ? needsReviewCount > 0
+          ? `已保存 ${savedCount} / ${resolvedSegmentCount} 段，其中 ${needsReviewCount} 段待检查。`
+          : `已保存第 ${savedCount} / ${resolvedSegmentCount} 段。`
+        : currentMessage;
+      currentBatchPhase = normalizedPhase;
+
+      if (["completed", "failed", "needs_review", "quota_paused"].includes(normalizedPhase) && !batchFinishedAtMs) {
         batchFinishedAtMs = nowMs;
       }
+      if (normalizedPhase === "completed") {
+        setError("");
+        setBatchGenerating(false);
+      }
+      if (normalizedPhase === "needs_review" || normalizedPhase === "quota_paused") setBatchGenerating(false);
       const elapsedReferenceMs = batchFinishedAtMs || nowMs;
-      const savedCount = segmentProgressItems.filter((item) => item.status === "saved" || item.status === "completed").length;
-      const cachedCount = segmentProgressItems.filter((item) => item.status === "cached").length;
-      const completedCount = savedCount;
-      const runningCount = segmentProgressItems.filter((item) => item.status === "running").length;
-      const repairingCount = segmentProgressItems.filter((item) => item.status === "repairing").length;
-      const savingCount = segmentProgressItems.filter((item) => item.status === "saving").length;
-      const pendingCount = segmentProgressItems.filter((item) => item.status === "pending").length;
+      const invocationMetrics = invocationLedger.summary();
       setBatchProgress({
         mode,
-        phase,
+        phase: normalizedPhase,
         requestedCount,
         resolvedSegmentCount,
         startedAtMs: batchStartedAtMs,
@@ -1681,18 +2982,159 @@ export function DashboardClient() {
         runningCount,
         pendingCount,
         repairingCount,
+        adjudicatingCount,
+        needsReviewCount,
         savingCount,
-        currentMessage,
+        currentMessage: normalizedMessage,
         segments: segmentProgressItems,
         qualityReportSummary: qualityReportSummary(),
+        invocationMetrics: {
+          renderPackCalls: invocationMetrics.renderPackCalls,
+          singleRegenerationCalls: invocationMetrics.singleRegenerationCalls,
+          pathPatchJobCreated: invocationMetrics.pathPatchJobCreated,
+          pathPatchCompleted: invocationMetrics.pathPatchCompleted,
+          judgeCalls: invocationMetrics.judgeCalls,
+          localPatchOperations: invocationMetrics.localPatchOperations,
+          contractPreflightAttempts: invocationMetrics.contractPreflightAttempts,
+          contractPreflightCompacted: invocationMetrics.contractPreflightCompacted,
+          contractPreflightIsolated: invocationMetrics.contractPreflightIsolated,
+          contractPreflightInvalid: invocationMetrics.contractPreflightInvalid,
+        },
+        timingMetrics: {
+          renderWallMs: renderPhaseStartedAtMs
+            ? Math.max(0, (renderPhaseFinishedAtMs || nowMs) - renderPhaseStartedAtMs)
+            : 0,
+          repairWaitMs: repairFirstQueuedAtMs
+            ? Math.max(0, (repairFinishedAtMs || nowMs) - repairFirstQueuedAtMs)
+            : 0,
+          saveMs: totalSaveDurationMs,
+          criticalPathMs: Math.max(0, elapsedReferenceMs - batchStartedAtMs),
+        },
       });
-      setGenerationProgress(currentMessage);
+      setGenerationProgress(normalizedMessage);
+    }
+
+    function rebuildSegmentProgressFromState() {
+      segmentProgressItems = segmentStateRecords.map((state) => {
+        const existing = segmentProgressItems.find((item) => item.index === state.index);
+        return {
+          index: state.index,
+          title: existing?.title || episodes?.find((episode) => episode.episodeIndex === state.index)?.input.title,
+          status: progressStatusFromSegmentState(state),
+          message: state.message,
+        };
+      });
+    }
+
+    function dispatchSegmentStateEvent(index: number, event: SegmentStateEvent) {
+      const effectiveEvent: SegmentStateEvent = !TASK_ONE_STATE_REDUCER_ENABLED && event.type === "QUALITY_BLOCKED"
+        ? {
+            type: "QUALITY_NEEDS_REVIEW",
+            message: event.message,
+            baseRevision: event.baseRevision,
+            at: event.at,
+          }
+        : event;
+      segmentStateRecords = segmentStateRecords.map((item) => (
+        item.index === index ? reduceSegmentState(item, effectiveEvent) : item
+      ));
+      const state = segmentStateRecords.find((item) => item.index === index);
+      const report = qualityReports.get(index);
+      if (state && report) {
+        qualityReports.set(index, updateSegmentQualityReportStatus(
+          report,
+          segmentQualityReportStatusFromState(state, report.status),
+        ));
+      }
+      rebuildSegmentProgressFromState();
+    }
+
+    type RenderOperation = {
+      segmentIndex: number;
+      token: string;
+    };
+
+    type RepairOperationIdentity = {
+      segmentIndex: number;
+      resultHash?: string;
+      repairFingerprint?: string;
+      jobId?: string;
+      contractHash?: string;
+    };
+
+    let segmentOperationSequence = 0;
+    const activeRenderOperations = new Map<number, RenderOperation>();
+
+    function beginRenderOperation(segmentIndex: number, token?: string): RenderOperation {
+      const operation = {
+        segmentIndex,
+        token: token || `render:${segmentIndex}:${++segmentOperationSequence}`,
+      };
+      activeRenderOperations.set(segmentIndex, operation);
+      return operation;
+    }
+
+    function isCurrentRenderOperation(operation: RenderOperation | null | undefined) {
+      if (!operation) return false;
+      return activeRenderOperations.get(operation.segmentIndex)?.token === operation.token;
+    }
+
+    function finishRenderOperation(operation: RenderOperation | null | undefined) {
+      if (operation && isCurrentRenderOperation(operation)) {
+        activeRenderOperations.delete(operation.segmentIndex);
+      }
+    }
+
+    function replaceRenderOperationRecord(operation: RenderOperationRefV2) {
+      renderOperationRecords = retainBoundedRenderOperationAudits([
+        ...renderOperationRecords.filter((item) => item.operationToken !== operation.operationToken),
+        operation,
+      ]);
+    }
+
+    function captureRepairOperationIdentity(segmentIndex: number): RepairOperationIdentity | null {
+      const state = segmentStateRecords.find((item) => item.index === segmentIndex);
+      if (!state) return null;
+      return {
+        segmentIndex,
+        resultHash: state.resultHash,
+        repairFingerprint: state.repairFingerprint,
+        jobId: state.activeRepairJobId,
+        contractHash: state.contractHash,
+      };
+    }
+
+    function isCurrentRepairOperation(identity: RepairOperationIdentity | null) {
+      if (!identity) return false;
+      const state = segmentStateRecords.find((item) => item.index === identity.segmentIndex);
+      return Boolean(
+        state
+        && state.resultHash === identity.resultHash
+        && state.repairFingerprint === identity.repairFingerprint
+        && state.contractHash === identity.contractHash
+        && (!identity.jobId || state.activeRepairJobId === identity.jobId),
+      );
+    }
+
+    function dispatchCurrentRepairEvent(
+      identity: RepairOperationIdentity | null,
+      event: SegmentStateEvent,
+    ) {
+      if (!identity || !isCurrentRepairOperation(identity)) return false;
+      const before = segmentStateRecords.find((item) => item.index === identity.segmentIndex);
+      dispatchSegmentStateEvent(identity.segmentIndex, event);
+      const after = segmentStateRecords.find((item) => item.index === identity.segmentIndex);
+      return Boolean(before && after && after.revision === before.revision + 1);
     }
 
     function updateSegmentProgress(index: number, status: BatchSegmentStatus, message?: string) {
-      segmentProgressItems = segmentProgressItems.map((item) =>
-        item.index === index ? { ...item, status, message } : item,
-      );
+      const current = segmentStateRecords.find((item) => item.index === index);
+      if (current) {
+        dispatchSegmentStateEvent(index, { type: "PROGRESS_UPDATED", status, message });
+        rebuildSegmentProgressFromState();
+        return;
+      }
+      segmentProgressItems = segmentProgressItems.map((item) => item.index === index ? { ...item, status, message } : item);
     }
 
     publishBatchProgress(
@@ -1720,42 +3162,71 @@ export function DashboardClient() {
     }
 
     const seasonPackJob = await runSeasonPackPlanningWithLockedRetry();
+    let batchEventFeatures: BatchEventFeatureSnapshot = normalizeBatchEventFeatureSnapshot(seasonPackJob.featureFlags || {
+      contractV2: true,
+      contractPreflightV2: true,
+      coverageSidecar: true,
+      coverageStage: "shadow",
+      emergencyStop: false,
+      localGate: false,
+      judge: false,
+      coveragePolicyVersion: DEFAULT_COVERAGE_POLICY_VERSION,
+      capturedAt: new Date().toISOString(),
+    });
+    let batchCoverageStage: BatchEventCoverageStage = batchEventFeatures.coverageStage;
+    let batchCoverageMode: "active" | "shadow" = batchEventFeatures.contractV2 && coverageStageUsesLocalGate(batchCoverageStage)
+      ? "active" as const
+      : "shadow" as const;
     const episodes = [...(seasonPackJob.result?.episodes || [])].sort((left, right) => left.episodeIndex - right.episodeIndex);
     resolvedSegmentCount = episodes.length;
-    const batchContractHash = buildSegmentContractHash({
-      segmentIndex: 1,
-      title: `batch:${seasonPackJob.id}`,
-      sourceText: episodes.map((episode) => episode.input.segmentContract?.contractHash || episode.input.sourceText).join("\n"),
-      durationSeconds: 15,
-      shotCount: Math.max(1, episodes.length),
-      requiredEvents: episodes.map((episode) => episode.input.segmentContract?.contractHash || episode.input.title),
-      forbiddenFutureEvents: [],
-      characters: [],
-      locations: [],
-      props: [],
-      requiredShotBeats: episodes.map((episode) => ({
-        shotNumber: episode.episodeIndex,
-        timeRange: "",
-        beat: episode.input.title,
-        visualFocus: episode.input.title,
+    const batchContractHash = buildStableBatchContractHash(
+      episodes.map((episode) => ({
+        segmentIndex: episode.episodeIndex,
+        contractHash: episode.input.segmentContract?.contractHash || buildBatchSegmentResultHash(episode.input.sourceText),
       })),
-      safetyPolicy: { avoidTerms: [], rewriteHints: {} },
-    });
-    const batchSourceHash = buildSegmentContractHash({
-      segmentIndex: 1,
-      title: `source:${mode}:${episodeCount}`,
-      sourceText: script,
-      durationSeconds: 15,
-      shotCount: Math.max(1, episodes.length),
-      requiredEvents: [mode, String(episodeCount), selectedDurationValue()],
-      forbiddenFutureEvents: [],
-      characters: [],
-      locations: [],
-      props: [],
-      requiredShotBeats: [{ shotNumber: 1, timeRange: "", beat: "source", visualFocus: "source" }],
-      safetyPolicy: { avoidTerms: [], rewriteHints: {} },
-    });
-    const batchCacheKey = `${BATCH_SEGMENT_CACHE_PREFIX}${activeProjectId || "new"}:${mode}:${resolvedSegmentCount}:${batchSourceHash}:${batchContractHash}`;
+    );
+    const batchCacheKey = batchRecoveryKey;
+    let durableBatchId = seasonPackJob.id;
+    if (typeof window !== "undefined") {
+      try {
+        const rawBatchIndex = window.localStorage.getItem(batchCacheKey);
+        const batchIndex = rawBatchIndex ? JSON.parse(rawBatchIndex) as Record<string, unknown> : null;
+        if (
+          batchIndex
+          && batchIndex.sourceHash === batchSourceHash
+          && batchIndex.contractHash === batchContractHash
+          && batchIndex.resolvedSegmentCount === resolvedSegmentCount
+          && (batchProjectId === null || batchIndex.projectId === batchProjectId)
+          && (
+            typeof batchIndex.durableBatchId === "string"
+            || typeof batchIndex.batchId === "string"
+          )
+        ) {
+          durableBatchId = typeof batchIndex.durableBatchId === "string"
+            ? batchIndex.durableBatchId
+            : String(batchIndex.batchId);
+        }
+      } catch (cacheIndexError) {
+        console.warn("Failed to read lightweight batch cache index", cacheIndexError);
+      }
+    }
+    const leaseStorageKey = buildSegmentBatchLeaseOwnerKey(durableBatchId);
+    let durableBatchLeaseOwnerId = typeof window !== "undefined"
+      ? window.sessionStorage.getItem(leaseStorageKey) || ""
+      : "";
+    if (!durableBatchLeaseOwnerId) {
+      durableBatchLeaseOwnerId = typeof globalThis.crypto?.randomUUID === "function"
+        ? globalThis.crypto.randomUUID()
+        : `lease-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      if (typeof window !== "undefined") window.sessionStorage.setItem(leaseStorageKey, durableBatchLeaseOwnerId);
+    }
+    function clearBatchRecoveryState() {
+      if (typeof window === "undefined") return;
+      for (const recoveryKey of batchRecoveryIndexKeys) window.localStorage.removeItem(recoveryKey);
+      forgetBatchRecoveryPointer(durableBatchId);
+      window.sessionStorage.removeItem(leaseStorageKey);
+      setBatchSaveRecovery(null);
+    }
     if (mode === "fixed" && episodes.length !== episodeCount) {
       throw new Error(`整段规划任务完成但段数不完整：${episodes.length} / ${episodeCount}`);
     }
@@ -1768,6 +3239,13 @@ export function DashboardClient() {
       status: "pending" as const,
       message: "等待单段质量生成",
     }));
+    segmentStateRecords = createInitialSegmentStates(
+      resolvedSegmentCount,
+      new Map(episodes.map((episode) => [
+        episode.episodeIndex,
+        episode.input.segmentContract?.contractHash || batchContractHash,
+      ])),
+    );
     publishBatchProgress("rendering", `已识别 ${resolvedSegmentCount} 段，正在按单段质量逐段生成...`);
 
     type RenderedEpisode = {
@@ -1778,17 +3256,56 @@ export function DashboardClient() {
       sourceText: string;
     };
 
+    type PendingCoverageJudgeSegment = {
+      episode: SeasonPackEpisodeResult;
+      result: AnalysisResult;
+      renderDuration: string;
+      renderStartedAt: number;
+      renderCompletedAt: number;
+      packIndex?: number;
+      packSize: number;
+      sidecar?: SegmentCoverageSidecar | null;
+      localDecisions: CoverageDecision[];
+    };
+
     const renderedEpisodes: Array<RenderedEpisode | undefined> = new Array(resolvedSegmentCount);
-    const repairQueue: Array<{ episode: SeasonPackEpisodeResult; reason: string; reasonType: BatchRepairReasonType }> = [];
-    let repairPoolPromise: Promise<void> | null = null;
+    type RepairQueueItem = {
+      episode: SeasonPackEpisodeResult;
+      reason: string;
+      reasonType: BatchRepairReasonType;
+      existingResult?: AnalysisResult;
+      validationError?: unknown;
+      renderDuration?: string;
+      renderStartedAt?: number;
+      packIndex?: number;
+      packSize?: number;
+    };
+    let repairScheduler: ReturnType<typeof createBatchRepairScheduler<RepairQueueItem, void>>;
     const queuedRepairIndexes = new Set<number>();
-    const queuedSaveIndexes = new Set<number>();
     const repairAttemptCounts = new Map<string, number>();
     const segmentRepairReasons = new Map<number, string[]>();
-    let nextSegmentToSave = 1;
-    let saveChain = Promise.resolve();
+    const needsReviewEpisodes = new Map<number, { result: AnalysisResult; reason: string }>();
+    let batchCachePersistChain = Promise.resolve();
+    let batchCacheRevision = 0;
+    let batchCacheWriteError: Error | null = null;
     let saveError: Error | null = null;
+    let renderOperationRecords: RenderOperationRefV2[] = [];
+    const mergedRepairJobIds = new Set<string>();
     let activeRenderScheduleProfile = "UNSCHEDULED";
+    let batchQuotaPaused = false;
+    let batchQuotaPauseMessage = "";
+
+    function pauseBatchForCodexQuota(segmentIndexes: number[], error: unknown) {
+      batchQuotaPaused = true;
+      batchQuotaPauseMessage = formatUserFacingError(error, CODEX_QUOTA_EXHAUSTED_DISPLAY_MESSAGE);
+      for (const episodeIndex of segmentIndexes) {
+        const current = segmentProgressItems.find((item) => item.index === episodeIndex);
+        if (current?.status === "saved" || current?.status === "cached") continue;
+        updateSegmentProgress(episodeIndex, "quota_paused", batchQuotaPauseMessage);
+      }
+      writeBatchSegmentCache();
+      publishBatchProgress("quota_paused", `${batchQuotaPauseMessage} 已保留全部已生成结果，恢复额度后可继续。`);
+    }
 
     function registerSegmentRepairReason(episodeIndex: number, reason: string) {
       const current = segmentRepairReasons.get(episodeIndex) || [];
@@ -1808,36 +3325,376 @@ export function DashboardClient() {
     }
 
     function writeBatchSegmentCache() {
-      if (typeof window === "undefined") return;
+      if (typeof window === "undefined") return batchCachePersistChain;
+      const cachedSegments = renderedEpisodes
+        .filter((item): item is RenderedEpisode => Boolean(item))
+        .sort((left, right) => left.episodeIndex - right.episodeIndex)
+        .map((item) => ({
+          episodeIndex: item.episodeIndex,
+          title: item.result.title,
+          sourceText: item.sourceText,
+          promptText: item.promptText,
+          result: item.result,
+          status: (() => {
+            const state = segmentStateRecords.find((candidate) => candidate.index === item.episodeIndex);
+            if (state?.saveStatus === "review_saved") return "review_saved";
+            if (state?.saveStatus === "saved") return "saved";
+            if (state?.qualityStatus === "needs_review") return "needs_review";
+            return qualityReports.get(item.episodeIndex)?.status || "cached";
+          })(),
+          cachedAt: new Date().toISOString(),
+        }));
+      const updatedAt = new Date().toISOString();
+      batchCacheRevision += 1;
+      const cacheDocument: SegmentBatchCacheDocumentV2 = {
+        schemaVersion: 2 as const,
+        revision: batchCacheRevision,
+        batchId: durableBatchId,
+        durableBatchId,
+        projectId: batchProjectId,
+        sourceHash: batchSourceHash,
+        contractHash: batchContractHash,
+        resolvedSegmentCount: resolvedSegmentCount || episodes.length,
+        qualityReports: Array.from(qualityReports.values()),
+        needsReviewSegments: Array.from(needsReviewEpisodes.entries()).map(([episodeIndex, item]) => ({
+          episodeIndex,
+          reason: item.reason,
+          result: item.result,
+        })),
+        updatedAt,
+        phase: currentBatchPhase,
+        segmentStates: segmentStateRecords,
+        activeJobIds: Array.from(new Set([
+          ...segmentStateRecords.map((item) => item.activeRepairJobId),
+          ...renderOperationRecords
+            .filter((operation) => ["creating", "observing", "detached"].includes(operation.state))
+            .map((operation) => operation.jobId),
+        ].filter((value): value is string => Boolean(value)))),
+        coverageStage: batchCoverageStage,
+        renderRound: 1,
+        repairAttempts: Array.from(repairAttemptCounts.entries()),
+        leaseOwnerId: durableBatchLeaseOwnerId,
+        leaseExpiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+        mode,
+        requestedCount,
+        duration: requestedDuration,
+        invocationEvents: invocationLedger.summary().events,
+        renderOperations: retainBoundedRenderOperationAudits(renderOperationRecords),
+        featureFlags: batchEventFeatures,
+        segments: cachedSegments,
+      };
       try {
-        const cachedSegments = renderedEpisodes
-          .filter((item): item is RenderedEpisode => Boolean(item))
-          .sort((left, right) => left.episodeIndex - right.episodeIndex)
-          .map((item) => ({
-            episodeIndex: item.episodeIndex,
-            title: item.result.title,
-            sourceText: item.sourceText,
-            promptText: item.promptText,
-            result: item.result,
-            cachedAt: new Date().toISOString(),
-          }));
-        window.localStorage.setItem(
-          batchCacheKey,
-          JSON.stringify({
-            batchId: seasonPackJob.id,
-            projectId: activeProjectId || null,
-            sourceHash: batchSourceHash,
-            contractHash: batchContractHash,
-            resolvedSegmentCount,
-            cachedCount: cachedSegments.length,
-            qualityReports: Array.from(qualityReports.values()),
-            updatedAt: new Date().toISOString(),
-            segments: cachedSegments,
-          }),
-        );
+        const activeRecoveryKey = buildSegmentBatchRecoveryKey({
+          projectId: batchProjectId,
+          sourceHash: batchSourceHash,
+          mode,
+          requestedCount,
+          duration: requestedDuration,
+        });
+        batchRecoveryIndexKeys.add(activeRecoveryKey);
+        const recoveryIndex = JSON.stringify({
+          durableBatchId,
+          projectId: batchProjectId,
+          sourceHash: batchSourceHash,
+          contractHash: batchContractHash,
+          resolvedSegmentCount,
+          cachedCount: cachedSegments.length,
+          revision: batchCacheRevision,
+          mode,
+          requestedCount,
+          duration: requestedDuration,
+          updatedAt,
+        });
+        for (const recoveryKey of batchRecoveryIndexKeys) {
+          window.localStorage.setItem(recoveryKey, recoveryIndex);
+        }
+        rememberBatchRecoveryPointer({
+          schemaVersion: 1,
+          durableBatchId,
+          recoveryKey: activeRecoveryKey,
+          sourceHash: batchSourceHash,
+          projectId: batchProjectId,
+          updatedAt,
+        });
       } catch (cacheError) {
-        console.warn("Failed to cache rendered batch segments", cacheError);
+        console.warn("Failed to write lightweight batch cache index", cacheError);
       }
+      batchCachePersistChain = batchCachePersistChain
+        .catch(() => undefined)
+        .then(async () => {
+          const response = await fetch(`/api/segment-batch-cache/${encodeURIComponent(durableBatchId)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(cacheDocument),
+          });
+          const data = await response.json().catch(() => null);
+          if (!response.ok || !data?.ok) throw new Error(data?.error || "服务端分段缓存写入失败");
+          batchCacheWriteError = null;
+        })
+        .catch((cacheError) => {
+          batchCacheWriteError = cacheError instanceof Error ? cacheError : new Error("服务端分段缓存写入失败");
+          setGenerationProgress(`${batchCacheWriteError.message}，已保留浏览器恢复索引。`);
+        });
+      return batchCachePersistChain;
+    }
+
+    async function watchDetachedRepair(
+      episode: SeasonPackEpisodeResult,
+      originalResult: AnalysisResult,
+      renderDuration: string,
+      repairIdentity: { jobId: string; contractHash: string; resultHash: string },
+      detachedAt = Date.now(),
+    ) {
+      try {
+        while (shouldContinueDetachedRepairObservation({ detachedAt, now: Date.now() })) {
+          const queryIdentity = captureRepairOperationIdentity(episode.episodeIndex);
+          if (queryIdentity?.jobId !== repairIdentity.jobId) return;
+          const repairJob = await queryBatchSegmentRepairCodexJob(repairIdentity.jobId);
+          if (!isCurrentRepairOperation(queryIdentity)) {
+            const current = captureRepairOperationIdentity(episode.episodeIndex);
+            if (current?.jobId !== repairIdentity.jobId) return;
+            continue;
+          }
+          if (repairJob.status === "pending" || repairJob.status === "running") {
+            await new Promise((resolve) => setTimeout(resolve, 5_000));
+            continue;
+          }
+          if (repairJob.status === "failed") {
+            dispatchCurrentRepairEvent(queryIdentity, {
+              type: "REPAIR_FAILED",
+              jobId: repairIdentity.jobId,
+              errorCode: "REPAIR_JOB_FAILED",
+              message: repairJob.error || "后台路径修复失败，已保留首次结果",
+            });
+            writeBatchSegmentCache();
+            return;
+          }
+          const currentState = segmentStateRecords.find((state) => state.index === episode.episodeIndex);
+          const currentRendered = renderedEpisodes[episode.episodeIndex - 1];
+          const currentResult = currentRendered?.result || originalResult;
+          const decision = decideLateRepairMerge({
+            jobId: repairIdentity.jobId,
+            activeRepairJobId: currentState?.activeRepairJobId,
+            jobStatus: repairJob.status,
+            expectedContractHash: repairIdentity.contractHash,
+            currentContractHash: currentState?.contractHash || episode.input.segmentContract?.contractHash,
+            expectedResultHash: repairIdentity.resultHash,
+            currentResultHash: buildBatchSegmentResultHash(currentResult),
+            mergedJobIds: mergedRepairJobIds,
+            saveStatus: currentState?.saveStatus || "not_ready",
+          });
+          if (decision.action === "continue_polling") {
+            await new Promise((resolve) => setTimeout(resolve, 5_000));
+            continue;
+          }
+          if (decision.action === "late_patch_available") {
+            if (!dispatchCurrentRepairEvent(queryIdentity, {
+              type: "LATE_PATCH_AVAILABLE",
+              jobId: repairIdentity.jobId,
+            })) return;
+            updateSegmentProgress(episode.episodeIndex, currentState?.saveStatus === "saved" ? "saved" : "review_saved", "后台修复已完成，可人工确认晚到补丁；不会静默修改已保存项目");
+            writeBatchSegmentCache();
+            return;
+          }
+          if (decision.action === "archive_stale" || decision.action === "ignore_duplicate") {
+            if (decision.action === "archive_stale") {
+              dispatchCurrentRepairEvent(queryIdentity, {
+                type: "REPAIR_FAILED",
+                jobId: repairIdentity.jobId,
+                errorCode: "STALE_REPAIR_RESULT",
+                message: "后台修复结果与当前版本不一致，已归档且未覆盖提示词",
+              });
+            }
+            writeBatchSegmentCache();
+            return;
+          }
+          if (!repairJob.result) {
+            dispatchCurrentRepairEvent(queryIdentity, {
+              type: "REPAIR_FAILED",
+              jobId: repairIdentity.jobId,
+              errorCode: "EMPTY_REPAIR_PATCH",
+              message: "后台修复完成但没有有效补丁，已保留首次结果",
+            });
+            writeBatchSegmentCache();
+            return;
+          }
+          const repairedResult = applyBatchSegmentRepairPatch(currentResult, repairJob.result);
+          assertBatchSegmentRepairPatchIsolation(
+            currentResult,
+            repairedResult,
+            repairJob.result.repairs.map((repair) => repair.path),
+          );
+          const validated = normalizePatchAndValidateBatchSegment(
+            script,
+            episode.episodeIndex,
+            repairedResult,
+            renderDuration,
+            episode.input.segmentContract,
+            undefined,
+            undefined,
+            batchCoverageMode,
+          );
+          if (!dispatchCurrentRepairEvent(queryIdentity, {
+            type: "REPAIR_COMPLETED",
+            jobId: repairIdentity.jobId,
+            resultHash: buildBatchSegmentResultHash(validated.result),
+          })) return;
+          mergedRepairJobIds.add(repairIdentity.jobId);
+          invocationLedger.record("pathPatchCompleted", { segmentIndex: episode.episodeIndex });
+          needsReviewEpisodes.delete(episode.episodeIndex);
+          storeRenderedEpisode(episode, validated.result, {
+            status: "repaired",
+            qualityGate: validated.gate,
+            patchDiffs: validated.patchDiffs,
+            codexRepairAttempted: true,
+            coverageDecisions: validated.coverageDecisions,
+            coverageDurationMs: validated.coverageDurationMs,
+          });
+          return;
+        }
+        const timeoutIdentity = captureRepairOperationIdentity(episode.episodeIndex);
+        if (timeoutIdentity?.jobId === repairIdentity.jobId) {
+          dispatchCurrentRepairEvent(timeoutIdentity, {
+            type: "MESSAGE_UPDATED",
+            message: "后台修复超过最终观察期限，已停止自动查询；首次结果和原任务标识均已保留。",
+          });
+        }
+        writeBatchSegmentCache();
+      } catch (error) {
+        const errorIdentity = captureRepairOperationIdentity(episode.episodeIndex);
+        if (errorIdentity?.jobId === repairIdentity.jobId) {
+          dispatchCurrentRepairEvent(errorIdentity, {
+            type: "MESSAGE_UPDATED",
+            message: `${formatUserFacingError(error, "后台修复状态读取失败")}；首次结果与任务标识均已保留。`,
+          });
+        }
+        writeBatchSegmentCache();
+      }
+    }
+
+    async function repairExistingBatchSegment(
+      renderScript: string,
+      renderDuration: string,
+      episodeIndex: number,
+      episodeCount: number,
+      episodeResult: AnalysisResult,
+      segmentContract: SegmentContract | undefined,
+      error: unknown,
+    ) {
+        const reason = error instanceof Error ? error.message : "当前段未通过质量校验";
+        const repairFindings = error instanceof BatchSegmentQualityValidationError ? error.findings : [];
+        const reasonType = classifyBatchRepairReason(reason);
+        const repairLabel = batchRepairReasonLabel(reasonType);
+        registerSegmentRepairReason(episodeIndex, reason);
+        updateSegmentProgress(episodeIndex, "repairing", `${repairLabel}: ${reason}`);
+        publishBatchProgress("repairing", `第 ${episodeIndex} / ${episodeCount} 段正在自动修复：${reason}`);
+        let repairIdentity = captureRepairOperationIdentity(episodeIndex);
+        const repairRequest = await requestBatchSegmentRepairPatchWithContext({
+          projectId: activeProjectId || undefined,
+          batchId: seasonPackJob.id,
+          segmentIndex: episodeIndex,
+          segmentContract,
+          sourceText: segmentContract?.sourceText || renderScript,
+          failedResult: episodeResult,
+          findings: repairFindings,
+          onJobCreated: ({ jobId }) => {
+            if (!dispatchCurrentRepairEvent(repairIdentity, { type: "REPAIR_STARTED", jobId })) return;
+            repairIdentity = captureRepairOperationIdentity(episodeIndex);
+            invocationLedger.record("pathPatchJobCreated", { segmentIndex: episodeIndex });
+            writeBatchSegmentCache();
+          },
+        });
+        if (!isCurrentRepairOperation(repairIdentity)) {
+          throw new StaleSegmentOperationError(episodeIndex, "repair");
+        }
+        const activeRepairState = segmentStateRecords.find((state) => state.index === episodeIndex);
+        if (activeRepairState?.generationStatus === "repair_pending") {
+          if (!dispatchCurrentRepairEvent(repairIdentity, {
+            type: "REPAIR_STARTED",
+            jobId: repairRequest.jobId,
+          })) {
+            throw new StaleSegmentOperationError(episodeIndex, "repair");
+          }
+          repairIdentity = captureRepairOperationIdentity(episodeIndex);
+          invocationLedger.record("pathPatchJobCreated", { segmentIndex: episodeIndex });
+          writeBatchSegmentCache();
+        }
+        if (repairIdentity?.jobId !== repairRequest.jobId || !isCurrentRepairOperation(repairIdentity)) {
+          throw new StaleSegmentOperationError(episodeIndex, "repair");
+        }
+        if (repairRequest.detached) {
+          if (!dispatchCurrentRepairEvent(repairIdentity, {
+            type: "REPAIR_DETACHED",
+            jobId: repairRequest.jobId,
+            message: "路径级修复仍在后台运行，首次结果将保留并保存为待检查草稿",
+          })) {
+            throw new StaleSegmentOperationError(episodeIndex, "repair");
+          }
+          const episode = episodes.find((candidate) => candidate.episodeIndex === episodeIndex);
+          if (episode) {
+            void watchDetachedRepair(episode, episodeResult, renderDuration, repairRequest);
+          }
+          writeBatchSegmentCache();
+          return {
+            detached: true as const,
+            result: episodeResult,
+            jobId: repairRequest.jobId,
+            gate: error instanceof BatchSegmentQualityValidationError ? error.gate : undefined,
+            patchDiffs: [] as QualityPatchDiff[],
+            codexRepairAttempted: true,
+            coverageDecisions: error instanceof BatchSegmentQualityValidationError ? error.coverageDecisions : [],
+            coverageDurationMs: 0,
+          };
+        }
+        const repairPatch = repairRequest.patch;
+        const acceptedRepairDiffs: QualityPatchDiff[] = repairPatch.repairs.map((repair) => {
+          const finding = repairFindings.find(
+            (item) => normalizeBatchSegmentRepairPath(item.path) === normalizeBatchSegmentRepairPath(repair.path),
+          );
+          const before = getBatchSegmentRepairValueAtPath(episodeResult, repair.path);
+          return {
+            path: repair.path,
+            code: finding?.code || "missing_required_field",
+            severity: finding?.severity === "risk" ? "risk" : "patchable",
+            before,
+            after: repair.replacement,
+            patchSource: "codex",
+            reason: finding?.message || reason,
+          };
+        });
+        const repairedResult = applyBatchSegmentRepairPatch(episodeResult, repairPatch);
+        assertBatchSegmentRepairPatchIsolation(
+          episodeResult,
+          repairedResult,
+          repairPatch.repairs.map((repair) => repair.path),
+        );
+        const validatedRepair = normalizePatchAndValidateBatchSegment(
+          script,
+          episodeIndex,
+          repairedResult,
+          renderDuration,
+          segmentContract,
+          undefined,
+          undefined,
+          batchCoverageMode,
+        );
+        if (!dispatchCurrentRepairEvent(repairIdentity, {
+          type: "REPAIR_COMPLETED",
+          jobId: repairRequest.jobId,
+          resultHash: buildBatchSegmentResultHash(validatedRepair.result),
+        })) {
+          throw new StaleSegmentOperationError(episodeIndex, "repair");
+        }
+        invocationLedger.record("pathPatchCompleted", { segmentIndex: episodeIndex });
+        return {
+          detached: false as const,
+          result: validatedRepair.result,
+          gate: validatedRepair.gate,
+          patchDiffs: [...acceptedRepairDiffs, ...validatedRepair.patchDiffs],
+          codexRepairAttempted: true,
+          coverageDecisions: validatedRepair.coverageDecisions,
+          coverageDurationMs: validatedRepair.coverageDurationMs,
+        };
     }
 
     async function renderBatchSegmentWithQualityRepair(
@@ -1846,6 +3703,7 @@ export function DashboardClient() {
       episodeIndex: number,
       episodeCount: number,
       segmentContract?: SegmentContract,
+      renderOperation?: RenderOperation,
     ) {
       const rawResult = await requestAnalysisWithContext(
         renderScript,
@@ -1853,102 +3711,320 @@ export function DashboardClient() {
         activeProjectId || undefined,
         undefined,
       );
+      if (!isCurrentRenderOperation(renderOperation)) {
+        throw new StaleSegmentOperationError(episodeIndex, "render");
+      }
       const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, episodeCount, rawResult, renderDuration);
-      try {
-        const validated = normalizePatchAndValidateBatchSegment(script, episodeIndex, episodeResult, renderDuration, segmentContract);
-        return validated.result;
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : "当前段未通过质量校验";
-        const reasonType = classifyBatchRepairReason(reason);
-        const repairLabel = batchRepairReasonLabel(reasonType);
-        registerSegmentRepairReason(episodeIndex, reason);
-        updateSegmentProgress(episodeIndex, "repairing", `${repairLabel}: ${reason}`);
-        publishBatchProgress("repairing", `第 ${episodeIndex} / ${episodeCount} 段正在自动修复：${reason}`);
-        const repairScript = buildBatchSegmentRepairScript(renderScript, episodeIndex, episodeCount, reason, episodeResult);
-        const repairedRawResult = await requestAnalysisWithContext(
-          repairScript,
+      const evaluated = normalizePatchAndEvaluateBatchSegment(
+        script,
+        episodeIndex,
+        episodeResult,
+        renderDuration,
+        segmentContract,
+        undefined,
+        undefined,
+        batchCoverageMode,
+      );
+      const outcome = routeBatchSegmentOutcome({
+        gate: evaluated.gate,
+        hasUsableResult: true,
+        coverageStage: batchCoverageStage,
+      });
+      if (outcome.action === "accept") {
+        legacyFatalCheck(episodeIndex, evaluated.result, evaluated.gate);
+        return {
+          detached: false as const,
+          result: evaluated.result,
+          gate: evaluated.gate,
+          patchDiffs: evaluated.patchDiffs,
+          codexRepairAttempted: false,
+          coverageDecisions: evaluated.coverageDecisions,
+          coverageDurationMs: evaluated.coverageDurationMs,
+        };
+      }
+      if (outcome.action === "request_quality_patch" || outcome.action === "request_event_patch") {
+        const routeError = qualityErrorForRoute(
+          evaluated.gate,
+          outcome,
+          evaluated.result,
+          evaluated.coverageDecisions,
+        );
+        return repairExistingBatchSegment(
+          renderScript,
           renderDuration,
+          episodeIndex,
+          episodeCount,
+          evaluated.result,
+          segmentContract,
+          routeError,
+        );
+      }
+      throw new BatchSegmentQualityValidationError(
+        evaluated.gate,
+        evaluated.result,
+        evaluated.coverageDecisions,
+      );
+    }
+
+    type SaveOperation = {
+      segmentIndex: number;
+      token: string;
+      idempotencyKey: string;
+      resultHash: string;
+    };
+
+    const activeSaveOperations = new Map<number, SaveOperation>();
+
+    function beginSaveOperation(segmentIndex: number, resultHash: string): SaveOperation {
+      const operation = {
+        segmentIndex,
+        token: `save:${segmentIndex}:${++segmentOperationSequence}`,
+        idempotencyKey: `${durableBatchId}:${segmentIndex}`,
+        resultHash,
+      };
+      activeSaveOperations.set(segmentIndex, operation);
+      return operation;
+    }
+
+    function isCurrentSaveOperation(operation: SaveOperation | null | undefined) {
+      if (!operation) return false;
+      const active = activeSaveOperations.get(operation.segmentIndex);
+      const state = segmentStateRecords.find((item) => item.index === operation.segmentIndex);
+      return Boolean(
+        active?.token === operation.token
+        && active.idempotencyKey === operation.idempotencyKey
+        && state?.resultHash === operation.resultHash
+        && state.saveStatus === "saving",
+      );
+    }
+
+    function finishSaveOperation(operation: SaveOperation | null | undefined) {
+      if (operation && activeSaveOperations.get(operation.segmentIndex)?.token === operation.token) {
+        activeSaveOperations.delete(operation.segmentIndex);
+      }
+    }
+
+    function markContractPreflightInvalid(
+      episodeIndex: number,
+      errorCode: string,
+      message = "分段 Contract 输入需要检查，不会触发视频提示词修复。",
+    ) {
+      const current = segmentStateRecords.find((item) => item.index === episodeIndex);
+      if (!current || current.generationStatus === "contract_invalid") return;
+      if (current.generationStatus === "pending") {
+        dispatchSegmentStateEvent(episodeIndex, { type: "CONTRACT_PREFLIGHT_STARTED" });
+      }
+      dispatchSegmentStateEvent(episodeIndex, {
+        type: "CONTRACT_PREFLIGHT_INVALID",
+        errorCode,
+        message,
+      });
+      updateSegmentProgress(episodeIndex, "failed", message);
+    }
+
+    const batchSaveController = createResumableBatchSaveController<RenderedEpisode>({
+      durableBatchId,
+      segmentCount: resolvedSegmentCount,
+      saveSegment: async ({ segmentIndex, idempotencyKey, payload, review }): Promise<ResumableBatchSaveResult> => {
+        const saveStartedAt = Date.now();
+        const episodeIndex = segmentIndex;
+        const episodeScript = payload.sourceText;
+        const episodeResult = payload.result;
+        const fullVideoPrompt = payload.promptText;
+        const expectedIdempotencyKey = `${durableBatchId}:${episodeIndex}`;
+        if (idempotencyKey !== expectedIdempotencyKey) {
+          return {
+            saved: false,
+            retryable: false,
+            errorCode: "PROJECT_VALIDATION_FAILED",
+            message: "分段保存幂等键与当前批次不一致",
+          };
+        }
+        const save = await saveAnalysisProject(
+          episodeScript,
+          episodeResult,
+          fullVideoPrompt,
           activeProjectId || undefined,
           undefined,
+          `${durableBatchId}:${episodeIndex}`,
+          review ? "needs_review" : "draft",
         );
-        const repairedResult = normalizeBatchEpisodeResult(script, episodeIndex, episodeCount, repairedRawResult, renderDuration);
-        const validatedRepair = normalizePatchAndValidateBatchSegment(script, episodeIndex, repairedResult, renderDuration, segmentContract);
-        return validatedRepair.result;
-      }
+        totalSaveDurationMs += Math.max(0, Date.now() - saveStartedAt);
+        if (!save.saved || !save.projectId || !save.versionId || !save.versionNumber) {
+          return {
+            saved: false,
+            retryable: Boolean(save.retryable),
+            errorCode: save.errorCode || "PROJECT_API_UNAVAILABLE",
+            message: save.message || save.reason || "项目保存失败",
+            requestId: save.requestId,
+          };
+        }
+
+        activeProjectId = save.projectId;
+        batchProjectId = save.projectId;
+        latestSaveRef.current = save;
+        setProjectSave(save);
+        setResumeProjectId(save.projectId);
+        setResumeVersionId(save.versionId);
+        if (!completed.some((item) => item.segment.index === segmentIndex)) {
+          completed.push({
+            segment: { index: segmentIndex, text: payload.sourceText },
+            result: payload.result,
+            promptText: payload.promptText,
+          });
+        }
+        setBatchResults([...completed]);
+        setResult(payload.result);
+        return {
+          saved: true,
+          projectId: save.projectId,
+          versionId: save.versionId,
+          versionNumber: save.versionNumber,
+          idempotentReplay: save.idempotentReplay,
+          requestId: save.requestId,
+        };
+      },
+      onTransition: (entry) => {
+        const episodeIndex = entry.segmentIndex;
+        if (entry.status === "saving") {
+          dispatchSegmentStateEvent(episodeIndex, { type: "SAVE_STARTED" });
+          updateSegmentProgress(episodeIndex, "saving", "正在保存到项目");
+          const payloadResultHash = entry.payload
+            ? buildBatchSegmentResultHash(entry.payload.result)
+            : segmentStateRecords.find((item) => item.index === episodeIndex)?.resultHash || "";
+          beginSaveOperation(episodeIndex, payloadResultHash);
+          publishBatchProgress("saving", `正在保存第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
+          return;
+        }
+        if (entry.status === "save_failed") {
+          const failure = entry.lastResult && !entry.lastResult.saved ? entry.lastResult : null;
+          const operation = activeSaveOperations.get(episodeIndex);
+          if (!isCurrentSaveOperation(operation)) return;
+          dispatchSegmentStateEvent(episodeIndex, {
+            type: "SAVE_FAILED",
+            errorCode: failure?.errorCode || "PROJECT_API_UNAVAILABLE",
+            message: failure?.message || "项目保存失败",
+          });
+          finishSaveOperation(operation);
+          updateSegmentProgress(episodeIndex, "failed", failure?.message || "项目保存失败");
+          saveError = new Error(`第 ${episodeIndex} 段已生成，但项目保存失败：${failure?.message || "未返回保存结果"}`);
+          writeBatchSegmentCache();
+          publishBatchProgress("saving", `${saveError.message} 已缓存结果，可仅继续保存。`);
+          return;
+        }
+        if (entry.status === "saved" || entry.status === "review_saved") {
+          const operation = activeSaveOperations.get(episodeIndex);
+          if (!isCurrentSaveOperation(operation)) return;
+          dispatchSegmentStateEvent(episodeIndex, {
+            type: "SAVE_SUCCEEDED",
+            review: entry.status === "review_saved",
+          });
+          finishSaveOperation(operation);
+          updateSegmentProgress(
+            episodeIndex,
+            entry.status,
+            entry.status === "review_saved" ? "已保存，待检查" : "已保存",
+          );
+          const review = entry.status === "review_saved";
+          saveError = null;
+          segmentRepairReasons.delete(episodeIndex);
+          queuedRepairIndexes.delete(episodeIndex);
+          if (!review) markSegmentQualityStatus(episodeIndex, "saved");
+          writeBatchSegmentCache();
+          publishBatchProgress("saving", review
+            ? `第 ${episodeIndex} 段已保存为待检查草稿。`
+            : `已保存第 ${episodeIndex} / ${resolvedSegmentCount} 段。`);
+        }
+      },
+    });
+
+    async function drainBatchSaveController() {
+      const nextSegmentToSave = batchSaveController
+        .snapshot()
+        .segments
+        .find((entry) => entry.status !== "saved" && entry.status !== "review_saved")
+        ?.segmentIndex;
+      if (!nextSegmentToSave) return;
+      const saveChain = batchSaveController.drain();
+      await saveChain;
     }
 
     function queueReadySegmentSaves() {
-      while (nextSegmentToSave <= renderedEpisodes.length) {
-        const rendered = renderedEpisodes[nextSegmentToSave - 1];
-        if (!rendered || queuedSaveIndexes.has(nextSegmentToSave)) break;
-
-        const queuedIndex = nextSegmentToSave;
-        queuedSaveIndexes.add(queuedIndex);
-        nextSegmentToSave += 1;
-
-        saveChain = saveChain.then(async () => {
-          const episodeIndex = rendered.episodeIndex;
-          const episodeResult = rendered.result;
-          const episodeScript = rendered.sourceText;
-          const fullVideoPrompt = rendered.promptText;
-
-          segmentRepairReasons.delete(episodeIndex);
-          queuedRepairIndexes.delete(episodeIndex);
-          updateSegmentProgress(episodeIndex, "saving", "正在保存到项目");
-          markSegmentQualityStatus(episodeIndex, "cached");
-          publishBatchProgress("saving", `正在保存第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
-          const save = await saveAnalysisProject(episodeScript, episodeResult, fullVideoPrompt, activeProjectId || undefined, undefined);
-          if (!save.saved || !save.projectId || !save.versionId) {
-            markSegmentQualityStatus(episodeIndex, "failed", { repairReasons: [...(segmentRepairReasons.get(episodeIndex) || []), save.reason || "项目保存失败"] });
-            writeBatchSegmentCache();
-            throw new Error(`第 ${episodeIndex} 段已生成，但项目保存失败：${save.reason || "未返回保存结果"}`);
-          }
-
-          activeProjectId = save.projectId;
-          latestSaveRef.current = save;
-          setProjectSave(save);
-          setResumeProjectId(save.projectId);
-          setResumeVersionId(save.versionId);
-
-          completed.push({
-            segment: { index: episodeIndex, text: episodeScript },
-            result: episodeResult,
-            promptText: fullVideoPrompt,
-          });
-          setBatchResults([...completed]);
-          setResult(episodeResult);
-          updateSegmentProgress(episodeIndex, "saved", "已保存");
-          markSegmentQualityStatus(episodeIndex, "saved");
-          writeBatchSegmentCache();
-          publishBatchProgress("saving", `已保存第 ${episodeIndex} / ${resolvedSegmentCount} 段。`);
-        }).catch((error) => {
-          saveError = error instanceof Error ? error : new Error(String(error));
-          throw saveError;
+      for (const rendered of renderedEpisodes) {
+        if (!rendered) continue;
+        const segmentState = segmentStateRecords.find((state) => state.index === rendered.episodeIndex);
+        if (segmentState?.saveStatus === "saved" || segmentState?.saveStatus === "review_saved") continue;
+        const snapshotEntry = batchSaveController.snapshot().segments[rendered.episodeIndex - 1];
+        if (
+          snapshotEntry?.status === "saving"
+          || snapshotEntry?.status === "saved"
+          || snapshotEntry?.status === "review_saved"
+          || snapshotEntry?.status === "save_failed"
+        ) continue;
+        batchSaveController.cache(rendered.episodeIndex, rendered, {
+          review: segmentState?.qualityStatus === "needs_review",
         });
       }
+      void drainBatchSaveController();
     }
 
-    function restoreCachedRenderedSegments() {
+    async function restoreCachedRenderedSegments() {
       if (typeof window === "undefined") return 0;
       try {
-        const rawCache = window.localStorage.getItem(batchCacheKey);
-        if (!rawCache) return 0;
-        const cache = JSON.parse(rawCache) as {
+        type CachedBatchDocument = {
+          schemaVersion?: 1 | 2;
+          revision?: number;
+          durableBatchId?: string;
           projectId?: string | null;
           sourceHash?: string;
           contractHash?: string;
           resolvedSegmentCount?: number;
           qualityReports?: SegmentQualityReport[];
+          needsReviewSegments?: Array<{
+            episodeIndex?: number;
+            reason?: string;
+            result?: AnalysisResult;
+          }>;
+          repairAttempts?: Array<[string, number]>;
+          invocationEvents?: BatchInvocationLedgerEvent[];
+          renderOperations?: RenderOperationRefV2[];
+          featureFlags?: BatchEventFeatureSnapshot;
+          mode?: SegmentCountMode;
+          requestedCount?: number | null;
+          duration?: string;
+          phase?: BatchGenerationPhase;
+          segmentStates?: Array<SegmentStateRecord | { index?: number; status?: BatchSegmentStatus; message?: string }>;
+          activeJobIds?: string[];
           segments?: Array<{
             episodeIndex?: number;
             title?: string;
             sourceText?: string;
             promptText?: string;
             result?: AnalysisResult;
+            status?: SegmentQualityStatus | "review_saved" | "saved";
           }>;
         };
+        let cache: CachedBatchDocument | null = null;
+        try {
+          const response = await fetch(`/api/segment-batch-cache/${encodeURIComponent(durableBatchId)}`, {
+            method: "GET",
+            cache: "no-store",
+          });
+          const data = await response.json().catch(() => null);
+          if (response.ok && data?.ok && data.cache) cache = data.cache as CachedBatchDocument;
+        } catch (serverCacheError) {
+          console.warn("Failed to read durable batch cache", serverCacheError);
+        }
+        if (!cache) {
+          const rawLegacyCache = window.localStorage.getItem(batchCacheKey);
+          if (rawLegacyCache) {
+            const legacyCache = JSON.parse(rawLegacyCache) as CachedBatchDocument;
+            if (Array.isArray(legacyCache.segments)) cache = legacyCache;
+          }
+        }
+        if (!cache) return 0;
         if (
-          cache.projectId !== (activeProjectId || null)
+          (batchProjectId !== null && cache.projectId !== batchProjectId)
           || cache.sourceHash !== batchSourceHash
           || cache.contractHash !== batchContractHash
           || cache.resolvedSegmentCount !== resolvedSegmentCount
@@ -1957,7 +4033,55 @@ export function DashboardClient() {
           return 0;
         }
 
+        if (cache.projectId) {
+          activeProjectId = cache.projectId;
+          batchProjectId = cache.projectId;
+        }
+        if (cache.featureFlags) {
+          batchEventFeatures = normalizeBatchEventFeatureSnapshot(cache.featureFlags, cache.featureFlags.capturedAt);
+          batchCoverageStage = batchEventFeatures.coverageStage;
+          batchCoverageMode = batchEventFeatures.contractV2 && coverageStageUsesLocalGate(batchCoverageStage)
+            ? "active"
+            : "shadow";
+        }
+        if (Array.isArray(cache.invocationEvents)) invocationLedger.restore(cache.invocationEvents);
+        if (Array.isArray(cache.renderOperations)) {
+          renderOperationRecords = retainBoundedRenderOperationAudits(cache.renderOperations);
+        }
+
         let restoredCount = 0;
+        const restoredJudgeItems: PendingCoverageJudgeSegment[] = [];
+        if (Array.isArray(cache.segmentStates)) {
+          if (cache.schemaVersion === 2) {
+            const restoredStates = cache.segmentStates.filter((state): state is SegmentStateRecord => (
+              Boolean(state)
+              && "generationStatus" in state
+              && "qualityStatus" in state
+              && "saveStatus" in state
+              && Number.isInteger(state.index)
+            ));
+            if (restoredStates.length === resolvedSegmentCount) {
+              segmentStateRecords = restoredStates.map((state) => ({ ...state }));
+              batchCacheRevision = Math.max(batchCacheRevision, Number(cache.revision) || 0);
+              segmentProgressItems = segmentStateRecords.map((state) => {
+                const episode = episodes.find((candidate) => candidate.episodeIndex === state.index);
+                return {
+                  index: state.index,
+                  title: episode?.input.title,
+                  status: progressStatusFromSegmentState(state),
+                  message: state.message,
+                };
+              });
+            }
+          } else {
+            for (const cachedState of cache.segmentStates) {
+              if (!("status" in cachedState)) continue;
+              const index = Number(cachedState.index);
+              if (!Number.isInteger(index) || index < 1 || index > renderedEpisodes.length || !cachedState.status) continue;
+              updateSegmentProgress(index, cachedState.status, cachedState.message);
+            }
+          }
+        }
         if (Array.isArray(cache.qualityReports)) {
           for (const report of cache.qualityReports) {
             if (report && Number.isInteger(report.segmentIndex)) {
@@ -1965,12 +4089,36 @@ export function DashboardClient() {
             }
           }
         }
+        if (Array.isArray(cache.repairAttempts)) {
+          for (const attempt of cache.repairAttempts) {
+            if (!Array.isArray(attempt) || typeof attempt[0] !== "string") continue;
+            const count = Number(attempt[1]);
+            if (Number.isInteger(count) && count > 0) repairAttemptCounts.set(attempt[0], count);
+          }
+        }
+        if (Array.isArray(cache.needsReviewSegments)) {
+          for (const cached of cache.needsReviewSegments) {
+            const episodeIndex = Number(cached.episodeIndex);
+            if (
+              !Number.isInteger(episodeIndex)
+              || episodeIndex < 1
+              || episodeIndex > renderedEpisodes.length
+              || !cached.result
+            ) {
+              continue;
+            }
+            const reason = String(cached.reason || "事件覆盖仍有歧义，保留首次结果等待检查。");
+            needsReviewEpisodes.set(episodeIndex, { result: cached.result, reason });
+            updateSegmentProgress(episodeIndex, "needs_review", reason);
+          }
+        }
         for (const cached of cache.segments) {
           const episodeIndex = Number(cached.episodeIndex);
           if (!Number.isInteger(episodeIndex) || episodeIndex < 1 || episodeIndex > renderedEpisodes.length) continue;
           if (renderedEpisodes[episodeIndex - 1]) continue;
-          const episodeInput = episodes.find((episode) => episode.episodeIndex === episodeIndex)?.input;
-          if (!episodeInput || !cached.result || !cached.promptText || !cached.sourceText) continue;
+          const episode = episodes.find((candidate) => candidate.episodeIndex === episodeIndex);
+          const episodeInput = episode?.input;
+          if (!episode || !episodeInput || !cached.result || !cached.promptText || !cached.sourceText) continue;
           const renderDuration = episodeInput.duration || selectedDurationValue();
           const normalizedCachedResult = normalizeBatchEpisodeResult(
             script,
@@ -1979,30 +4127,131 @@ export function DashboardClient() {
             cached.result,
             renderDuration,
           );
-          let validatedCachedResult: AnalysisResult;
-          try {
-            validatedCachedResult = normalizePatchAndValidateBatchSegment(
-              script,
+          const restoredState = segmentStateRecords.find((state) => state.index === episodeIndex);
+          if (restoredState?.generationStatus === "repair_detached" && restoredState.activeRepairJobId) {
+            const restoredRendered: RenderedEpisode = {
               episodeIndex,
-              normalizedCachedResult,
-              renderDuration,
-              episodeInput.segmentContract,
-            ).result;
-          } catch {
+              episodeInput,
+              result: normalizedCachedResult,
+              promptText: buildVideoGenerationPromptText(normalizedCachedResult),
+              sourceText: cached.sourceText,
+            };
+            renderedEpisodes[episodeIndex - 1] = restoredRendered;
+            const review = restoredState.qualityStatus === "needs_review" || cached.status === "review_saved";
+            batchSaveController.restore(episodeIndex, {
+              payload: restoredRendered,
+              review,
+              status: cached.status === "review_saved" || cached.status === "saved" ? cached.status : "cached",
+            });
+            void watchDetachedRepair(episode, normalizedCachedResult, renderDuration, {
+              jobId: restoredState.activeRepairJobId,
+              contractHash: restoredState.contractHash || episodeInput.segmentContract?.contractHash || batchContractHash,
+              resultHash: restoredState.resultHash || buildBatchSegmentResultHash(normalizedCachedResult),
+            }, restoredState.updatedAt || Date.now());
+            restoredCount += 1;
             continue;
           }
-          renderedEpisodes[episodeIndex - 1] = {
+          const evaluated = normalizePatchAndEvaluateBatchSegment(
+            script,
+            episodeIndex,
+            normalizedCachedResult,
+            renderDuration,
+            episodeInput.segmentContract,
+            undefined,
+            undefined,
+            batchCoverageMode,
+          );
+          const outcome = routeBatchSegmentOutcome({
+            gate: evaluated.gate,
+            hasUsableResult: true,
+            coverageStage: batchCoverageStage,
+          });
+          if (outcome.action === "enqueue_judge" || outcome.action === "enqueue_judge_shadow") {
+            restoredJudgeItems.push({
+              episode,
+              result: evaluated.result,
+              renderDuration,
+              renderStartedAt: Date.now(),
+              renderCompletedAt: Date.now(),
+              packSize: 1,
+              sidecar: null,
+              localDecisions: evaluated.coverageDecisions,
+            });
+            updateSegmentProgress(episodeIndex, "adjudicating", "已恢复缓存，等待批量语义裁决");
+            continue;
+          }
+          if (outcome.action === "needs_review") {
+            markCoverageNeedsReview({
+              episode,
+              result: evaluated.result,
+              renderDuration,
+              renderStartedAt: Date.now(),
+              renderCompletedAt: Date.now(),
+              packSize: 1,
+              sidecar: null,
+              localDecisions: evaluated.coverageDecisions,
+            }, buildTargetedRepairReason(evaluated.gate));
+            continue;
+          }
+          if (outcome.action === "request_quality_patch" || outcome.action === "request_event_patch") {
+            const routeError = qualityErrorForRoute(
+              evaluated.gate,
+              outcome,
+              evaluated.result,
+              evaluated.coverageDecisions,
+            );
+            queueSegmentRepair(episode, routeError.message, {
+              result: evaluated.result,
+              validationError: routeError,
+              renderDuration,
+              packSize: 1,
+            });
+            continue;
+          }
+          if (outcome.action !== "accept") continue;
+          const validatedCachedResult = evaluated.result;
+          legacyFatalCheck(episodeIndex, validatedCachedResult, evaluated.gate);
+          const restoredRendered: RenderedEpisode = {
             episodeIndex,
             episodeInput,
             result: validatedCachedResult,
             promptText: buildVideoGenerationPromptText(validatedCachedResult),
             sourceText: cached.sourceText,
           };
+          renderedEpisodes[episodeIndex - 1] = restoredRendered;
+          const cachedStatus = cached.status || qualityReports.get(episodeIndex)?.status;
+          if (cachedStatus === "saved" || cachedStatus === "review_saved") {
+            batchSaveController.restore(episodeIndex, {
+              payload: restoredRendered,
+              review: cachedStatus === "review_saved",
+              status: cachedStatus,
+            });
+            updateSegmentProgress(
+              episodeIndex,
+              cachedStatus === "review_saved" ? "review_saved" : "saved",
+              cachedStatus === "review_saved" ? "已恢复已保存的待检查草稿" : "已从服务端缓存恢复已保存状态",
+            );
+            if (!completed.some((item) => item.segment.index === episodeIndex)) {
+              completed.push({
+                segment: { index: episodeIndex, text: cached.sourceText },
+                result: validatedCachedResult,
+                promptText: buildVideoGenerationPromptText(validatedCachedResult),
+              });
+            }
+          } else {
+            batchSaveController.restore(episodeIndex, {
+              payload: restoredRendered,
+              review: needsReviewEpisodes.has(episodeIndex),
+              status: "cached",
+            });
+            updateSegmentProgress(episodeIndex, "cached", "已恢复缓存分段，继续按顺序保存");
+          }
           segmentRepairReasons.delete(episodeIndex);
           queuedRepairIndexes.delete(episodeIndex);
-          updateSegmentProgress(episodeIndex, "cached", "已恢复缓存分段，继续按顺序保存");
           restoredCount += 1;
         }
+
+        if (restoredJudgeItems.length) await runCoverageJudgeWave(restoredJudgeItems, 0);
 
         if (restoredCount > 0) {
           setBatchResults(
@@ -2017,6 +4266,15 @@ export function DashboardClient() {
           );
           publishBatchProgress("saving", `已恢复缓存分段，继续按顺序保存：${restoredCount} 段`);
           queueReadySegmentSaves();
+        }
+        const restoredNeedsReviewCount = segmentStateRecords.filter((state) => (
+          state.qualityStatus === "needs_review" || state.saveStatus === "review_saved"
+        )).length;
+        if (restoredNeedsReviewCount > 0) {
+          publishBatchProgress(
+            "needs_review",
+            `已恢复 ${restoredNeedsReviewCount} 段待检查结果，不会重新生成。`,
+          );
         }
         return restoredCount;
       } catch (cacheError) {
@@ -2035,16 +4293,49 @@ export function DashboardClient() {
         durationMs?: number;
         packIndex?: number;
         packSize?: number;
+        qualityGate?: ReturnType<typeof evaluateBatchSegmentQuality>;
+        patchDiffs?: QualityPatchDiff[];
+        codexRepairAttempted?: boolean;
+        coverageDecisions?: CoverageDecision[];
+        coverageReceiptCount?: number;
+        coverageDurationMs?: number;
+        judgeInvoked?: boolean;
+        judgeWaveId?: string;
+        judgeDecisionCount?: number;
+        judgeDurationMs?: number;
+        needsReviewReason?: string;
       } = {},
     ) {
       const episodeIndex = episode.episodeIndex;
       const episodeInput = episode.input;
-      if (episodeInput.shotCount > 0 && episodeResult.storyboard.length !== episodeInput.shotCount) {
-        throw new Error(`第 ${episodeIndex} 段生成失败：规划要求 ${episodeInput.shotCount} 个镜头，但生成结果为 ${episodeResult.storyboard.length} 个镜头。`);
-      }
       const fullVideoPrompt = buildVideoGenerationPromptText(episodeResult);
       const episodeScript = episodeSourceText(script, episodeIndex, resolvedSegmentCount || episodes.length, episodeInput, episodeResult);
       const repairReasons = segmentRepairReasons.get(episodeIndex) || [];
+      const localPatchCount = (reportMeta.patchDiffs || []).filter((patch) => patch.patchSource === "local").length;
+      if (localPatchCount > 0) {
+        invocationLedger.record("localPatchOperations", { segmentIndex: episodeIndex, count: localPatchCount });
+      }
+      const stateBeforeStore = segmentStateRecords.find((state) => state.index === episodeIndex);
+      const storedResultHash = buildBatchSegmentResultHash(episodeResult);
+      if (
+        stateBeforeStore?.generationStatus !== "repair_detached"
+        && stateBeforeStore?.resultHash !== storedResultHash
+      ) {
+        if (stateBeforeStore?.generationStatus === "settled") {
+          dispatchSegmentStateEvent(episodeIndex, { type: "RENDER_STARTED" });
+        }
+        dispatchSegmentStateEvent(episodeIndex, {
+          type: "RENDER_SUCCEEDED",
+          resultHash: storedResultHash,
+          contractHash: episodeInput.segmentContract?.contractHash || batchContractHash,
+        });
+      }
+      dispatchSegmentStateEvent(
+        episodeIndex,
+        reportMeta.status === "needs_review"
+          ? { type: "QUALITY_NEEDS_REVIEW", message: reportMeta.needsReviewReason }
+          : { type: "QUALITY_PASSED" },
+      );
       qualityReports.set(
         episodeIndex,
         createSegmentQualityReport({
@@ -2060,10 +4351,21 @@ export function DashboardClient() {
           packSize: reportMeta.packSize,
           repairCount: repairReasons.length,
           repairReasons,
+          qualityGate: reportMeta.qualityGate,
+          patchDiffs: reportMeta.patchDiffs,
+          codexRepairAttempted: reportMeta.codexRepairAttempted,
           renderStartedAt: reportMeta.renderStartedAt,
           renderCompletedAt: reportMeta.renderCompletedAt,
           durationMs: reportMeta.durationMs,
           contractHash: episodeInput.segmentContract?.contractHash,
+          coverageDecisions: reportMeta.coverageDecisions,
+          coverageReceiptCount: reportMeta.coverageReceiptCount,
+          coverageDurationMs: reportMeta.coverageDurationMs,
+          judgeInvoked: reportMeta.judgeInvoked,
+          judgeWaveId: reportMeta.judgeWaveId,
+          judgeDecisionCount: reportMeta.judgeDecisionCount,
+          judgeDurationMs: reportMeta.judgeDurationMs,
+          needsReviewReason: reportMeta.needsReviewReason,
         }),
       );
       renderedEpisodes[episodeIndex - 1] = {
@@ -2073,6 +4375,7 @@ export function DashboardClient() {
         promptText: fullVideoPrompt,
         sourceText: episodeScript,
       };
+      dispatchSegmentStateEvent(episodeIndex, { type: "CACHE_READY" });
       segmentRepairReasons.delete(episodeIndex);
       queuedRepairIndexes.delete(episodeIndex);
       setBatchResults(
@@ -2087,8 +4390,18 @@ export function DashboardClient() {
       );
       setResult(episodeResult);
       writeBatchSegmentCache();
-      updateSegmentProgress(episodeIndex, "cached", "已生成并缓存，等待前序保存");
-      publishBatchProgress("rendering", `第 ${episodeIndex} / ${resolvedSegmentCount} 段已生成并缓存，继续处理剩余分段...`);
+      const needsReview = reportMeta.status === "needs_review" || needsReviewEpisodes.has(episodeIndex);
+      updateSegmentProgress(
+        episodeIndex,
+        needsReview ? "needs_review" : "cached",
+        needsReview ? reportMeta.needsReviewReason || "已保留首次结果，等待检查并按序保存" : "已生成并缓存，等待前序保存",
+      );
+      publishBatchProgress(
+        needsReview ? "needs_review" : "rendering",
+        needsReview
+          ? `第 ${episodeIndex} 段首次结果已保留，将保存为待检查草稿。`
+          : `第 ${episodeIndex} / ${resolvedSegmentCount} 段已生成并缓存，继续处理剩余分段...`,
+      );
       queueReadySegmentSaves();
     }
 
@@ -2097,27 +4410,106 @@ export function DashboardClient() {
       const episodeInput = episode.input;
       const renderScript = buildBatchEpisodeRenderScript(episodeInput, resolvedSegmentCount || episodes.length);
       const renderDuration = episodeInput.duration || selectedDurationValue();
+      const renderOperation = beginRenderOperation(episodeIndex);
 
       updateSegmentProgress(episodeIndex, "repairing", "正在按单段质量生成修复");
       publishBatchProgress("repairing", `正在按单段质量生成第 ${episodeIndex} / ${resolvedSegmentCount} 段...`);
       const renderStartedAt = Date.now();
-      const episodeResult = await renderBatchSegmentWithQualityRepair(
-        renderScript,
-        renderDuration,
-        episodeIndex,
-        resolvedSegmentCount || episodes.length,
-        episodeInput.segmentContract,
-      );
-      storeRenderedEpisode(episode, episodeResult, {
-        status: "repaired",
-        renderStartedAt,
-        renderCompletedAt: Date.now(),
-        packIndex: episodeIndex,
-        packSize: 1,
-      });
+      try {
+        const validatedEpisode = await renderBatchSegmentWithQualityRepair(
+          renderScript,
+          renderDuration,
+          episodeIndex,
+          resolvedSegmentCount || episodes.length,
+          episodeInput.segmentContract,
+          renderOperation,
+        );
+        if (validatedEpisode.detached) {
+          markCoverageNeedsReview({
+            episode,
+            result: validatedEpisode.result,
+            renderDuration,
+            renderStartedAt,
+            renderCompletedAt: Date.now(),
+            packIndex: episodeIndex,
+            packSize: 1,
+            sidecar: null,
+            localDecisions: validatedEpisode.coverageDecisions,
+          }, "路径级修复仍在后台运行，首次结果已保留并将保存为待检查草稿。");
+          return;
+        }
+        const repairState = segmentStateRecords.find((state) => state.index === episodeIndex);
+        if (repairState?.generationStatus === "repair_pending") {
+          const syntheticJobId = `single-regeneration:${episodeIndex}:${buildBatchSegmentResultHash(validatedEpisode.result).slice(0, 12)}`;
+          dispatchSegmentStateEvent(episodeIndex, { type: "REPAIR_STARTED", jobId: syntheticJobId });
+          dispatchSegmentStateEvent(episodeIndex, {
+            type: "REPAIR_COMPLETED",
+            jobId: syntheticJobId,
+            resultHash: buildBatchSegmentResultHash(validatedEpisode.result),
+          });
+        }
+        storeRenderedEpisode(episode, validatedEpisode.result, {
+          status: "repaired",
+          renderStartedAt,
+          renderCompletedAt: Date.now(),
+          packIndex: episodeIndex,
+          packSize: 1,
+          qualityGate: validatedEpisode.gate,
+          patchDiffs: validatedEpisode.patchDiffs,
+          codexRepairAttempted: validatedEpisode.codexRepairAttempted,
+          coverageDecisions: validatedEpisode.coverageDecisions,
+          coverageDurationMs: validatedEpisode.coverageDurationMs,
+        });
+      } catch (error) {
+        if (error instanceof StaleSegmentOperationError) return;
+        if (!(error instanceof BatchSegmentQualityValidationError) || !error.result) throw error;
+        const repairState = segmentStateRecords.find((state) => state.index === episodeIndex);
+        if (["repair_pending", "repair_running", "repair_detached"].includes(repairState?.generationStatus || "")) {
+          dispatchSegmentStateEvent(episodeIndex, {
+            type: "REPAIR_FAILED",
+            jobId: repairState?.activeRepairJobId,
+            errorCode: "REPAIR_VALIDATION_FAILED",
+            message: "补生成结果未通过复检，已保留首次可用结果",
+          });
+        }
+        const outcome = routeBatchSegmentOutcome({
+          gate: error.gate,
+          hasUsableResult: true,
+          coverageStage: batchCoverageStage,
+        });
+        const judgeItem: PendingCoverageJudgeSegment = {
+          episode,
+          result: error.result,
+          renderDuration,
+          renderStartedAt,
+          renderCompletedAt: Date.now(),
+          packIndex: episodeIndex,
+          packSize: 1,
+          sidecar: null,
+          localDecisions: error.coverageDecisions,
+        };
+        if (outcome.action === "enqueue_judge" || outcome.action === "enqueue_judge_shadow") {
+          await runCoverageJudgeWave([judgeItem], episodeIndex);
+          return;
+        }
+        markCoverageNeedsReview(judgeItem, buildTargetedRepairReason(error.gate));
+      } finally {
+        finishRenderOperation(renderOperation);
+      }
     }
 
-    function queueSegmentRepair(episode: SeasonPackEpisodeResult, reason: string) {
+    function queueSegmentRepair(
+      episode: SeasonPackEpisodeResult,
+      reason: string,
+      existing?: {
+        result: AnalysisResult;
+        validationError: unknown;
+        renderDuration: string;
+        renderStartedAt?: number;
+        packIndex?: number;
+        packSize?: number;
+      },
+    ) {
       const cachedRendered = renderedEpisodes[episode.episodeIndex - 1];
       if (cachedRendered) {
         try {
@@ -2127,6 +4519,9 @@ export function DashboardClient() {
             cachedRendered.result,
             cachedRendered.episodeInput.duration || selectedDurationValue(),
             cachedRendered.episodeInput.segmentContract,
+            undefined,
+            undefined,
+            batchCoverageMode,
           );
           renderedEpisodes[episode.episodeIndex - 1] = {
             ...cachedRendered,
@@ -2148,8 +4543,32 @@ export function DashboardClient() {
       }
       if (queuedRepairIndexes.has(episode.episodeIndex)) return;
       const reasonType = classifyBatchRepairReason(reason);
+      const repairFindings = existing?.validationError instanceof BatchSegmentQualityValidationError
+        ? existing.validationError.findings
+        : [];
+      const safetyOnlyRepair = repairFindings.length > 0
+        && repairFindings.every((finding) => finding.code === "sensitive_term");
+      if (
+        existing?.result
+        && (!TASK_ONE_REPAIR_SCHEDULER_ENABLED || (!TASK_ONE_SAFETY_ENABLED && safetyOnlyRepair))
+      ) {
+        markCoverageNeedsReview({
+          episode,
+          result: existing.result,
+          renderDuration: existing.renderDuration,
+          renderStartedAt: existing.renderStartedAt || Date.now(),
+          renderCompletedAt: Date.now(),
+          packIndex: existing.packIndex,
+          packSize: existing.packSize || 1,
+          sidecar: null,
+          localDecisions: existing.validationError instanceof BatchSegmentQualityValidationError
+            ? existing.validationError.coverageDecisions
+            : [],
+        }, "任务一自动修复功能已关闭，首次结果已保留为待检查草稿。" );
+        return;
+      }
       registerSegmentRepairReason(episode.episodeIndex, reason);
-      const attemptKey = buildBatchRepairAttemptKey(episode.episodeIndex, reasonType);
+      const attemptKey = buildBatchRepairAttemptKey(episode.episodeIndex, reasonType, repairFindings);
       const attemptCount = (repairAttemptCounts.get(attemptKey) || 0) + 1;
       repairAttemptCounts.set(attemptKey, attemptCount);
       if (attemptCount > MAX_BATCH_REPAIR_ATTEMPTS_PER_REASON) {
@@ -2160,46 +4579,743 @@ export function DashboardClient() {
       }
       queuedRepairIndexes.add(episode.episodeIndex);
       const repairLabel = batchRepairReasonLabel(reasonType);
-      repairQueue.push({ episode, reason, reasonType });
-      updateSegmentProgress(episode.episodeIndex, "repairing", `${repairLabel}: ${reason}`);
+      if (existing?.result) {
+        const existingResultHash = buildBatchSegmentResultHash(existing.result);
+        const existingState = segmentStateRecords.find((state) => state.index === episode.episodeIndex);
+        if (existingState?.resultHash !== existingResultHash) {
+          if (existingState?.generationStatus === "settled") {
+            dispatchSegmentStateEvent(episode.episodeIndex, { type: "RENDER_STARTED" });
+          }
+          dispatchSegmentStateEvent(episode.episodeIndex, {
+            type: "RENDER_SUCCEEDED",
+            resultHash: existingResultHash,
+            contractHash: episode.input.segmentContract?.contractHash || batchContractHash,
+          });
+        }
+        dispatchSegmentStateEvent(episode.episodeIndex, { type: "QUALITY_BLOCKED", message: reason });
+      }
+      const item: RepairQueueItem = {
+        episode,
+        reason,
+        reasonType,
+        existingResult: existing?.result,
+        validationError: existing?.validationError,
+        renderDuration: existing?.renderDuration,
+        renderStartedAt: existing?.renderStartedAt,
+        packIndex: existing?.packIndex,
+        packSize: existing?.packSize,
+      };
+      dispatchSegmentStateEvent(episode.episodeIndex, {
+        type: "REPAIR_QUEUED",
+        fingerprint: attemptKey,
+        message: `${repairLabel}: ${existing ? "只补未通过字段" : reason}`,
+      });
+      const accepted = repairScheduler.enqueue({
+        segmentIndex: episode.episodeIndex,
+        fingerprint: attemptKey,
+        payload: item,
+      });
+      if (!accepted) return;
+      if (!repairFirstQueuedAtMs) repairFirstQueuedAtMs = Date.now();
+      updateSegmentProgress(
+        episode.episodeIndex,
+        existing ? "patching" : "repairing",
+        `${repairLabel}: ${existing ? "只补未通过字段" : reason}`,
+      );
+    }
+
+    async function processSegmentRepairItem(item: RepairQueueItem) {
+      if (batchQuotaPaused) return;
+      const { episode, reasonType } = item;
+      if (!item.existingResult) {
+        invocationLedger.record("singleRegenerationCalls", { segmentIndex: episode.episodeIndex });
+        updateSegmentProgress(episode.episodeIndex, "repairing", `${batchRepairReasonLabel(reasonType)}: Render Pack 无可用结果，正在补生成当前段`);
+        await renderSingleEpisodeWithQualityRepair(episode);
+        return;
+      }
+      updateSegmentProgress(episode.episodeIndex, "patching", `${batchRepairReasonLabel(reasonType)}: 正在只补授权叶子字段`);
+      try {
+        const renderDuration = item.renderDuration || episode.input.duration || selectedDurationValue();
+        const repaired = await repairExistingBatchSegment(
+          buildBatchEpisodeRenderScript(episode.input, resolvedSegmentCount || episodes.length),
+          renderDuration,
+          episode.episodeIndex,
+          resolvedSegmentCount || episodes.length,
+          item.existingResult,
+          episode.input.segmentContract,
+          item.validationError || new Error(item.reason),
+        );
+        if (repaired.detached) {
+          markCoverageNeedsReview({
+            episode,
+            result: item.existingResult,
+            renderDuration,
+            renderStartedAt: item.renderStartedAt || Date.now(),
+            renderCompletedAt: Date.now(),
+            packIndex: item.packIndex,
+            packSize: item.packSize || 1,
+            sidecar: null,
+            localDecisions: repaired.coverageDecisions,
+          }, "路径级修复仍在后台运行，首次结果已保留并将保存为待检查草稿。");
+          return;
+        }
+        storeRenderedEpisode(episode, repaired.result, {
+          status: "repaired",
+          renderStartedAt: item.renderStartedAt,
+          renderCompletedAt: Date.now(),
+          packIndex: item.packIndex,
+          packSize: item.packSize || 1,
+          qualityGate: repaired.gate,
+          patchDiffs: repaired.patchDiffs,
+          codexRepairAttempted: true,
+          coverageDecisions: repaired.coverageDecisions,
+          coverageDurationMs: repaired.coverageDurationMs,
+        });
+      } catch (repairError) {
+        if (repairError instanceof StaleSegmentOperationError) return;
+        const renderDuration = item.renderDuration || episode.input.duration || selectedDurationValue();
+        const repairState = segmentStateRecords.find((state) => state.index === episode.episodeIndex);
+        if (["repair_pending", "repair_running", "repair_detached"].includes(repairState?.generationStatus || "")) {
+          dispatchSegmentStateEvent(episode.episodeIndex, {
+            type: "REPAIR_FAILED",
+            jobId: repairState?.activeRepairJobId,
+            errorCode: "REPAIR_VALIDATION_FAILED",
+            message: formatUserFacingError(repairError, "路径级 patch 未通过复检"),
+          });
+        }
+        const validationRepairError = repairError instanceof BatchSegmentQualityValidationError ? repairError : null;
+        const routedError = validationRepairError
+          ? routeBatchSegmentOutcome({
+              gate: validationRepairError.gate,
+              hasUsableResult: Boolean(validationRepairError.result || item.existingResult),
+              coverageStage: batchCoverageStage,
+            })
+          : null;
+        const latestResult = validationRepairError?.result || item.existingResult;
+        if (routedError && latestResult && (routedError.action === "enqueue_judge" || routedError.action === "enqueue_judge_shadow")) {
+          queuedRepairIndexes.delete(episode.episodeIndex);
+          await runCoverageJudgeWave([{
+            episode,
+            result: latestResult,
+            renderDuration,
+            renderStartedAt: item.renderStartedAt || Date.now(),
+            renderCompletedAt: Date.now(),
+            packIndex: item.packIndex,
+            packSize: item.packSize || 1,
+            sidecar: null,
+            localDecisions: validationRepairError?.coverageDecisions.length
+              ? validationRepairError.coverageDecisions
+              : episode.input.segmentContract
+                ? validateSegmentEventCoverage(latestResult, episode.input.segmentContract)
+                : [],
+          }], episode.episodeIndex);
+          return;
+        }
+        if (routedError && latestResult && (routedError.action === "request_event_patch" || routedError.action === "request_quality_patch")) {
+          queuedRepairIndexes.delete(episode.episodeIndex);
+          const routeError = qualityErrorForRoute(
+            validationRepairError!.gate,
+            routedError,
+            latestResult,
+            validationRepairError!.coverageDecisions,
+          );
+          queueSegmentRepair(episode, routeError.message, {
+            result: latestResult,
+            validationError: routeError,
+            renderDuration,
+            renderStartedAt: item.renderStartedAt,
+            packIndex: item.packIndex,
+            packSize: item.packSize,
+          });
+          return;
+        }
+        markCoverageNeedsReview({
+          episode,
+          result: latestResult,
+          renderDuration,
+          renderStartedAt: item.renderStartedAt || Date.now(),
+          renderCompletedAt: Date.now(),
+          packIndex: item.packIndex,
+          packSize: item.packSize || 1,
+          sidecar: null,
+          localDecisions: episode.input.segmentContract
+            ? validateSegmentEventCoverage(latestResult, episode.input.segmentContract)
+            : [],
+        }, `${formatUserFacingError(repairError, "路径级 patch 未通过复检")}；首次结果已保留。`);
+        if (CODEX_QUOTA_ERROR_PATTERN.test(String(repairError instanceof Error ? repairError.message : repairError))) {
+          pauseBatchForCodexQuota([episode.episodeIndex], repairError);
+        }
+      }
+    }
+
+    repairScheduler = createBatchRepairScheduler<RepairQueueItem, void>({
+      maxConcurrency: BATCH_SINGLE_RENDER_CONCURRENCY,
+      execute: async (task) => processSegmentRepairItem(task.payload),
+      onFailed: (task, error) => {
+        queuedRepairIndexes.delete(task.segmentIndex);
+        dispatchSegmentStateEvent(task.segmentIndex, {
+          type: "REPAIR_FAILED",
+          errorCode: "REPAIR_EXECUTION_FAILED",
+          message: formatUserFacingError(error, "当前段修复任务失败，已保留可用结果"),
+        });
+        updateSegmentProgress(task.segmentIndex, "failed", formatUserFacingError(error, "当前段修复任务失败"));
+      },
+    });
+
+    function signalRepairScheduler() {
+      repairScheduler.signal();
     }
 
     async function runSegmentRepairPool() {
-      if (repairPoolPromise) return repairPoolPromise;
-      repairPoolPromise = (async () => {
-      if (!repairQueue.length) return;
-      publishBatchProgress("repairing", `正在并发重修 ${repairQueue.length} 段，最多同时 ${BATCH_SINGLE_RENDER_CONCURRENCY} 段...`);
+      await repairScheduler.waitForIdle();
+    }
 
-      let nextRepairIndex = 0;
-      const repairConcurrency = Math.min(BATCH_SINGLE_RENDER_CONCURRENCY, repairQueue.length);
+    function markCoverageNeedsReview(item: PendingCoverageJudgeSegment, reason: string) {
+      needsReviewEpisodes.set(item.episode.episodeIndex, { result: item.result, reason });
+      storeRenderedEpisode(item.episode, item.result, {
+        status: "needs_review",
+        packIndex: item.packIndex,
+        packSize: item.packSize,
+        renderStartedAt: item.renderStartedAt,
+        renderCompletedAt: item.renderCompletedAt,
+        coverageDecisions: item.localDecisions,
+        needsReviewReason: reason,
+      });
+    }
 
-      async function repairNextSegment() {
-        while (nextRepairIndex < repairQueue.length) {
-          const repairIndex = nextRepairIndex;
-          nextRepairIndex += 1;
-          const { episode, reasonType } = repairQueue[repairIndex];
-          updateSegmentProgress(episode.episodeIndex, "repairing", `${batchRepairReasonLabel(reasonType)}: 正在重跑单段渲染`);
-          await renderSingleEpisodeWithQualityRepair(episode);
-        }
+    async function runCoverageJudgeWave(items: PendingCoverageJudgeSegment[], waveNumber: number) {
+      if (!items.length) return;
+      if (!batchEventFeatures.contractV2 || !coverageStageInvokesJudge(batchCoverageStage)) {
+        for (const item of items) markCoverageNeedsReview(item, "事件覆盖存在歧义，Judge 未启用，保留首次结果等待检查。");
+        return;
       }
 
-      await Promise.all(Array.from({ length: repairConcurrency }, () => repairNextSegment()));
-      repairQueue.splice(0, nextRepairIndex);
-      })();
+      const cases = items.flatMap((item) => {
+        const contract = item.episode.input.segmentContract;
+        if (!contract) return [];
+        return item.localDecisions.flatMap((decision) => {
+          if (decision.status !== "ambiguous" || decision.importance !== "blocking") return [];
+          const slot = contract.requiredEventSlots.find((candidate) => candidate.id === decision.slotId);
+          if (!slot) return [];
+          const inspectedFields = collectEventCoverageInspectedFields(item.result, slot);
+          if (!inspectedFields.length) return [];
+          return [{
+            segmentIndex: item.episode.episodeIndex,
+            slotId: slot.id,
+            label: slot.label,
+            importance: "blocking" as const,
+            contractHash: contract.contractHash,
+            resultHash: buildBatchSegmentResultHash(item.result),
+            anchorGroups: slot.anchorGroups,
+            conceptGroups: slot.conceptGroups,
+            contradictionGroups: slot.contradictionGroups,
+            sourceExcerpt: contract.sourceText,
+            characterLocks: contract.characterLocks || [],
+            forbiddenFutureEvents: contract.forbiddenFutureEvents || [],
+            evidenceSelectors: slot.evidenceSelectors || [],
+            inspectedFields,
+          }];
+        });
+      });
+      if (!cases.length) {
+        for (const item of items) markCoverageNeedsReview(item, "事件覆盖缺少可裁决字段，保留首次结果等待检查。");
+        return;
+      }
 
+      for (const item of items) updateSegmentProgress(item.episode.episodeIndex, "adjudicating", "正在批量判断事件语义覆盖");
+      publishBatchProgress("adjudicating", `正在批量判断 ${cases.length} 个歧义事件，不改写首次提示词...`);
+      let judgeJobs: EventCoverageCodexJob[] = [];
+      let judgeWaveId = `wave-${waveNumber}-${buildBatchSegmentResultHash(cases)}`;
+      const judgeStartedAt = Date.now();
       try {
-        await repairPoolPromise;
-      } finally {
-        repairPoolPromise = null;
+        const caseChunks = Array.from(
+          { length: Math.ceil(cases.length / 20) },
+          (_, index) => cases.slice(index * 20, index * 20 + 20),
+        );
+        invocationLedger.record("judgeCalls", { count: caseChunks.length });
+        const createdJobs = await Promise.all(caseChunks.map((caseChunk) => createEventCoverageCodexJob({
+          batchId: seasonPackJob.id,
+          renderRound: waveNumber,
+          cases: caseChunk,
+        })));
+        judgeJobs = await Promise.all(createdJobs.map((created) => pollEventCoverageCodexJob(created.id)));
+        judgeWaveId = judgeJobs.map((job) => job.waveId).join(",");
+      } catch (error) {
+        const reason = formatUserFacingError(error, "事件覆盖裁决失败");
+        for (const item of items) markCoverageNeedsReview(item, `${reason}；首次结果已保留。`);
+        if (CODEX_QUOTA_ERROR_PATTERN.test(String(error instanceof Error ? error.message : error))) {
+          pauseBatchForCodexQuota(items.map((item) => item.episode.episodeIndex), error);
+        }
+        return;
+      }
+
+      const judgeDecisions = new Map<string, EventCoverageJudgeDecision>(
+        judgeJobs.flatMap((job) => job.result?.decisions || []).map(
+          (decision) => [`${decision.segmentIndex}:${decision.slotId}`, decision] as const,
+        ),
+      );
+      const judgeDecisionCount = judgeJobs.reduce((count, job) => count + (job.result?.decisions.length || 0), 0);
+      const submittedJudgeCases = new Map<string, (typeof cases)[number]>(
+        cases.map((judgeCase) => [`${judgeCase.segmentIndex}:${judgeCase.slotId}`, judgeCase] as const),
+      );
+      const judgeDurationMs = Math.max(0, Date.now() - judgeStartedAt);
+      for (const item of items) {
+        const contract = item.episode.input.segmentContract;
+        if (!contract) {
+          markCoverageNeedsReview(item, "缺少本段生成契约，首次结果已保留。");
+          continue;
+        }
+        const mergedDecisions = item.localDecisions.map((decision) => {
+          if (decision.status !== "ambiguous" || decision.importance !== "blocking") return decision;
+          const caseKey = `${item.episode.episodeIndex}:${decision.slotId}`;
+          const judged = judgeDecisions.get(caseKey);
+          const submittedCase = submittedJudgeCases.get(caseKey);
+          const currentResultHash = buildBatchSegmentResultHash(item.result);
+          const expectedPaths = submittedCase?.inspectedFields.map((field) => field.path).sort() || [];
+          const inspectedPaths = judged?.inspectedPaths.slice().sort() || [];
+          const trustedEvidence = Boolean(judged?.evidence.every((entry) => {
+            const currentValue = String(getBatchSegmentRepairValueAtPath(item.result, entry.path) || "");
+            const normalizedCurrent = currentValue.normalize("NFKC").replace(/\s+/g, "");
+            const normalizedQuote = entry.quote.normalize("NFKC").replace(/\s+/g, "");
+            return normalizedQuote.length > 0 && normalizedCurrent.includes(normalizedQuote);
+          }));
+          if (
+            !judged
+            || !submittedCase
+            || submittedCase.contractHash !== contract.contractHash
+            || submittedCase.resultHash !== currentResultHash
+            || JSON.stringify(expectedPaths) !== JSON.stringify(inspectedPaths)
+            || !trustedEvidence
+            || judged.status === "uncertain"
+          ) return decision;
+          return {
+            ...decision,
+            status: judged.status === "covered"
+              ? "covered" as const
+              : judged.status === "missing"
+                ? "definite_missing" as const
+                : "contradiction" as const,
+            evidencePaths: judged.evidence.map((entry) => entry.path),
+            evidenceQuotes: judged.evidence.map((entry) => entry.quote),
+            reasonCode: judged.status === "covered"
+              ? "verified_receipt" as const
+              : judged.status === "contradiction"
+                ? "explicit_contradiction" as const
+                : "required_field_empty" as const,
+          };
+        });
+
+        if (batchCoverageStage === "judge-shadow") {
+          const shadowEvaluation = normalizePatchAndEvaluateBatchSegment(
+            script,
+            item.episode.episodeIndex,
+            item.result,
+            item.renderDuration,
+            contract,
+            item.sidecar,
+            undefined,
+            "shadow",
+          );
+          const nonCoverageBlocking = shadowEvaluation.gate.blockingFindings.filter(
+            (finding) => finding.code !== "ambiguous_required_event_slot",
+          );
+          if (nonCoverageBlocking.length) {
+            const shadowRoute = routeBatchSegmentOutcome({
+              gate: qualityGateWithBlockingFindings(shadowEvaluation.gate, nonCoverageBlocking),
+              hasUsableResult: true,
+              coverageStage: "shadow",
+            });
+            if (shadowRoute.action !== "accept") {
+              markCoverageNeedsReview(item, "Judge shadow 仅记录结论；当前段仍有非语义质量阻断，首次结果已保留。");
+              continue;
+            }
+          }
+          legacyFatalCheck(item.episode.episodeIndex, shadowEvaluation.result, shadowEvaluation.gate);
+          storeRenderedEpisode(item.episode, shadowEvaluation.result, {
+            status: "cached",
+            renderStartedAt: item.renderStartedAt,
+            renderCompletedAt: item.renderCompletedAt,
+            packIndex: item.packIndex,
+            packSize: item.packSize,
+            qualityGate: shadowEvaluation.gate,
+            patchDiffs: shadowEvaluation.patchDiffs,
+            coverageDecisions: item.localDecisions,
+            coverageReceiptCount: item.sidecar?.receipts.length || 0,
+            coverageDurationMs: shadowEvaluation.coverageDurationMs,
+            judgeInvoked: true,
+            judgeWaveId,
+            judgeDecisionCount,
+            judgeDurationMs,
+          });
+          continue;
+        }
+
+        if (mergedDecisions.some((decision) => decision.importance === "blocking" && decision.status === "ambiguous")) {
+          markCoverageNeedsReview(item, "Judge 无法确定事件是否覆盖，首次结果已保留，未自动修改。");
+          continue;
+        }
+
+        const evaluated = normalizePatchAndEvaluateBatchSegment(
+          script,
+          item.episode.episodeIndex,
+          item.result,
+          item.renderDuration,
+          contract,
+          item.sidecar,
+          mergedDecisions,
+          batchCoverageMode,
+        );
+        const outcome = routeBatchSegmentOutcome({
+          gate: evaluated.gate,
+          hasUsableResult: true,
+          coverageStage: batchCoverageStage,
+        });
+        if (outcome.action === "accept") {
+          legacyFatalCheck(item.episode.episodeIndex, evaluated.result, evaluated.gate);
+          storeRenderedEpisode(item.episode, evaluated.result, {
+            status: "cached",
+            renderStartedAt: item.renderStartedAt,
+            renderCompletedAt: item.renderCompletedAt,
+            packIndex: item.packIndex,
+            packSize: item.packSize,
+            qualityGate: evaluated.gate,
+            patchDiffs: evaluated.patchDiffs,
+            coverageDecisions: mergedDecisions,
+            coverageReceiptCount: item.sidecar?.receipts.length || 0,
+            coverageDurationMs: evaluated.coverageDurationMs,
+            judgeInvoked: true,
+            judgeWaveId,
+            judgeDecisionCount,
+            judgeDurationMs,
+          });
+          continue;
+        }
+
+        if (outcome.action === "request_event_patch" || outcome.action === "request_quality_patch") {
+          const routeError = qualityErrorForRoute(
+            evaluated.gate,
+            outcome,
+            evaluated.result,
+            evaluated.coverageDecisions,
+          );
+          updateSegmentProgress(item.episode.episodeIndex, "patching", "已确认真实缺失，只补授权叶子字段");
+          queueSegmentRepair(item.episode, routeError.message, {
+            result: evaluated.result,
+            validationError: routeError,
+            renderDuration: item.renderDuration,
+            renderStartedAt: item.renderStartedAt,
+            packIndex: item.packIndex,
+            packSize: item.packSize,
+          });
+          continue;
+        }
+
+        markCoverageNeedsReview(item, buildTargetedRepairReason(evaluated.gate));
       }
     }
 
-    async function renderPackedSegmentsWithQualityRepair(packEpisodes: SeasonPackEpisodeResult[], allowSplitFallback = true, packIndex?: number) {
-      packEpisodes = packEpisodes.filter((episode) => !renderedEpisodes[episode.episodeIndex - 1]);
+    async function reconcileAndRouteRenderPackResult(input: {
+      operation: RenderOperationRefV2;
+      job: VideoPromptPackCodexJob;
+      packEpisodes: SeasonPackEpisodeResult[];
+      packStartedAt: number;
+      packIndex?: number;
+      renderRound: number;
+    }) {
+      const { operation, job, packEpisodes, packStartedAt, packIndex, renderRound } = input;
+      const currentSegments = Object.fromEntries(operation.segmentIndexes.map((episodeIndex) => {
+        const state = segmentStateRecords.find((item) => item.index === episodeIndex);
+        return [String(episodeIndex), {
+          operationToken: state?.renderOperationToken,
+          sourceHash: state?.expectedSourceHash,
+          contractHash: state?.expectedContractHash || state?.contractHash,
+          resultHash: state?.resultHash,
+        }];
+      }));
+      const decision = reconcileDetachedRenderPack({
+        operation,
+        job,
+        manifestValidated: job.protocolVersion === 2
+          && job.status === "completed"
+          && job.resultAvailable === true
+          && Boolean(job.resultHash),
+        currentSegments,
+      });
+
+      if (decision.status === "waiting") return decision;
+      if (decision.status === "failed") {
+        replaceRenderOperationRecord(terminateRenderOperation(operation, {
+          state: "failed",
+          errorCode: decision.errorCode,
+        }));
+        for (const episodeIndex of operation.segmentIndexes) {
+          dispatchSegmentStateEvent(episodeIndex, {
+            type: "RENDER_OPERATION_FAILED",
+            operationToken: operation.operationToken,
+            errorCode: decision.errorCode,
+            message: "Render Pack 结果身份或最终清单无效，已停止自动处理。",
+          });
+        }
+        await writeBatchSegmentCache();
+        return decision;
+      }
+      if (decision.status === "ignored") {
+        replaceRenderOperationRecord(terminateRenderOperation(operation, {
+          state: "ignored",
+          reasonCode: decision.reasonCode,
+        }));
+        for (const episodeIndex of decision.segmentIndexes) {
+          dispatchSegmentStateEvent(episodeIndex, {
+            type: "RENDER_OPERATION_IGNORED",
+            operationToken: operation.operationToken,
+            reasonCode: decision.reasonCode,
+          });
+        }
+        await writeBatchSegmentCache();
+        return decision;
+      }
+      if (decision.status === "replay") {
+        if (operation.state !== "merged") {
+          replaceRenderOperationRecord(terminateRenderOperation(operation, {
+            state: "merged",
+            finalManifestHash: String(job.resultHash),
+            resultHashes: decision.resultHashes,
+          }));
+          await writeBatchSegmentCache();
+        }
+        return decision;
+      }
+
+      const pendingJudgeSegments: PendingCoverageJudgeSegment[] = [];
+      const packDurationMs = renderPackDurationMs(job);
+      const packCompletedAt = Date.now();
+      try {
+        const prepared = prepareRenderPackReconciliation({
+          operation,
+          eligibleSegmentIndexes: decision.segmentIndexes,
+          contexts: packEpisodes.map((episode) => ({ episodeIndex: episode.episodeIndex, episode })),
+          results: job.result?.segments || [],
+          prepareSegment: ({ segmentIndex: episodeIndex, context, result: rawSegment }) => {
+            const episode = context.episode;
+            const renderDuration = episode.input.duration || selectedDurationValue();
+            const episodeResult = normalizeBatchEpisodeResult(
+              script,
+              episodeIndex,
+              resolvedSegmentCount || episodes.length,
+              rawSegment.result,
+              renderDuration,
+            );
+            const evaluated = normalizePatchAndEvaluateBatchSegment(
+              script,
+              episodeIndex,
+              episodeResult,
+              renderDuration,
+              episode.input.segmentContract,
+              rawSegment.coverageSidecar,
+              undefined,
+              batchCoverageMode,
+            );
+            const outcome = routeBatchSegmentOutcome({
+              gate: evaluated.gate,
+              hasUsableResult: true,
+              coverageStage: batchCoverageStage,
+            });
+            if (outcome.action === "accept") {
+              legacyFatalCheck(episodeIndex, evaluated.result, evaluated.gate);
+            }
+            const judgeItem: PendingCoverageJudgeSegment = {
+              episode,
+              result: evaluated.result,
+              renderDuration,
+              renderStartedAt: packStartedAt,
+              renderCompletedAt: packCompletedAt,
+              packIndex,
+              packSize: packEpisodes.length,
+              sidecar: rawSegment.coverageSidecar,
+              localDecisions: evaluated.coverageDecisions,
+            };
+            return { episode, rawSegment, renderDuration, evaluated, outcome, judgeItem };
+          },
+        });
+
+        await applyPreparedRenderPackReconciliation(prepared, {
+          applySegment: ({ episode, rawSegment, renderDuration, evaluated, outcome, judgeItem }, episodeIndex) => {
+            dispatchSegmentStateEvent(episodeIndex, {
+              type: "RENDER_OPERATION_RECONCILED",
+              operationToken: operation.operationToken,
+              jobId: String(operation.jobId),
+              resultHash: rawSegment.resultHash!,
+              contractHash: episode.input.segmentContract?.contractHash,
+            });
+            if (outcome.action === "accept") {
+              storeRenderedEpisode(episode, evaluated.result, {
+                status: "cached",
+                renderStartedAt: packStartedAt,
+                renderCompletedAt: packCompletedAt,
+                durationMs: packDurationMs || Math.max(0, packCompletedAt - packStartedAt),
+                packIndex,
+                packSize: packEpisodes.length,
+                qualityGate: evaluated.gate,
+                patchDiffs: evaluated.patchDiffs,
+                coverageDecisions: evaluated.coverageDecisions,
+                coverageReceiptCount: rawSegment.coverageSidecar?.receipts.length || 0,
+                coverageDurationMs: evaluated.coverageDurationMs,
+              });
+              return;
+            }
+            if (outcome.action === "enqueue_judge" || outcome.action === "enqueue_judge_shadow") {
+              pendingJudgeSegments.push(judgeItem);
+              updateSegmentProgress(episodeIndex, "adjudicating", "本地无法确定事件覆盖，等待批量语义裁决");
+              return;
+            }
+            if (outcome.action === "needs_review") {
+              markCoverageNeedsReview(judgeItem, buildTargetedRepairReason(evaluated.gate));
+              return;
+            }
+            if (outcome.action === "regenerate_segment") {
+              const reason = summarizeQualityFindings(outcome.structuralFindings) || "结果结构不可用，需要补生成当前段";
+              queueSegmentRepair(episode, reason);
+              return;
+            }
+            const routeError = qualityErrorForRoute(
+              evaluated.gate,
+              outcome,
+              evaluated.result,
+              evaluated.coverageDecisions,
+            );
+            queueSegmentRepair(episode, routeError.message, {
+              result: evaluated.result,
+              validationError: routeError,
+              renderDuration,
+              renderStartedAt: packStartedAt,
+              packIndex,
+              packSize: packEpisodes.length,
+            });
+          },
+          finalize: async () => {
+            replaceRenderOperationRecord(terminateRenderOperation(operation, {
+              state: "merged",
+              finalManifestHash: String(job.resultHash),
+              resultHashes: decision.resultHashes,
+            }));
+            await runCoverageJudgeWave(pendingJudgeSegments, renderRound);
+            signalRepairScheduler();
+            queueReadySegmentSaves();
+            await writeBatchSegmentCache();
+          },
+        });
+        return decision;
+      } catch {
+        const detached = detachRenderOperation(operation, {
+          errorCode: "RENDER_RECONCILIATION_PREPARATION_FAILED",
+        });
+        replaceRenderOperationRecord(detached);
+        for (const episodeIndex of operation.segmentIndexes) {
+          dispatchSegmentStateEvent(episodeIndex, {
+            type: "RENDER_OPERATION_DETACHED",
+            operationToken: operation.operationToken,
+            jobId: String(operation.jobId),
+          });
+        }
+        await writeBatchSegmentCache();
+        return {
+          status: "failed" as const,
+          errorCode: "RENDER_RECONCILIATION_PREPARATION_FAILED",
+          retryable: true,
+        };
+      }
+    }
+
+    function observeDetachedRenderOperation(input: {
+      operation: RenderOperationRefV2;
+      packEpisodes: SeasonPackEpisodeResult[];
+      packStartedAt: number;
+      packIndex?: number;
+      renderRound: number;
+    }) {
+      const jobId = input.operation.jobId;
+      if (!jobId) return Promise.resolve();
+      return renderPackObserverRegistryRef.current.observe(jobId, async (signal) => {
+        const outcome = await observeRenderPackJob({
+          jobId,
+          mode: "background",
+          signal,
+          readJob: readVideoPromptPackCodexJob,
+          sleep: waitForRenderObservation,
+          isHidden: () => typeof document !== "undefined" && document.hidden,
+        });
+        if (outcome.status === "completed") {
+          await reconcileAndRouteRenderPackResult({ ...input, job: outcome.job });
+          return;
+        }
+        if (outcome.status === "terminal_failed") {
+          if (outcome.job) {
+            await reconcileAndRouteRenderPackResult({ ...input, job: outcome.job });
+            return;
+          }
+          const failed = terminateRenderOperation(input.operation, {
+            state: "failed",
+            errorCode: outcome.reasonCode,
+          });
+          replaceRenderOperationRecord(failed);
+          for (const episode of input.packEpisodes) {
+            dispatchSegmentStateEvent(episode.episodeIndex, {
+              type: "RENDER_OPERATION_FAILED",
+              operationToken: input.operation.operationToken,
+              errorCode: outcome.reasonCode,
+              message: "原 Render Pack 已确认不可读取，不会触发逐段补生成。",
+            });
+          }
+          await writeBatchSegmentCache();
+        }
+      });
+    }
+
+    async function renderPackedSegmentsWithQualityRepair(
+      renderPack: PreflightedRenderPack<SeasonPackEpisodeResult>,
+      allowSplitFallback = true,
+      packIndex?: number,
+      renderRound = 1,
+      contractRerouteGeneration = 0,
+    ) {
+      const packEntries = renderPack.entries.filter(
+        ({ item: episode }) => !renderedEpisodes[episode.episodeIndex - 1]
+          && !needsReviewEpisodes.has(episode.episodeIndex)
+          && !queuedRepairIndexes.has(episode.episodeIndex)
+          && segmentStateRecords.find((state) => state.index === episode.episodeIndex)?.generationStatus !== "contract_invalid",
+      );
+      const packEpisodes = packEntries.map((entry) => entry.item);
       if (!packEpisodes.length) return;
+      const effectiveRenderPack: PreflightedRenderPack<SeasonPackEpisodeResult> = {
+        ...renderPack,
+        entries: packEntries,
+      };
+      const renderOperations = new Map<number, RenderOperation>();
       const packLabel = packEpisodes.map((episode) => episode.episodeIndex).join(", ");
+
+      let durableRenderOperation = createRenderOperationDraftFromPreflightPack({
+        batchId: durableBatchId,
+        sourceHash: batchSourceHash,
+        pack: effectiveRenderPack,
+        reconciliationContext: {
+          sourceText: script,
+          segments: packEpisodes.map((episode) => ({
+            episodeIndex: episode.episodeIndex,
+            title: episode.input.title,
+            sourceText: episode.input.sourceText || script,
+            duration: episode.input.duration || selectedDurationValue(),
+            shotCount: episode.input.shotCount,
+            segmentContract: episode.input.segmentContract,
+          })),
+        },
+      });
+      const compiledBySegment = new Map(
+        (durableRenderOperation.creationContext?.segments || []).map((segment) => [segment.episodeIndex, segment]),
+      );
       const packSegments = packEpisodes.map((episode) => {
         const episodeInput = episode.input;
+        const compiled = compiledBySegment.get(episode.episodeIndex)?.compiledContract;
+        if (!compiled) throw new Error(`Segment ${episode.episodeIndex} is missing its persisted compiled Contract`);
         return {
           episodeIndex: episode.episodeIndex,
           title: episodeInput.title,
@@ -2208,18 +5324,58 @@ export function DashboardClient() {
           duration: episodeInput.duration || selectedDurationValue(),
           shotCount: episodeInput.shotCount,
           segmentContract: episodeInput.segmentContract,
+          compiledContract: compiled,
         };
       });
+      replaceRenderOperationRecord(durableRenderOperation);
 
       for (const episode of packEpisodes) {
+        const state = segmentStateRecords.find((item) => item.index === episode.episodeIndex);
+        if (state?.generationStatus !== "rendering" && state?.generationStatus !== "render_detached") {
+          dispatchSegmentStateEvent(episode.episodeIndex, {
+            type: "RENDER_OPERATION_CREATED",
+            operationToken: durableRenderOperation.operationToken,
+            expectedContractHash: episode.input.segmentContract?.contractHash,
+          });
+        }
         updateSegmentProgress(episode.episodeIndex, "running", `Render Pack 生成中：${packLabel}`);
+        renderOperations.set(
+          episode.episodeIndex,
+          beginRenderOperation(episode.episodeIndex, durableRenderOperation.operationToken),
+        );
       }
+      await writeBatchSegmentCache();
       publishBatchProgress("rendering", `正在本地并发生成 Render Pack：第 ${packLabel} 段...`);
       const packStartedAt = Date.now();
 
       try {
         async function runRenderPack(mode: RenderPackCodexMode) {
-          const packJob = await createVideoPromptPackCodexJob(packSegments, activeProjectId || undefined, mode);
+          const packJob = await createVideoPromptPackCodexJob(
+            packSegments,
+            activeProjectId || undefined,
+            mode,
+            batchEventFeatures.contractV2 && batchEventFeatures.coverageSidecar,
+            durableRenderOperation,
+          );
+          invocationLedger.record("renderPackCalls", {
+            count: 1,
+            fingerprint: `render:${durableRenderOperation.operationToken}:${packJob.id}`,
+          });
+          durableRenderOperation = attachRenderOperationJob(durableRenderOperation, {
+            jobId: packJob.id,
+            sourceHash: String(packJob.sourceHash || ""),
+            aggregateContractHash: packJob.aggregateContractHash || null,
+          });
+          replaceRenderOperationRecord(durableRenderOperation);
+          for (const episode of packEpisodes) {
+            dispatchSegmentStateEvent(episode.episodeIndex, {
+              type: "RENDER_OPERATION_OBSERVING",
+              operationToken: durableRenderOperation.operationToken,
+              jobId: packJob.id,
+              expectedSourceHash: String(packJob.sourceHash || ""),
+            });
+          }
+          await writeBatchSegmentCache();
           return pollVideoPromptPackCodexJob(packJob.id, packSegments.length);
         }
 
@@ -2227,8 +5383,75 @@ export function DashboardClient() {
         try {
           renderPackJob = await runRenderPack(STRICT_UTF8_RENDER_PACK_MODE);
         } catch (strictError) {
+          if (isContractPreflightCreateError(strictError)) {
+            const partition = partitionPreflightedRenderPackAfterRejection(effectiveRenderPack, {
+              affectedSegmentIndexes: Array.isArray(strictError.segmentIndexes)
+                ? strictError.segmentIndexes
+                : [],
+              errorCode: strictError.code,
+              rerouteGeneration: contractRerouteGeneration,
+            });
+            durableRenderOperation = terminateRenderOperation(durableRenderOperation, {
+              state: "failed",
+              errorCode: strictError.code,
+            });
+            replaceRenderOperationRecord(durableRenderOperation);
+            for (const episode of packEpisodes) {
+              finishRenderOperation(renderOperations.get(episode.episodeIndex));
+            }
+
+            if (partition.disposition === "fail_closed") {
+              for (const episode of packEpisodes) {
+                markContractPreflightInvalid(episode.episodeIndex, partition.reasonCode, strictError.message);
+              }
+              await writeBatchSegmentCache();
+              return;
+            }
+
+            for (const entry of partition.rejectedEntries) {
+              markContractPreflightInvalid(entry.item.episodeIndex, strictError.code, strictError.message);
+            }
+            for (const run of partition.retryRuns) {
+              for (const entry of run) {
+                dispatchSegmentStateEvent(entry.item.episodeIndex, {
+                  type: "RENDER_OPERATION_REQUEUED",
+                  operationToken: durableRenderOperation.operationToken,
+                });
+                updateSegmentProgress(entry.item.episodeIndex, "pending", "Contract 已重新验证，等待连续区间重新调度");
+              }
+            }
+            await writeBatchSegmentCache();
+
+            const retryPacks = partition.retryRuns.map((entries) => ({
+              ...effectiveRenderPack,
+              entries,
+              packSize: entries.length,
+            }));
+            await Promise.all(retryPacks.map((retryPack) => renderPackedSegmentsWithQualityRepair(
+              retryPack,
+              allowSplitFallback,
+              packIndex,
+              renderRound,
+              partition.nextGeneration,
+            )));
+            return;
+          }
           if (allowSplitFallback && packEpisodes.length > 1 && isRecoverableRenderPackError(strictError)) {
-            const splitRenderPacks = buildRenderPacks(packEpisodes, { forceProfile: "SINGLE" }).packs;
+            const splitSchedule = buildRenderPacks(packEntries, {
+              forceProfile: "SINGLE",
+              getSegment: (entry) => ({
+                sourceText: entry.item.input.sourceText,
+                shotCount: entry.item.input.shotCount,
+                segmentContract: entry.item.input.segmentContract,
+              }),
+            });
+            const splitRenderPacks = splitSchedule.packs.map((entries) => ({
+              ...effectiveRenderPack,
+              isolated: true,
+              profile: "SINGLE" as const,
+              packSize: 1,
+              entries,
+            }));
             const reason = strictError instanceof Error ? strictError.message : "Render Pack strict UTF-8 generation failed";
             publishBatchProgress(
               "repairing",
@@ -2246,69 +5469,239 @@ export function DashboardClient() {
           publishBatchProgress("rendering", `Render Pack ${packLabel} took ${minutes} minutes, marked as slow pack for diagnostics.`);
         }
 
-        const packResults = new Map(
-          (renderPackJob.result?.segments || []).map((segment) => [segment.episodeIndex, segment.result] as const),
-        );
+        await reconcileAndRouteRenderPackResult({
+          operation: durableRenderOperation,
+          job: renderPackJob,
+          packEpisodes,
+          packStartedAt,
+          packIndex,
+          renderRound,
+        });
+        for (const renderOperation of renderOperations.values()) finishRenderOperation(renderOperation);
+        return;
 
-        for (const episode of packEpisodes) {
-          const episodeIndex = episode.episodeIndex;
-          const episodeInput = episode.input;
-          const renderDuration = episodeInput.duration || selectedDurationValue();
-          const rawResult = packResults.get(episodeIndex);
-          if (!rawResult) {
-            queueSegmentRepair(episode, "Render Pack 缺少本段结果，转为单段修复");
-            continue;
-          }
-          const episodeResult = normalizeBatchEpisodeResult(script, episodeIndex, resolvedSegmentCount || episodes.length, rawResult, renderDuration);
-          try {
-            const validated = normalizePatchAndValidateBatchSegment(script, episodeIndex, episodeResult, renderDuration, episodeInput.segmentContract);
-            storeRenderedEpisode(episode, validated.result, {
-              status: "cached",
-              renderStartedAt: packStartedAt,
-              renderCompletedAt: packCompletedAt,
-              durationMs: packDurationMs || Math.max(0, packCompletedAt - packStartedAt),
-              packIndex,
-              packSize: packEpisodes.length,
-            });
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : "Render Pack 结果未通过单段质量校验";
-            publishBatchProgress("repairing", `第 ${episodeIndex} / ${resolvedSegmentCount} 段 Render Pack 未过质量闸，正在单段重修：${reason}`);
-            queueSegmentRepair(episode, reason);
-          }
-        }
       } catch (error) {
-        const reason = error instanceof Error ? error.message : "Render Pack 生成失败";
-        publishBatchProgress("repairing", `Render Pack 第 ${packLabel} 段失败，正在逐段降级修复：${reason}`);
-        for (const episode of packEpisodes) {
-          queueSegmentRepair(episode, reason);
+        if (isRenderPackPollingInfrastructureError(error)) {
+          durableRenderOperation = detachRenderOperation(durableRenderOperation, {
+            errorCode: "RENDER_PACK_ATTENTION_TIMEOUT",
+          });
+          replaceRenderOperationRecord(durableRenderOperation);
+          for (const episode of packEpisodes) {
+            dispatchSegmentStateEvent(episode.episodeIndex, {
+              type: "RENDER_OPERATION_DETACHED",
+              operationToken: durableRenderOperation.operationToken,
+              jobId: error.jobId,
+            });
+            finishRenderOperation(renderOperations.get(episode.episodeIndex));
+          }
+          await writeBatchSegmentCache();
+          if (BATCH_RENDER_LATE_RECONCILIATION_ENABLED) {
+            void observeDetachedRenderOperation({
+              operation: durableRenderOperation,
+              packEpisodes,
+              packStartedAt,
+              packIndex,
+              renderRound,
+            });
+          }
+          publishBatchProgress(
+            "rendering",
+            `Render Pack 第 ${packLabel} 段状态暂不可读，原任务 ${error.jobId} 已保留，不会创建逐段补生成任务。`,
+          );
+          return;
         }
+        const reason = error instanceof Error ? error.message : "Render Pack 生成失败";
+        if (CODEX_QUOTA_ERROR_PATTERN.test(String(reason))) {
+          pauseBatchForCodexQuota(packEpisodes.map((episode) => episode.episodeIndex), error);
+          return;
+        }
+        for (const episode of packEpisodes) {
+          const renderOperation = renderOperations.get(episode.episodeIndex);
+          if (!isCurrentRenderOperation(renderOperation)) continue;
+          dispatchSegmentStateEvent(episode.episodeIndex, {
+            type: "RENDER_OPERATION_FAILED",
+            operationToken: durableRenderOperation.operationToken,
+            errorCode: "RENDER_PACK_FAILED",
+            message: reason,
+          });
+          finishRenderOperation(renderOperation);
+        }
+        throw error;
       }
-      await runSegmentRepairPool();
     }
 
-    restoreCachedRenderedSegments();
+    await restoreCachedRenderedSegments();
 
-    const renderSchedule = buildRenderPacks(episodes);
+    const pendingContractEpisodes = episodes.filter((episode) => {
+      const state = segmentStateRecords.find((candidate) => candidate.index === episode.episodeIndex);
+      return !renderedEpisodes[episode.episodeIndex - 1]
+        && !needsReviewEpisodes.has(episode.episodeIndex)
+        && !queuedRepairIndexes.has(episode.episodeIndex)
+        && (!state || ["pending", "preparing_input"].includes(state.generationStatus));
+    });
+    for (const episode of pendingContractEpisodes) {
+      const state = segmentStateRecords.find((candidate) => candidate.index === episode.episodeIndex);
+      if (state?.generationStatus === "pending") {
+        dispatchSegmentStateEvent(episode.episodeIndex, { type: "CONTRACT_PREFLIGHT_STARTED" });
+      }
+    }
+    publishBatchProgress("validating", "正在本地准备并校验每段 Contract 输入...");
+
+    const contractPreflightOptions = {
+      getSegmentIndex: (episode: SeasonPackEpisodeResult) => episode.episodeIndex,
+      getSourceText: (episode: SeasonPackEpisodeResult) => episode.input.sourceText,
+      getContract: (episode: SeasonPackEpisodeResult) => episode.input.segmentContract as SegmentContract,
+      getScheduleSegment: (entry: { item: SeasonPackEpisodeResult }) => ({
+        sourceText: entry.item.input.sourceText,
+        shotCount: entry.item.input.shotCount,
+        segmentContract: entry.item.input.segmentContract,
+      }),
+    };
+    const preflightMetricFingerprint = `${durableBatchId}:${batchContractHash}`;
+    const recordPreflightMetric = (
+      name: "contractPreflightAttempts" | "contractPreflightCompacted" | "contractPreflightIsolated" | "contractPreflightInvalid",
+      count: number,
+    ) => {
+      if (count <= 0) return;
+      invocationLedger.record(name, {
+        count,
+        fingerprint: `preflight:${preflightMetricFingerprint}:${name}`,
+      });
+    };
+
+    const contractPreflightPlan = batchEventFeatures.contractPreflightV2
+      ? preflightSegmentContracts(pendingContractEpisodes, contractPreflightOptions)
+      : {
+          eligibleRuns: [],
+          isolated: [],
+          invalid: [],
+          metrics: {
+            attempts: pendingContractEpisodes.length,
+            ready: 0,
+            compacted: 0,
+            isolated: 0,
+            invalid: pendingContractEpisodes.length,
+            overflow: 0,
+          },
+        };
+    const preflightSchedule = buildPreflightedRenderPacks(contractPreflightPlan, contractPreflightOptions);
+    recordPreflightMetric("contractPreflightAttempts", contractPreflightPlan.metrics.attempts);
+    recordPreflightMetric("contractPreflightCompacted", contractPreflightPlan.metrics.compacted);
+    recordPreflightMetric("contractPreflightIsolated", contractPreflightPlan.metrics.isolated);
+    recordPreflightMetric("contractPreflightInvalid", contractPreflightPlan.metrics.invalid);
+
+    if (batchEventFeatures.contractPreflightV2) {
+      for (const entry of [...contractPreflightPlan.eligibleRuns.flat(), ...contractPreflightPlan.isolated]) {
+        dispatchSegmentStateEvent(entry.item.episodeIndex, { type: "CONTRACT_PREFLIGHT_READY" });
+      }
+      for (const entry of contractPreflightPlan.invalid) {
+        markContractPreflightInvalid(
+          entry.item.episodeIndex,
+          entry.preflight.reasonCode,
+          `第 ${entry.item.episodeIndex} 段 Contract 输入需要检查：${entry.preflight.reasonCode}`,
+        );
+      }
+    } else {
+      for (const episode of pendingContractEpisodes) {
+        markContractPreflightInvalid(
+          episode.episodeIndex,
+          "CONTRACT_PREFLIGHT_V2_CREATE_PAUSED",
+          "Contract Preflight V2 已暂停，新 Render 创建已安全停止；不会回退旧生成链路。",
+        );
+      }
+    }
+    await writeBatchSegmentCache();
+
+    const renderSchedule = {
+      ...preflightSchedule,
+      profile: batchEventFeatures.contractPreflightV2
+        ? Array.from(new Set(preflightSchedule.packs.map((pack) => pack.profile))).join("+") || "NO_RENDER"
+        : "CONTRACT_PREFLIGHT_PAUSED",
+    };
+    renderPhaseStartedAtMs = Date.now();
     activeRenderScheduleProfile = renderSchedule.profile;
     const renderPacks = renderSchedule.packs;
     let nextPackToRender = 0;
     const renderPackConcurrency = Math.min(renderSchedule.concurrency, renderPacks.length);
-    const renderPackShape = renderPacks.map((pack) => pack.length).join("/");
+    const renderPackShape = renderPacks.map((pack) => pack.entries.length).join("/");
     publishBatchProgress(
       "rendering",
       `调度策略：${renderSchedule.profile}，${renderPackConcurrency} 包并发，分包 ${renderPackShape}。`,
     );
 
     async function renderNextPack() {
-      while (nextPackToRender < renderPacks.length) {
+      while (!batchQuotaPaused && nextPackToRender < renderPacks.length) {
         const packIndex = nextPackToRender;
         nextPackToRender += 1;
-        await renderPackedSegmentsWithQualityRepair(renderPacks[packIndex], true, packIndex + 1);
+        const renderRound = Math.floor(packIndex / Math.max(1, renderPackConcurrency)) + 1;
+        await renderPackedSegmentsWithQualityRepair(renderPacks[packIndex], true, packIndex + 1, renderRound);
       }
     }
 
-    await Promise.all(Array.from({ length: renderPackConcurrency }, () => renderNextPack()));
+    await Promise.allSettled(Array.from({ length: renderPackConcurrency }, () => renderNextPack()));
+    renderPhaseFinishedAtMs = Date.now();
     await runSegmentRepairPool();
+    if (repairFirstQueuedAtMs) repairFinishedAtMs = Date.now();
+
+    if (batchQuotaPaused) {
+      writeBatchSegmentCache();
+      await batchCachePersistChain;
+      publishBatchProgress(
+        "quota_paused",
+        `${batchQuotaPauseMessage || CODEX_QUOTA_EXHAUSTED_DISPLAY_MESSAGE} 已生成结果和缓存均已保留。`,
+      );
+      setBatchGenerating(false);
+      return;
+    }
+
+    const contractInvalidStates = segmentStateRecords.filter((state) => state.generationStatus === "contract_invalid");
+    if (contractInvalidStates.length > 0) {
+      queueReadySegmentSaves();
+      await drainBatchSaveController();
+      await writeBatchSegmentCache();
+      await batchCachePersistChain;
+      const invalidIndexes = contractInvalidStates.map((state) => state.index).join("、");
+      const contractReviewMessage = `第 ${invalidIndexes} 段 Contract 输入需要检查；其他有效段已继续生成并缓存，不会触发视频提示词修复。`;
+      setError(contractReviewMessage);
+      publishBatchProgress("failed", contractReviewMessage);
+      setBatchGenerating(false);
+      return;
+    }
+
+    const finalNeedsReviewCount = segmentStateRecords.filter((state) => (
+      state.qualityStatus === "needs_review" || state.saveStatus === "review_saved"
+    )).length;
+    if (finalNeedsReviewCount) {
+      queueReadySegmentSaves();
+      await drainBatchSaveController();
+      await batchCachePersistChain;
+      const reviewSaveError = saveError as Error | null;
+      if (reviewSaveError) {
+        publishBatchProgress("saving", `${reviewSaveError.message} 已保留全部缓存；下次恢复只会继续保存。`);
+        setBatchGenerating(false);
+        return;
+      }
+      const unsavedReviewSegmentStates = segmentStateRecords.filter((state) => (
+        state.saveStatus !== "saved" && state.saveStatus !== "review_saved"
+      ));
+      if (unsavedReviewSegmentStates.length > 0) {
+        writeBatchSegmentCache();
+        await batchCachePersistChain;
+        publishBatchProgress(
+          "saving",
+          `仍有 ${unsavedReviewSegmentStates.length} 段待检查结果尚未落库，已保留缓存；不会重新生成。`,
+        );
+        setBatchGenerating(false);
+        return;
+      }
+      publishBatchProgress(
+        "needs_review",
+        `${finalNeedsReviewCount} 段事件证据仍不确定，首次结果已按原样保存为待检查草稿；其余合格段已保存。`,
+      );
+      clearBatchRecoveryState();
+      setBatchGenerating(false);
+      return;
+    }
 
     for (const rendered of renderedEpisodes) {
       if (!rendered) {
@@ -2316,8 +5709,19 @@ export function DashboardClient() {
       }
     }
     queueReadySegmentSaves();
-    await saveChain;
-    if (saveError) throw saveError;
+    await drainBatchSaveController();
+    await batchCachePersistChain;
+    const finalSaveError = saveError as Error | null;
+    if (finalSaveError) {
+      publishBatchProgress("saving", `${finalSaveError.message} 已保留全部缓存；下次恢复只会继续保存。`);
+      setBatchGenerating(false);
+      return;
+    }
+
+    const finalBatchCacheWriteError = batchCacheWriteError as Error | null;
+    if (finalBatchCacheWriteError) {
+      setGenerationProgress(`分段已保存，但服务端恢复缓存写入失败：${finalBatchCacheWriteError.message}`);
+    }
 
     if (latestSaveRef.current?.versionId) {
       setResumeVersionId(latestSaveRef.current.versionId);
@@ -2325,6 +5729,7 @@ export function DashboardClient() {
       setCreatingNewEpisode(false);
     }
     publishBatchProgress("completed", `已生成 ${completed.length} 段，并按顺序保存到同一个项目。`);
+    clearBatchRecoveryState();
   }
 
   async function handlePromptFileUpload(event: ChangeEvent<HTMLInputElement>) {
@@ -2833,12 +6238,12 @@ export function DashboardClient() {
               <span className="ml-auto text-xs text-slate-500">{script.length}/50000</span>
               <button
                 onClick={analyze}
-                disabled={loading || uploadingText || batchGenerating}
+                disabled={loading || uploadingText || batchGenerating || batchRecoveryChecking}
                 className="prompt-send-button"
-                aria-label={loading ? "正在生成" : "生成视频提示词"}
-                title={loading ? "正在生成" : "生成视频提示词"}
+                aria-label={batchRecoveryChecking ? "正在检查待保存结果" : loading ? "正在生成" : "生成视频提示词"}
+                title={batchRecoveryChecking ? "正在检查待保存结果" : loading ? "正在生成" : "生成视频提示词"}
               >
-                {loading || batchGenerating ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send className="h-5 w-5" />}
+                {loading || batchGenerating || batchRecoveryChecking ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send className="h-5 w-5" />}
               </button>
             </div>
           </div>
@@ -2848,6 +6253,19 @@ export function DashboardClient() {
           <div className="mt-4 flex w-full max-w-5xl items-center gap-3 rounded-xl border border-violet-300/18 bg-violet-500/10 px-4 py-3 text-sm text-violet-50">
             {(uploadingText || loading || batchGenerating) && <Loader2 className="h-4 w-4 animate-spin" />}
             <span>{generationProgress || "正在生成..."}</span>
+          </div>
+        )}
+        {batchSaveRecovery && !batchGenerating && (
+          <div className="mt-4 flex w-full max-w-5xl items-center justify-between gap-3 rounded-xl border border-amber-300/20 bg-amber-300/8 px-4 py-3 text-sm text-amber-50">
+            <span>检测到已生成但尚未全部保存的分段结果。</span>
+            <button
+              type="button"
+              onClick={() => void resumeCachedBatchSavesOnly(batchSaveRecovery)}
+              className="inline-flex items-center gap-2 rounded-lg border border-amber-200/25 bg-amber-200/12 px-3 py-2 text-xs font-semibold transition hover:bg-amber-200/20"
+            >
+              <FileText className="h-4 w-4" />
+              继续保存已缓存段
+            </button>
           </div>
         )}
         {batchProgress && (
@@ -2862,11 +6280,13 @@ export function DashboardClient() {
                 {batchProgress.resolvedSegmentCount ? ` · 已识别 ${batchProgress.resolvedSegmentCount} 段` : ""}
               </div>
             </div>
-            <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-6">
+            <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-8">
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">已保存 {batchProgress.savedCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">已缓存 {batchProgress.cachedCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">生成中 {batchProgress.runningCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">修复 {batchProgress.repairingCount}</span>
+              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">裁决 {batchProgress.adjudicatingCount}</span>
+              <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">待检查 {batchProgress.needsReviewCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">保存 {batchProgress.savingCount}</span>
               <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">等待 {batchProgress.pendingCount}</span>
             </div>
@@ -2876,7 +6296,7 @@ export function DashboardClient() {
               </div>
             )}
             {batchProgress.qualityReportSummary && batchProgress.qualityReportSummary.totalReports > 0 && (
-              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-4">
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-4 xl:grid-cols-8">
                 <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
                   质量均分 {batchProgress.qualityReportSummary.averageQualityScore}
                 </span>
@@ -2884,11 +6304,60 @@ export function DashboardClient() {
                   建议检查 {batchProgress.qualityReportSummary.suggestedReviewCount}
                 </span>
                 <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  阻断 {batchProgress.qualityReportSummary.blockingCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  可本地修 {batchProgress.qualityReportSummary.patchableCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  提醒 {batchProgress.qualityReportSummary.warningCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  风险 {batchProgress.qualityReportSummary.riskCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  本地 patch {batchProgress.qualityReportSummary.localPatchCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  Codex 修复 {batchProgress.qualityReportSummary.codexRepairCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  语义裁决 {batchProgress.qualityReportSummary.judgeInvocationCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  事件 patch {batchProgress.qualityReportSummary.eventPatchCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
+                  待人工检查 {batchProgress.qualityReportSummary.needsReviewCount}
+                </span>
+                <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
                   最高风险 {formatBatchSafetyRisk(batchProgress.qualityReportSummary.highestSafetyRisk)}
                 </span>
                 <span className="rounded-lg border border-cyan-300/15 bg-cyan-300/[0.06] px-2.5 py-1">
                   最慢段 {batchProgress.qualityReportSummary.slowestSegmentIndex ? `第 ${batchProgress.qualityReportSummary.slowestSegmentIndex} 段 ${formatBatchDurationMs(batchProgress.qualityReportSummary.slowestDurationMs)}` : "暂无"}
                 </span>
+              </div>
+            )}
+            {batchProgress.invocationMetrics && (
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300 md:grid-cols-3 xl:grid-cols-10">
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Render 调用 {batchProgress.invocationMetrics.renderPackCalls}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">单段补生成 {batchProgress.invocationMetrics.singleRegenerationCalls}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">路径任务 {batchProgress.invocationMetrics.pathPatchJobCreated}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">路径完成 {batchProgress.invocationMetrics.pathPatchCompleted}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Judge 调用 {batchProgress.invocationMetrics.judgeCalls}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">本地操作 {batchProgress.invocationMetrics.localPatchOperations}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Contract 预检 {batchProgress.invocationMetrics.contractPreflightAttempts}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Contract 压缩 {batchProgress.invocationMetrics.contractPreflightCompacted}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Contract 隔离 {batchProgress.invocationMetrics.contractPreflightIsolated}</span>
+                <span className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1">Contract 待检查 {batchProgress.invocationMetrics.contractPreflightInvalid}</span>
+              </div>
+            )}
+            {batchProgress.timingMetrics && (
+              <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-400">
+                <span>渲染墙钟 {formatBatchDurationMs(batchProgress.timingMetrics.renderWallMs)}</span>
+                <span>修复等待 {formatBatchDurationMs(batchProgress.timingMetrics.repairWaitMs)}</span>
+                <span>保存耗时 {formatBatchDurationMs(batchProgress.timingMetrics.saveMs)}</span>
+                <span>关键路径 {formatBatchDurationMs(batchProgress.timingMetrics.criticalPathMs)}</span>
               </div>
             )}
             {batchProgress.segments.length > 0 && (
@@ -2900,11 +6369,11 @@ export function DashboardClient() {
                     className={`rounded-lg border px-2.5 py-1 text-xs ${
                       segment.status === "saved" || segment.status === "completed"
                         ? "border-emerald-300/20 bg-emerald-300/10 text-emerald-50"
-                        : segment.status === "running" || segment.status === "saving"
+                        : segment.status === "running" || segment.status === "saving" || segment.status === "validating" || segment.status === "adjudicating"
                           ? "border-cyan-300/20 bg-cyan-300/10 text-cyan-50"
-                          : segment.status === "repairing"
+                          : segment.status === "repairing" || segment.status === "patching"
                             ? "border-amber-300/20 bg-amber-300/10 text-amber-50"
-                            : segment.status === "failed"
+                            : segment.status === "failed" || segment.status === "needs_review" || segment.status === "review_saved" || segment.status === "quota_paused"
                               ? "border-red-300/20 bg-red-300/10 text-red-50"
                               : "border-white/10 bg-white/[0.03] text-slate-400"
                     }`}

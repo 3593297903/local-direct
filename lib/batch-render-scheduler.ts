@@ -23,10 +23,10 @@ type BuildRenderPackOptions<T> = {
 };
 
 const profileSettings: Record<RenderScheduleProfile, { concurrency: number; packSize: number }> = {
-  FAST: { concurrency: 8, packSize: 5 },
-  BALANCED: { concurrency: 8, packSize: 4 },
-  STRICT: { concurrency: 8, packSize: 3 },
-  SINGLE: { concurrency: 8, packSize: 1 },
+  FAST: { concurrency: 4, packSize: 5 },
+  BALANCED: { concurrency: 4, packSize: 4 },
+  STRICT: { concurrency: 4, packSize: 3 },
+  SINGLE: { concurrency: 4, packSize: 1 },
 };
 
 const sensitivePattern =

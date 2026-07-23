@@ -3,6 +3,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { appendCapturedOutput, buildCodexFailureMessage } from "./codex-runtime-utils.mjs";
+import { withCodexCliSlot } from "./codex-cli-slot-coordinator.mjs";
+import { startCodexWorkerRuntimeHealth } from "./codex-runtime-health.mjs";
+import { acquireWorkerFleetLock } from "./worker-singleton-lock.mjs";
 
 const rootDir = process.cwd();
 const apiBaseUrl = (process.env.PROMPT_SAFETY_CODEX_API_BASE_URL || "http://localhost:3100").replace(/\/+$/, "");
@@ -11,6 +14,13 @@ const idleLogMs = positiveInteger(process.env.PROMPT_SAFETY_CODEX_IDLE_LOG_MS, 3
 const taskTimeoutMs = positiveInteger(process.env.PROMPT_SAFETY_CODEX_TASK_TIMEOUT_MS, 20 * 60_000);
 const workerToken = process.env.PROMPT_SAFETY_CODEX_WORKER_TOKEN || "";
 const messageDir = path.join(rootDir, ".tmp-prompt-safety-codex", "codex-messages");
+const workerLock = await acquireWorkerFleetLock("prompt-safety-worker", { rootDir });
+if (!workerLock.acquired) {
+  console.log(`Prompt safety worker is already running (pid=${workerLock.owner?.pid || "unknown"}).`);
+  process.exit(0);
+}
+const runtimeHealth = await startCodexWorkerRuntimeHealth("prompt-safety", { rootDir });
+installWorkerShutdown(workerLock);
 
 console.log("Local Director prompt safety Codex worker started.");
 console.log(`API: ${apiBaseUrl}`);
@@ -21,6 +31,7 @@ let lastIdleLogAt = 0;
 
 while (true) {
   try {
+    runtimeHealth.assertHealthy();
     const task = await claimTask();
     if (!task) {
       logIdle();
@@ -38,7 +49,7 @@ while (true) {
 async function processTask(task) {
   console.log(`Claimed prompt safety job ${task.id}.`);
   try {
-    await runCodex(task);
+    await withCodexCliSlot("safety_rewrite", task.id, () => runCodex(task));
     await assertOutputJson(task.outputPath);
     await completeTask(task);
     console.log(`Completed prompt safety job ${task.id}: ${task.outputPath}`);
@@ -232,4 +243,16 @@ function delay(ms) {
 
 function safeFileName(value) {
   return path.basename(String(value || "").replace(/[\\/:*?"<>|]+/g, "-"));
+}
+
+function installWorkerShutdown(lock) {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await lock.release().catch(() => undefined);
+    process.exit(0);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
 }

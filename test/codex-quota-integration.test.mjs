@@ -59,7 +59,11 @@ test("Codex job APIs reject or pause work when the global Codex quota circuit is
     const source = readFileSync(route, "utf8");
     assert.match(source, /getCodexRuntimeState/, `${route} should check global Codex runtime state while polling`);
     assert.match(source, /codexUnavailable/, `${route} should tell the UI that Codex is unavailable`);
-    assert.match(source, /fail.*Codex.*Job/, `${route} should fail stale pending work instead of letting the UI time out`);
+    if (route.includes("video-prompt-packs")) {
+      assert.doesNotMatch(source, /failVideoPromptPackCodexJob/, `${route} must preserve leased or pending work for recovery`);
+    } else {
+      assert.match(source, /fail.*Codex.*Job/, `${route} should fail stale pending work instead of letting the UI time out`);
+    }
   }
 
   for (const route of codexFailRoutes) {
@@ -82,6 +86,14 @@ test("Codex workers capture CLI output and normalize quota failures", async () =
   );
   assert.match(contractEchoMessage, /Codex returned task prompt or SegmentContract text/);
   assert.doesNotMatch(contractEchoMessage, /forbiddenFutureEvents/);
+
+  const versionMessage = helper.buildCodexFailureMessage(
+    "codex exec exited with code 1",
+    `${"SEGMENT CONTRACT task prompt ".repeat(80)}The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.`,
+  );
+  assert.match(versionMessage, /CODEX_CLI_VERSION_UNSUPPORTED/);
+  assert.match(versionMessage, /Codex CLI 版本过旧/);
+  assert.doesNotMatch(versionMessage, /task prompt or SegmentContract/);
 
   for (const worker of codexWorkers) {
     const source = readFileSync(worker, "utf8");

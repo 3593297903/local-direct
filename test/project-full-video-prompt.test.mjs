@@ -21,7 +21,7 @@ test("project versions persist the exact rendered full video prompt", () => {
   assert.match(dashboard, /saveAnalysisProject\(script, singleResult, fullVideoPrompt\)/);
   assert.match(dashboard, /const episodeResult = normalizeBatchEpisodeResult/);
   assert.match(dashboard, /const fullVideoPrompt = buildVideoGenerationPromptText\(episodeResult\)/);
-  assert.match(dashboard, /saveAnalysisProject\(episodeScript, episodeResult, fullVideoPrompt, activeProjectId \|\| undefined, undefined\)/);
+  assert.match(dashboard, /saveAnalysisProject\(\s*episodeScript,\s*episodeResult,\s*fullVideoPrompt,\s*activeProjectId \|\| undefined,\s*undefined,\s*`\$\{durableBatchId\}:\$\{episodeIndex\}`/s);
   assert.doesNotMatch(dashboard, /save:\s*true/);
 
   assert.match(projects, /fullVideoPrompt\?: string \| null/);

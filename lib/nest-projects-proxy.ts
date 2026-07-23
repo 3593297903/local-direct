@@ -1,10 +1,16 @@
+import { randomUUID } from "node:crypto";
 import { unlink } from "node:fs/promises";
 import path from "node:path";
 import { NextRequest, NextResponse } from "next/server";
 import { NEST_AUTH_TOKEN_COOKIE } from "@/lib/nest-auth-proxy";
+import {
+  isProjectSaveErrorCode,
+  type ProjectSaveFailure,
+} from "@/lib/project-save-contract";
 import type { AnalysisResult, StoryboardShot } from "@/types";
 
 type ProjectCreatePayload = Record<string, unknown> & {
+  idempotencyKey: string | undefined;
   projectId: string | undefined;
   versionId: string | undefined;
   title: string | undefined;
@@ -50,17 +56,73 @@ type NestResponse = Record<string, unknown> & {
   data: NestResponseData | undefined;
   error: string | undefined;
   message: string | string[] | undefined;
+  code: string | undefined;
+  errorCode: string | undefined;
+  retryable: boolean | undefined;
+  requestId: string | undefined;
 };
 
 const NARRATIVE_STATE_FIELDS = ["stateVector", "openLoops", "narrativeMemory", "qualityCheck"];
+const PROJECT_SAVE_PUBLIC_MESSAGES = {
+  PROJECT_LOCK_BUSY: "项目保存队列正忙，请使用同一请求稍后重试。",
+  PROJECT_API_UNAVAILABLE: "项目保存服务暂时不可用，请稍后重试。",
+  PROJECT_VALIDATION_FAILED: "项目保存内容未通过校验，请检查后重试。",
+  PROJECT_DB_SAVE_FAILED: "项目暂时无法保存，请稍后使用同一请求重试。",
+  PROJECT_VERSION_CONFLICT: "项目版本在保存期间发生变化，请使用同一请求重试。",
+} as const;
 
 function getNestApiBaseUrl() {
-  return (process.env.NEST_API_BASE_URL || "http://localhost:4000/api").replace(/\/+$/, "");
+  return (process.env.NEST_API_BASE_URL || "http://localhost:4100/api").replace(/\/+$/, "");
 }
 
 function formatUpstreamError(payload: NestResponse | null, fallback: string) {
   const message = payload ? payload.message || payload.error || fallback : fallback;
   return Array.isArray(message) ? message.join("; ") : message;
+}
+
+export function mapProjectSaveFailure(
+  payload: NestResponse | null,
+  status: number,
+  fallback = "Project save failed",
+): ProjectSaveFailure {
+  const errorCodeValue = payload?.errorCode || payload?.code;
+  const errorCode = isProjectSaveErrorCode(errorCodeValue)
+    ? errorCodeValue
+    : status === 400
+      ? "PROJECT_VALIDATION_FAILED"
+      : status === 409
+        ? "PROJECT_VERSION_CONFLICT"
+        : status === 423
+          ? "PROJECT_LOCK_BUSY"
+          : status >= 500
+            ? "PROJECT_DB_SAVE_FAILED"
+            : "PROJECT_API_UNAVAILABLE";
+  const retryable = typeof payload?.retryable === "boolean"
+    ? payload.retryable
+    : errorCode === "PROJECT_LOCK_BUSY" ||
+      errorCode === "PROJECT_API_UNAVAILABLE" ||
+      errorCode === "PROJECT_DB_SAVE_FAILED" ||
+      errorCode === "PROJECT_VERSION_CONFLICT";
+
+  return {
+    saved: false,
+    errorCode,
+    message: PROJECT_SAVE_PUBLIC_MESSAGES[errorCode] || fallback,
+    retryable,
+    requestId: typeof payload?.requestId === "string" && payload.requestId.trim()
+      ? payload.requestId
+      : randomUUID(),
+  };
+}
+
+function projectApiUnavailableFailure(_error: unknown): ProjectSaveFailure {
+  return {
+    saved: false,
+    errorCode: "PROJECT_API_UNAVAILABLE",
+    message: PROJECT_SAVE_PUBLIC_MESSAGES.PROJECT_API_UNAVAILABLE,
+    retryable: true,
+    requestId: randomUUID(),
+  };
 }
 
 async function readJson(response: Response): Promise<NestResponse | null> {
@@ -417,6 +479,7 @@ export function mapAnalysisResultToNestProjectBody(input: Record<string, unknown
   const memory = deriveProjectMemoryFromAnalysis(payload.originalScript, payload.result);
 
   return {
+    idempotencyKey: payload.idempotencyKey,
     projectId: payload.projectId,
     versionId: payload.versionId,
     title: deriveProjectSaveTitle(payload),
@@ -608,11 +671,19 @@ export async function proxyNestProjectsPost(request: NextRequest) {
   if (!token) return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
 
   const body = mapAnalysisResultToNestProjectBody((await request.json()) as Record<string, unknown>);
-  const { upstream, payload } = await postProjectToNestWithCompatibility(token, body);
+  let response: Awaited<ReturnType<typeof postProjectToNestWithCompatibility>>;
+  try {
+    response = await postProjectToNestWithCompatibility(token, body);
+  } catch (error) {
+    const failure = projectApiUnavailableFailure(error);
+    return NextResponse.json({ ok: false, error: failure.message, ...failure }, { status: 503 });
+  }
+  const { upstream, payload } = response;
 
   if (!upstream.ok || !payload || !payload.ok) {
+    const failure = mapProjectSaveFailure(payload, upstream.status || 502);
     return NextResponse.json(
-      { ok: false, error: formatUpstreamError(payload, "Project save failed") },
+      { ok: false, error: failure.message, ...failure },
       { status: upstream.status || 502 },
     );
   }
@@ -631,12 +702,20 @@ export async function saveAnalysisProjectToNest(
   if (!token) return { saved: false, reason: "Unauthorized" };
 
   const body = mapAnalysisResultToNestProjectBody({ projectId, versionId, originalScript, result });
-  const { upstream, payload } = await postProjectToNestWithCompatibility(token, body);
+  let response: Awaited<ReturnType<typeof postProjectToNestWithCompatibility>>;
+  try {
+    response = await postProjectToNestWithCompatibility(token, body);
+  } catch (error) {
+    const failure = projectApiUnavailableFailure(error);
+    return { ...failure, reason: failure.message };
+  }
+  const { upstream, payload } = response;
 
   if (!upstream.ok || !payload || !payload.ok) {
+    const failure = mapProjectSaveFailure(payload, upstream.status || 502);
     return {
-      saved: false,
-      reason: formatUpstreamError(payload, "Project save failed"),
+      ...failure,
+      reason: failure.message,
     };
   }
 

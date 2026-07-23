@@ -11,7 +11,9 @@ require("ts-node/register/transpile-only");
 
 const {
   applyDeterministicQualityPatch,
+  applyDeterministicQualityPatchWithDiff,
   evaluateBatchSegmentQuality,
+  selectDeterministicQualityPatchFindings,
   shouldRepairWithCodex,
 } = require("../lib/batch-segment-quality-gate.ts");
 
@@ -57,6 +59,55 @@ function baseResult(overrides = {}) {
     ...overrides,
   };
 }
+
+test("rich storyboard can pass without leaf patches while canonical workflow fields start empty", () => {
+  const shots = Array.from({ length: 4 }, (_, offset) => {
+    const shotNumber = offset + 1;
+    return {
+      ...baseResult().storyboard[0],
+      shotNumber,
+      timeRange: `${offset * 3}s-${(offset + 1) * 3}s`,
+      scene: `调查室证据墙前第${shotNumber}处机位`,
+      visual: `调查员沿证据墙逐项核对第${shotNumber}组聊天记录，手指停在对应时间标记旁，旁侧人物保持克制反应。`,
+      composition: `证据墙占据画面右侧三分之二，调查员侧身位于左侧前景，线索标记形成清楚的视线方向。`,
+      cameraMovement: `摄影机从桌边稳定横移到第${shotNumber}组证据，再缓慢推进人物确认线索的手部动作。`,
+      lighting: `冷白屏幕光与室内顶灯共同勾勒人物轮廓，证据文字区域保持清晰但不过曝。`,
+      sound: `纸张翻动声、键盘轻响和压低的交谈声依次出现，环境底噪保持真实克制。`,
+      dialogue: "调查员低声确认：时间与记录能够对应。",
+      emotion: "克制而持续升高的调查压力",
+      transition: "以人物转身动作匹配切入下一组证据",
+      shotPurpose: `完成第${shotNumber}组线索核对并推动人物判断，为下一镜的证据反应建立明确因果。`,
+      firstFramePrompt: `调查室冷白灯下，证据墙与调查员侧影同时进入画面，桌面资料按时间顺序整齐铺开。`,
+      videoPrompt: `电影级写实近景，摄影机稳定横移并缓慢推进，调查员核对第${shotNumber}组聊天记录和时间标记，冷白屏幕光照亮克制表情，纸张与键盘声自然衔接。`,
+      lastFramePrompt: `调查员的手指停在关键时间标记上，证据墙保持清晰，人物侧脸在冷白光中形成下一镜承接。`,
+      negativePrompt: "避免低清、模糊、过曝、字幕水印、人物变形、无关道具和突兀镜头跳切。",
+    };
+  });
+  const raw = baseResult({
+    workflow: {
+      ...baseResult().workflow,
+      fullVideoPrompt: "",
+      filmScript: "",
+    },
+    storyboard: shots,
+  });
+  const canonicalText = shots
+    .map((shot) => `${shot.timeRange} ${shot.visual} ${shot.composition} ${shot.cameraMovement} ${shot.lighting} ${shot.sound}`)
+    .join("\n");
+  const gate = evaluateBatchSegmentQuality(raw, {
+    expectedShotCount: 4,
+    fullPromptText: canonicalText,
+    minFullPromptLength: 100,
+  });
+  const deterministicFindings = selectDeterministicQualityPatchFindings(gate.findings, { safetyEnabled: true });
+  const patched = applyDeterministicQualityPatchWithDiff(raw, deterministicFindings);
+
+  assert.equal(shouldRepairWithCodex(gate), false);
+  assert.ok(canonicalText.length > 100);
+  assert.equal(patched.patchDiffs.length, 0);
+  assert.equal(raw.workflow.fullVideoPrompt, "");
+  assert.equal(raw.workflow.filmScript, "");
+});
 
 test("patches short fields and negative prompt pollution without requiring Codex repair", () => {
   const raw = baseResult();
@@ -133,6 +184,51 @@ test("rewrites negative prompt placeholder warnings without requiring Codex repa
   assert.doesNotMatch(patched.workflow.fullVideoPrompt, /同上|如上|见上文|(?:^|[，。；、\s])略(?:[，。；、\s]|$)/);
 });
 
+test("abstracts corpse wording inside negative prompts without requiring Codex repair", () => {
+  const raw = baseResult({
+    workflow: {
+      ...baseResult().workflow,
+      fullNegativePrompt: "\u907f\u514d\u5c38\u4f53\u7ec6\u8282\uff0c\u907f\u514d\u4f4e\u6e05\u753b\u9762\u3002",
+      fullVideoPrompt: "\u8c03\u67e5\u5ba4\u5185\u51b7\u5149\u7a33\u5b9a\uff0c\u4eba\u7269\u9762\u5bf9\u8bc1\u636e\u8868\u60c5\u514b\u5236\u3002",
+    },
+    storyboard: [
+      {
+        ...baseResult().storyboard[0],
+        negativePrompt: "\u4e0d\u8981\u5c38\u4f53\u6b63\u8138\uff0c\u907f\u514d\u4f4e\u6e05\u753b\u9762\u3002",
+      },
+    ],
+  });
+
+  const firstGate = evaluateBatchSegmentQuality(raw, {
+    fullPromptText: raw.workflow.fullVideoPrompt,
+    minFullPromptLength: 20,
+  });
+  const patched = applyDeterministicQualityPatch(raw, firstGate.findings);
+  const finalGate = evaluateBatchSegmentQuality(patched, {
+    fullPromptText: patched.workflow.fullVideoPrompt,
+    minFullPromptLength: 20,
+  });
+
+  assert.equal(shouldRepairWithCodex(finalGate), false);
+  assert.doesNotMatch(patched.workflow.fullNegativePrompt, /\u5c38\u4f53/);
+  assert.doesNotMatch(patched.storyboard[0].negativePrompt, /\u5c38\u4f53/);
+});
+
+test("keeps corpse wording in executable shot text as blocking", () => {
+  const raw = baseResult({
+    storyboard: [
+      {
+        ...baseResult().storyboard[0],
+        videoPrompt: "\u955c\u5934\u7f13\u6162\u63a8\u8fd1\u5230\u5c38\u4f53\u7ec6\u8282\uff0c\u73af\u5883\u58f0\u538b\u4f4e\u4eba\u7269\u53cd\u5e94\u3002",
+      },
+    ],
+  });
+  const gate = evaluateBatchSegmentQuality(raw, { minFullPromptLength: 20 });
+
+  assert.equal(shouldRepairWithCodex(gate), true);
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "sensitive_term"), true);
+});
+
 test("keeps executable placeholder text as blocking", () => {
   const raw = baseResult({
     storyboard: [
@@ -147,4 +243,316 @@ test("keeps executable placeholder text as blocking", () => {
 
   assert.equal(shouldRepairWithCodex(gate), true);
   assert.equal(gate.blockingFindings.some((finding) => finding.code === "placeholder_text"), true);
+});
+
+test("moves contract and shot-count failures into the quality gate", () => {
+  const contract = {
+    segmentIndex: 1,
+    title: "第1段｜案情显影",
+    sourceText: "调查室里聊天记录成为关键证据。",
+    durationSeconds: 10,
+    shotCount: 2,
+    requiredEvents: ["聊天记录成为关键证据"],
+    requiredEventSlots: [
+      {
+        id: "chat_record_evidence",
+        label: "聊天记录成为关键证据",
+        mustIncludeAny: ["聊天记录"],
+        mustIncludeOneOf: [["证据", "线索"]],
+      },
+    ],
+    forbiddenFutureEvents: ["嫌疑人逃跑"],
+    characters: [],
+    locations: [],
+    props: [],
+    requiredShotBeats: [],
+    safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+    contractHash: "sc_test",
+  };
+  const raw = baseResult({ duration: "12秒" });
+  const gate = evaluateBatchSegmentQuality(raw, {
+    contract,
+    fullPromptText: "嫌疑人逃跑，调查室只出现普通资料，没有聊天记录证据。",
+    minFullPromptLength: 20,
+  });
+
+  assert.equal(shouldRepairWithCodex(gate), true);
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "shot_count_mismatch"), true);
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "duration_exceeds_contract"), true);
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "forbidden_future_event"), true);
+  assert.equal(gate.findings.some((finding) => /SegmentContract|requiredEvents|requiredEventSlots/.test(finding.message)), false);
+});
+
+test("legacy required event text cannot trigger blocking repair", () => {
+  const contract = {
+    segmentIndex: 1,
+    title: "第1段｜案情显影",
+    sourceText: "调查室里聊天记录成为关键证据。",
+    durationSeconds: 12,
+    shotCount: 1,
+    requiredEvents: ["聊天记录成为关键证据"],
+    requiredEventSlots: [
+      {
+        id: "chat_record_evidence",
+        label: "聊天记录成为关键证据",
+        mustIncludeAny: ["聊天记录"],
+        mustIncludeOneOf: [["证据", "线索"]],
+      },
+    ],
+    forbiddenFutureEvents: [],
+    characters: [],
+    locations: [],
+    props: [],
+    requiredShotBeats: [],
+    safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+    contractHash: "sc_test",
+  };
+  const gate = evaluateBatchSegmentQuality(baseResult(), {
+    contract,
+    fullPromptText: "调查室里只有人物沉默和冷光，没有提到关键材料。",
+    minFullPromptLength: 20,
+  });
+
+  assert.equal(shouldRepairWithCodex(gate), false);
+  assert.equal(gate.warningFindings.some((finding) => finding.code === "weak_required_event_slot"), true);
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "missing_required_event_slot"), false);
+});
+
+test("structured coverage decisions are the only source of event repair blockers", () => {
+  const raw = baseResult();
+  const contract = {
+    contractSchemaVersion: 2,
+    coveragePolicyVersion: "test",
+    sourceHash: "src_test",
+    segmentIndex: 1,
+    title: "第1段",
+    sourceText: "必须出现关键证据",
+    durationSeconds: 12,
+    shotCount: 1,
+    requiredEvents: ["关键证据"],
+    requiredEventSlots: [],
+    forbiddenFutureEvents: [],
+    characterLocks: [],
+    characters: [],
+    locations: [],
+    props: [],
+    requiredShotBeats: [],
+    safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+    contractHash: "sc_test",
+  };
+  const gate = evaluateBatchSegmentQuality(raw, {
+    contract,
+    coverageMode: "active",
+    coverageDecisions: [{
+      segmentIndex: 1,
+      slotId: "key_evidence",
+      label: "关键证据出现",
+      importance: "blocking",
+      status: "definite_missing",
+      evidencePaths: [],
+      evidenceQuotes: [],
+      repairTargets: [{ shotNumber: 1, field: "videoPrompt" }],
+      repairPaths: ["storyboard[0].videoPrompt"],
+      reasonCode: "required_field_empty",
+    }],
+    fullPromptText: raw.workflow.fullVideoPrompt,
+    minFullPromptLength: 20,
+  });
+
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "missing_required_event_slot"), true);
+  assert.equal(gate.blockingFindings.find((finding) => finding.code === "missing_required_event_slot")?.path, "storyboard[0].videoPrompt");
+});
+
+test("shadow coverage records confirmed missing events without blocking or repair", () => {
+  const raw = baseResult();
+  const contract = {
+    contractSchemaVersion: 2,
+    coveragePolicyVersion: "test",
+    sourceHash: "src",
+    segmentIndex: 1,
+    title: "第1段",
+    sourceText: "关键证据应出现",
+    durationSeconds: 12,
+    shotCount: 1,
+    requiredEvents: ["关键证据"],
+    requiredEventSlots: [],
+    forbiddenFutureEvents: [],
+    characterLocks: [],
+    characters: [],
+    locations: [],
+    props: [],
+    requiredShotBeats: [],
+    safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+    contractHash: "sc_shadow",
+  };
+  const gate = evaluateBatchSegmentQuality(raw, {
+    contract,
+    coverageMode: "shadow",
+    coverageDecisions: [{
+      segmentIndex: 1,
+      slotId: "evidence",
+      label: "关键证据",
+      importance: "blocking",
+      status: "definite_missing",
+      evidencePaths: [],
+      evidenceQuotes: [],
+      repairTargets: [{ shotNumber: 1, field: "videoPrompt" }],
+      repairPaths: ["storyboard[0].videoPrompt"],
+      reasonCode: "required_field_empty",
+    }],
+    fullPromptText: raw.workflow.fullVideoPrompt,
+    minFullPromptLength: 20,
+  });
+  assert.equal(gate.warningFindings.some((finding) => finding.code === "missing_required_event_slot"), true);
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "missing_required_event_slot"), false);
+});
+
+test("reports empty and template-only full prompts through the quality gate", () => {
+  const emptyGate = evaluateBatchSegmentQuality(baseResult(), {
+    fullPromptText: "",
+    minFullPromptLength: 20,
+  });
+  assert.equal(emptyGate.blockingFindings.some((finding) => finding.code === "empty_full_prompt"), true);
+
+  const templateGate = evaluateBatchSegmentQuality(baseResult(), {
+    fullPromptText: "人物、地点和关键物件按案件逻辑分层，缓慢推进后停住，保留北方县城真实空间感。",
+    minFullPromptLength: 20,
+  });
+  assert.equal(templateGate.blockingFindings.some((finding) => finding.code === "template_summary"), true);
+});
+
+test("keeps slightly short full prompts patchable when storyboard signal is strong", () => {
+  const raw = baseResult({
+    storyboard: Array.from({ length: 4 }, (_, index) => ({
+      ...baseResult().storyboard[0],
+      shotNumber: index + 1,
+      scene: `调查室第${index + 1}个角落`,
+      visual: `第${index + 1}个镜头里，调查室屏幕、人物侧影和桌面证据形成清晰画面层次。`,
+      firstFramePrompt: `第${index + 1}个首帧，调查室冷光照亮屏幕和人物侧脸。`,
+      videoPrompt: `第${index + 1}个镜头缓慢推进，屏幕聊天记录与人物反应交替出现，环境声保持克制。`,
+      lastFramePrompt: `第${index + 1}个尾帧，人物目光停在屏幕最后一句话上。`,
+    })),
+  });
+  const gate = evaluateBatchSegmentQuality(raw, {
+    fullPromptText: "短提示词但 storyboard 信息充足。",
+    minFullPromptLength: 260,
+  });
+
+  assert.equal(gate.patchableFindings.some((finding) => finding.code === "full_prompt_too_short"), true);
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "full_prompt_too_short"), false);
+});
+
+test("deterministic quality patch only changes the matched finding path", () => {
+  const raw = baseResult();
+  const originalVideoPrompt = raw.storyboard[0].videoPrompt;
+  const originalLighting = raw.storyboard[0].lighting;
+  const patched = applyDeterministicQualityPatchWithDiff(raw, [
+    {
+      severity: "patchable",
+      code: "field_below_target",
+      message: "scene is short",
+      path: "storyboard[0].scene",
+      field: "scene",
+      shotNumber: 1,
+      currentValue: raw.storyboard[0].scene,
+      currentLength: 2,
+      minimumLength: 4,
+      targetLength: 8,
+    },
+  ]);
+
+  assert.equal(patched.patchDiffs.length, 1);
+  assert.equal(patched.patchDiffs[0].path, "storyboard[0].scene");
+  assert.notEqual(patched.result.storyboard[0].scene, raw.storyboard[0].scene);
+  assert.equal(patched.result.storyboard[0].videoPrompt, originalVideoPrompt);
+  assert.equal(patched.result.storyboard[0].lighting, originalLighting);
+});
+
+test("shared safety policy is patched locally instead of forcing Codex repair", () => {
+  const raw = baseResult({
+    workflow: {
+      ...baseResult().workflow,
+      fullVideoPrompt: "\u516c\u5b89\u5c40\u95e8\u53e3\u51fa\u73b0\u8b66\u5fbd\uff0c\u4eba\u7269\u5728\u51b7\u5149\u4e2d\u4fdd\u6301\u514b\u5236\u3002",
+    },
+  });
+
+  const firstGate = evaluateBatchSegmentQuality(raw, {
+    fullPromptText: raw.workflow.fullVideoPrompt,
+    minFullPromptLength: 20,
+  });
+
+  assert.equal(firstGate.findings.some((finding) => finding.code === "sensitive_term"), true);
+  assert.equal(shouldRepairWithCodex(firstGate), false);
+
+  const patched = applyDeterministicQualityPatch(raw, firstGate.findings);
+  assert.doesNotMatch(patched.workflow.fullVideoPrompt, /\u516c\u5b89\u5c40|\u8b66\u5fbd/);
+  assert.match(patched.workflow.fullVideoPrompt, /\u57ce\u5e02\u529e\u6848\u5efa\u7b51|\u673a\u6784\u6807\u8bc6/);
+});
+
+test("weak required event slots are warnings, not repair blockers", () => {
+  const contract = {
+    segmentIndex: 1,
+    title: "Segment 1",
+    sourceText: "alpha clue",
+    durationSeconds: 12,
+    shotCount: 1,
+    requiredEvents: ["alpha clue"],
+    requiredEventSlots: [
+      {
+        id: "alpha_slot",
+        label: "alpha clue",
+        mustIncludeAny: ["alpha"],
+        mustIncludeOneOf: [],
+      },
+    ],
+    forbiddenFutureEvents: [],
+    characters: [],
+    locations: [],
+    props: [],
+    requiredShotBeats: [],
+    safetyPolicy: { avoidTerms: [], rewriteHints: {} },
+    contractHash: "sc_test",
+  };
+  const gate = evaluateBatchSegmentQuality(baseResult(), {
+    contract,
+    fullPromptText: "alpha clue is covered in a concrete prompt body.",
+    minFullPromptLength: 20,
+  });
+
+  assert.equal(gate.warningFindings.some((finding) => finding.code === "weak_required_event_slot"), true);
+  assert.equal(gate.blockingFindings.some((finding) => finding.code === "missing_required_event_slot"), false);
+  assert.equal(shouldRepairWithCodex(gate), false);
+});
+
+test("disabling safety automation keeps all non-safety deterministic patches", () => {
+  const findings = [
+    {
+      code: "field_below_hard_minimum",
+      severity: "patchable",
+      path: "storyboard[0].videoPrompt",
+      message: "short",
+    },
+    {
+      code: "sensitive_term",
+      severity: "blocking",
+      path: "storyboard[0].visual",
+      message: "safety",
+    },
+    {
+      code: "missing_required_field",
+      severity: "patchable",
+      path: "storyboard[0].dialogue",
+      field: "dialogue",
+      message: "empty",
+    },
+  ];
+
+  assert.deepEqual(
+    selectDeterministicQualityPatchFindings(findings, { safetyEnabled: false }).map((item) => item.code),
+    ["field_below_hard_minimum", "missing_required_field"],
+  );
+  assert.deepEqual(
+    selectDeterministicQualityPatchFindings(findings, { safetyEnabled: true }).map((item) => item.code),
+    ["field_below_hard_minimum", "sensitive_term", "missing_required_field"],
+  );
 });

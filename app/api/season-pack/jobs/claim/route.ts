@@ -28,6 +28,7 @@ export async function POST(request: Request) {
     const task = await claimNextSeasonPackCodexJob({
       order: process.env.SEASON_PACK_CODEX_ORDER === "newest" ? "newest" : "oldest",
       runningTimeoutMs: positiveInteger(process.env.SEASON_PACK_CODEX_TASK_TIMEOUT_MS, 45 * 60_000),
+      workerId: request.headers.get("x-worker-id") || undefined,
     });
     return NextResponse.json({ ok: true, task });
   } catch (error: any) {

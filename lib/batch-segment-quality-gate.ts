@@ -1,5 +1,18 @@
 import type { AnalysisResult, StoryboardShot } from "../types";
-import { findInternalPromptToken, sanitizeInternalPromptTokensDeep } from "./internal-prompt-token-sanitizer";
+import type { SegmentContract } from "./batch-segment-contract";
+import type { CoverageDecision } from "./batch-event-coverage";
+import {
+  findInternalPromptToken,
+  sanitizeInternalPromptTokens,
+  sanitizeInternalPromptTokensDeep,
+} from "./internal-prompt-token-sanitizer";
+import {
+  analyzePromptSafetyTree,
+  applyPromptSafetyPolicy,
+  type PromptSafetyPathClass,
+  type PromptSafetyPolarity,
+  type PromptSafetyRisk,
+} from "./prompt-safety-policy";
 
 export type BatchSegmentQualitySeverity = "blocking" | "patchable" | "warning" | "risk";
 
@@ -9,13 +22,26 @@ export type BatchSegmentQualityFindingCode =
   | "field_below_hard_minimum"
   | "field_below_target"
   | "full_prompt_too_short"
+  | "empty_full_prompt"
   | "internal_token"
   | "episode_terminology"
   | "vertical_conflict"
   | "placeholder_text"
   | "nullish_text"
   | "duplicate_visual"
-  | "sensitive_term";
+  | "sensitive_term"
+  | "shot_count_mismatch"
+  | "too_many_shots"
+  | "too_few_shots"
+  | "duration_exceeds_contract"
+  | "forbidden_future_event"
+  | "missing_required_event_slot"
+  | "ambiguous_required_event_slot"
+  | "continuity_contradiction"
+  | "weak_contract"
+  | "weak_required_event_slot"
+  | "template_summary"
+  | "source_shot_count_mismatch";
 
 export type BatchSegmentQualityFinding = {
   severity: BatchSegmentQualitySeverity;
@@ -24,13 +50,47 @@ export type BatchSegmentQualityFinding = {
   path?: string;
   field?: string;
   shotNumber?: number;
+  slotId?: string;
+  currentValue?: unknown;
   currentLength?: number;
   minimumLength?: number;
   targetLength?: number;
+  fingerprint?: string;
+  ruleId?: string;
+  pathClass?: PromptSafetyPathClass;
+  polarity?: PromptSafetyPolarity;
+  affectedPaths?: string[];
+  affectedPathCount?: number;
 };
+
+export type QualityPatchDiff = {
+  path: string;
+  code: BatchSegmentQualityFindingCode;
+  severity: Extract<BatchSegmentQualitySeverity, "patchable" | "risk">;
+  before: unknown;
+  after: unknown;
+  patchSource: "local" | "codex";
+  reason: string;
+};
+
+export type DeterministicQualityPatchResult<T extends AnalysisResult> = {
+  result: T;
+  patchDiffs: QualityPatchDiff[];
+};
+
+export function selectDeterministicQualityPatchFindings(
+  findings: readonly BatchSegmentQualityFinding[],
+  options: { safetyEnabled: boolean },
+) {
+  return options.safetyEnabled
+    ? [...findings]
+    : findings.filter((finding) => finding.code !== "sensitive_term");
+}
 
 export type BatchSegmentQualityGate = {
   score: number;
+  promptQualityScore: number;
+  complianceRisk: PromptSafetyRisk;
   findings: BatchSegmentQualityFinding[];
   blockingFindings: BatchSegmentQualityFinding[];
   patchableFindings: BatchSegmentQualityFinding[];
@@ -39,8 +99,16 @@ export type BatchSegmentQualityGate = {
 };
 
 export type BatchSegmentQualityOptions = {
+  segmentIndex?: number;
   minFullPromptLength?: number;
   expectedShotCount?: number;
+  sourceShotCount?: number;
+  minShotCount?: number;
+  maxShotCount?: number;
+  requestedDuration?: string;
+  contract?: SegmentContract;
+  coverageDecisions?: CoverageDecision[];
+  coverageMode?: "shadow" | "active";
   fullPromptText?: string;
 };
 
@@ -85,6 +153,13 @@ const SENSITIVE_REWRITE_RULES: Array<[RegExp, string]> = [
   [/政治人物/g, "公共人物"],
 ];
 
+const GENERIC_BATCH_TEMPLATE_PHRASES = [
+  "人物、地点和关键物件按案件逻辑分层",
+  "缓慢推进后停住",
+  "同期环境声、脚步声、纸张声或市场声",
+  "保留北方县城真实空间感",
+];
+
 function cleanText(value: unknown) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
 }
@@ -93,8 +168,60 @@ function compactLength(value: unknown) {
   return cleanText(value).replace(/\s+/g, "").length;
 }
 
+function parseDurationSeconds(value: unknown) {
+  const text = cleanText(value);
+  if (!text || /^auto$/i.test(text)) return 0;
+  const match = text.match(/(\d+(?:\.\d+)?)\s*(?:秒|s|seconds?)/i) || text.match(/^(\d+(?:\.\d+)?)$/);
+  if (!match) return 0;
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) ? seconds : 0;
+}
+
+function normalizeContractText(value: unknown) {
+  return cleanText(value)
+    .replace(/\s+/g, "")
+    .replace(/[，。；：、""''《》【】（）()|\-—–]/g, "")
+    .toLowerCase();
+}
+
 function pathForShotField(index: number, field: string) {
   return `storyboard[${index}].${field}`;
+}
+
+function parseQualityPath(path: string) {
+  const parts: Array<string | number> = [];
+  const pattern = /([^[.\]]+)|\[(\d+)\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(path))) {
+    if (match[1]) parts.push(match[1]);
+    if (match[2]) parts.push(Number(match[2]));
+  }
+  return parts;
+}
+
+function getValueAtPath(value: unknown, path: string) {
+  if (!path) return value;
+  let current = value as any;
+  for (const part of parseQualityPath(path)) {
+    if (current == null) return undefined;
+    current = current[part as any];
+  }
+  return current;
+}
+
+function setValueAtPath<T>(value: T, path: string, nextValue: unknown): T {
+  const parts = parseQualityPath(path);
+  if (!parts.length) return value;
+  const cloneRoot: any = Array.isArray(value) ? [...value as any[]] : { ...(value as any) };
+  let current = cloneRoot;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const part = parts[index] as any;
+    const child = current[part];
+    current[part] = Array.isArray(child) ? [...child] : { ...(child || {}) };
+    current = current[part];
+  }
+  current[parts[parts.length - 1] as any] = nextValue;
+  return cloneRoot;
 }
 
 function pushFieldFinding(
@@ -114,6 +241,7 @@ function pushFieldFinding(
       path: pathForShotField(index, field),
       field,
       shotNumber: index + 1,
+      currentValue: value,
       currentLength: length,
       minimumLength: rule.hard,
       targetLength: rule.target,
@@ -127,6 +255,7 @@ function pushFieldFinding(
     path: pathForShotField(index, field),
     field,
     shotNumber: index + 1,
+    currentValue: value,
     currentLength: length,
     minimumLength: rule.hard,
     targetLength: rule.target,
@@ -140,6 +269,10 @@ function containsPlaceholderText(value: string) {
 
 function isNegativePromptPath(path: string) {
   return /(^|\.)(fullNegativePrompt|negativePrompt)$/.test(path);
+}
+
+function isPatchablePlaceholderPath(path: string) {
+  return isNegativePromptPath(path) || path === "workflow.fullVideoPrompt" || path === "result.workflow.fullVideoPrompt";
 }
 
 function rewritePlaceholderWarningLanguage(value: string) {
@@ -167,11 +300,14 @@ function containsVerticalConflict(value: string) {
   return /16\s*:\s*9\s*竖屏|竖屏\s*16\s*:\s*9|横屏\s*竖屏/.test(value);
 }
 
-function applyStringRules(value: string) {
+function qualityFieldFromPath(path: string) {
+  const match = path.match(/(?:^|\.)([^.[\]]+)$/);
+  return match ? match[1] : undefined;
+}
+
+function applyStringRules(value: string, path = "") {
   let next = rewritePlaceholderWarningLanguage(value);
-  for (const [pattern, replacement] of SENSITIVE_REWRITE_RULES) {
-    next = next.replace(pattern, replacement);
-  }
+  next = applyPromptSafetyPolicy(next, { phase: "quality", path, field: qualityFieldFromPath(path) }).text;
   return next
     .replace(/第\s*([0-9一二三四五六七八九十百]+)\s*集/g, "第 $1 段")
     .replace(/本集/g, "本段")
@@ -181,12 +317,15 @@ function applyStringRules(value: string) {
     .replace(/\bundefined\b|\bnull\b/gi, "空字段或占位文本");
 }
 
-function rewriteStringsDeep<T>(value: T): T {
-  if (typeof value === "string") return applyStringRules(value) as T;
-  if (Array.isArray(value)) return value.map((item) => rewriteStringsDeep(item)) as T;
+function rewriteStringsDeep<T>(value: T, path = ""): T {
+  if (typeof value === "string") return applyStringRules(value, path) as T;
+  if (Array.isArray(value)) return value.map((item, index) => rewriteStringsDeep(item, `${path}[${index}]`)) as T;
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, rewriteStringsDeep(item)]),
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      rewriteStringsDeep(item, path ? `${path}.${key}` : key),
+    ]),
   ) as T;
 }
 
@@ -209,8 +348,8 @@ function ensureTargetLength(value: unknown, target: number, fallback: string) {
   return compactLength(merged) >= target ? merged : `${merged}，画面保持电影短剧质感，动作和环境信息清晰可执行`;
 }
 
-function normalizeNegativePrompt(value: unknown) {
-  const text = rewriteNegativePromptPlaceholderLanguage(cleanText(value));
+function normalizeNegativePrompt(value: unknown, path = "negativePrompt") {
+  const text = rewriteNegativePromptPlaceholderLanguage(applyStringRules(cleanText(value), path));
   if (!text) return BASIC_NEGATIVE_PROMPT;
   const additions = BASIC_NEGATIVE_PROMPT
     .split("，")
@@ -266,12 +405,13 @@ function collectPlaceholderFindings(
   if (typeof value === "string") {
     if (!containsPlaceholderText(value)) return;
     findings.push({
-      severity: isNegativePromptPath(path) ? "patchable" : "blocking",
+      severity: isPatchablePlaceholderPath(path) ? "patchable" : "blocking",
       code: "placeholder_text",
-      message: isNegativePromptPath(path)
+      message: isPatchablePlaceholderPath(path)
         ? "负向提示词包含占位词禁止说明，允许本地改写"
         : "包含同上/如上/略等不可执行占位",
       path,
+      currentValue: value,
     });
     return;
   }
@@ -285,20 +425,81 @@ function collectPlaceholderFindings(
   });
 }
 
+function collectStringQualityFindings(
+  value: unknown,
+  path: string,
+  findings: BatchSegmentQualityFinding[],
+) {
+  if (typeof value === "string") {
+    const internalHit = findInternalPromptToken(value);
+    if (internalHit) {
+      findings.push({
+        severity: "patchable",
+        code: "internal_token",
+        message: `鍖呭惈鍐呴儴绯荤粺鏍囪瘑 ${internalHit.token}`,
+        path,
+        currentValue: value,
+      });
+    }
+    if (containsNullishText(value)) {
+      findings.push({
+        severity: "patchable",
+        code: "nullish_text",
+        message: "鍖呭惈 undefined/null 瀛楅潰鍗犱綅",
+        path,
+        currentValue: value,
+      });
+    }
+    if (containsEpisodeTerminology(value)) {
+      findings.push({
+        severity: "patchable",
+        code: "episode_terminology",
+        message: "contains episode terminology",
+        path,
+        currentValue: value,
+      });
+    }
+    if (containsVerticalConflict(value)) {
+      findings.push({
+        severity: "patchable",
+        code: "vertical_conflict",
+        message: "鍖呭惈 16:9 绔栧睆鍐茬獊",
+        path,
+        currentValue: value,
+      });
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => collectStringQualityFindings(item, `${path}[${index}]`, findings));
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  Object.entries(value as Record<string, unknown>).forEach(([key, item]) => {
+    collectStringQualityFindings(item, path ? `${path}.${key}` : key, findings);
+  });
+}
+
 export function evaluateBatchSegmentQuality(
   result: AnalysisResult,
   options: BatchSegmentQualityOptions = {},
 ): BatchSegmentQualityGate {
   const findings: BatchSegmentQualityFinding[] = [];
   const storyboard = Array.isArray(result.storyboard) ? result.storyboard : [];
-  const fullPromptText = options.fullPromptText || cleanText(result.workflow?.fullVideoPrompt);
-  const serialized = JSON.stringify(result);
+  const fullPromptText = options.fullPromptText !== undefined
+    ? cleanText(options.fullPromptText)
+    : cleanText(result.workflow?.fullVideoPrompt);
+  const safetyAnalysis = analyzePromptSafetyTree(result, {
+    phase: "quality",
+    segmentIndex: options.segmentIndex || options.contract?.segmentIndex || 0,
+    rootPath: "result",
+  });
 
   if (!storyboard.length) {
     findings.push({ severity: "blocking", code: "missing_storyboard", message: "缺少 storyboard 镜头列表" });
   }
 
-  const internalHit = findInternalPromptToken(serialized) || findInternalPromptToken(fullPromptText);
+  const internalHit = null as ReturnType<typeof findInternalPromptToken>;
   if (internalHit) {
     findings.push({
       severity: "blocking",
@@ -307,7 +508,7 @@ export function evaluateBatchSegmentQuality(
     });
   }
 
-  for (const [value, path] of [[serialized, "result"], [fullPromptText, "workflow.fullVideoPrompt"]] as const) {
+  for (const [value, path] of [] as Array<[string, string]>) {
     if (containsNullishText(value)) findings.push({ severity: "patchable", code: "nullish_text", message: "包含 undefined/null 字面占位", path });
     if (containsEpisodeTerminology(value)) findings.push({ severity: "patchable", code: "episode_terminology", message: "包含集/本集/单集术语", path });
     if (containsVerticalConflict(value)) findings.push({ severity: "patchable", code: "vertical_conflict", message: "包含 16:9 竖屏冲突", path });
@@ -320,14 +521,163 @@ export function evaluateBatchSegmentQuality(
     }
   }
 
+  collectStringQualityFindings(result, "result", findings);
+  if (fullPromptText) collectStringQualityFindings(fullPromptText, "workflow.fullVideoPrompt", findings);
   collectPlaceholderFindings(result, "result", findings);
+  for (const safetyFinding of safetyAnalysis.findings) {
+    findings.push({
+      severity: safetyFinding.severity,
+      code: "sensitive_term",
+      message: safetyFinding.reason,
+      path: safetyFinding.primaryPath,
+      currentValue: safetyFinding.match,
+      fingerprint: safetyFinding.fingerprint,
+      ruleId: safetyFinding.ruleId,
+      pathClass: safetyFinding.pathClass,
+      polarity: safetyFinding.polarity,
+      affectedPaths: safetyFinding.affectedPaths,
+      affectedPathCount: safetyFinding.affectedPathCount,
+    });
+  }
 
-  if (options.expectedShotCount && storyboard.length && storyboard.length !== options.expectedShotCount) {
+  if (!options.contract && options.expectedShotCount && storyboard.length && storyboard.length !== options.expectedShotCount) {
     findings.push({
       severity: "blocking",
-      code: "missing_storyboard",
+      code: "shot_count_mismatch",
       message: `镜头数 ${storyboard.length} 与规划 ${options.expectedShotCount} 不一致`,
+      currentLength: storyboard.length,
+      minimumLength: options.expectedShotCount,
     });
+  }
+
+  if (options.contract && storyboard.length && storyboard.length !== options.contract.shotCount) {
+    findings.push({
+      severity: "blocking",
+      code: "shot_count_mismatch",
+      message: `镜头数 ${storyboard.length} 与段落规划要求的 ${options.contract.shotCount} 个镜头不一致`,
+      currentLength: storyboard.length,
+      minimumLength: options.contract.shotCount,
+    });
+  }
+
+  const resultDurationSeconds = parseDurationSeconds(result.duration);
+  if (
+    options.contract
+    && resultDurationSeconds > 0
+    && resultDurationSeconds > options.contract.durationSeconds + 0.2
+  ) {
+    findings.push({
+      severity: "blocking",
+      code: "duration_exceeds_contract",
+      message: `时长 ${resultDurationSeconds}s 超过段落规划上限 ${options.contract.durationSeconds}s`,
+      currentLength: resultDurationSeconds,
+      minimumLength: options.contract.durationSeconds,
+    });
+  }
+
+  if (
+    options.sourceShotCount
+    && storyboard.length
+    && (!options.maxShotCount || options.sourceShotCount <= options.maxShotCount)
+    && storyboard.length !== options.sourceShotCount
+  ) {
+    findings.push({
+      severity: "blocking",
+      code: "source_shot_count_mismatch",
+      message: `源文案有 ${options.sourceShotCount} 个镜头，结果为 ${storyboard.length} 个`,
+      currentLength: storyboard.length,
+      minimumLength: options.sourceShotCount,
+    });
+  }
+
+  if (options.maxShotCount && storyboard.length > options.maxShotCount) {
+    findings.push({
+      severity: "blocking",
+      code: "too_many_shots",
+      message: `镜头数 ${storyboard.length} 超过上限 ${options.maxShotCount}`,
+      currentLength: storyboard.length,
+      minimumLength: options.maxShotCount,
+    });
+  }
+
+  if (options.minShotCount && storyboard.length > 0 && storyboard.length < options.minShotCount) {
+    findings.push({
+      severity: "blocking",
+      code: "too_few_shots",
+      message: `镜头数 ${storyboard.length} 低于下限 ${options.minShotCount}`,
+      currentLength: storyboard.length,
+      minimumLength: options.minShotCount,
+    });
+  }
+
+  if (options.contract) {
+    const normalizedFullPrompt = normalizeContractText(fullPromptText);
+    for (const slot of options.contract.requiredEventSlots || []) {
+      if (!slot.anchorGroups?.length || !slot.conceptGroups?.length || slot.importance !== "blocking") {
+        findings.push({
+          severity: "warning",
+          code: "weak_required_event_slot",
+          message: `本段事件要求仅作为建议约束：${slot.label || slot.id}`,
+        });
+      }
+    }
+    for (const forbidden of options.contract.forbiddenFutureEvents || []) {
+      const normalizedForbidden = normalizeContractText(forbidden);
+      if (normalizedForbidden.length >= 4 && normalizedFullPrompt.includes(normalizedForbidden)) {
+        findings.push({
+          severity: "blocking",
+          code: "forbidden_future_event",
+          message: `提前泄露后续事件：${forbidden}`,
+        });
+      }
+    }
+
+    if (!options.coverageDecisions) {
+      if ((options.contract.requiredEvents || []).length && !(options.contract.requiredEventSlots || []).length) {
+        findings.push({
+          severity: "warning",
+          code: "weak_contract",
+          message: "段落规划只有自然语言事件要求，不能据此触发自动修复",
+        });
+      }
+    } else {
+      for (const decision of options.coverageDecisions) {
+        if (decision.status === "covered") continue;
+        const path = decision.repairPaths[0];
+        if (decision.status === "contradiction") {
+          const activeBlocking = decision.importance === "blocking" && options.coverageMode === "active" && Boolean(path);
+          findings.push({
+            severity: activeBlocking ? "blocking" : "warning",
+            code: decision.slotId.startsWith("continuity:") ? "continuity_contradiction" : "missing_required_event_slot",
+            message: `检测到明确事件或连续性冲突：${decision.label}`,
+            path,
+            slotId: decision.slotId,
+            currentValue: decision.evidenceQuotes.join("；"),
+          });
+          continue;
+        }
+        if (decision.status === "definite_missing") {
+          const activeBlocking = decision.importance === "blocking" && options.coverageMode === "active" && Boolean(path);
+          findings.push({
+            severity: activeBlocking ? "blocking" : "warning",
+            code: "missing_required_event_slot",
+            message: `确定缺少本段必要事件：${decision.label}`,
+            path,
+            slotId: decision.slotId,
+          });
+          continue;
+        }
+        const activeBlocking = decision.importance === "blocking" && options.coverageMode === "active";
+        findings.push({
+          severity: activeBlocking ? "blocking" : "warning",
+          code: "ambiguous_required_event_slot",
+          message: `必要事件覆盖存在歧义，不能仅凭字面缺失判定：${decision.label}`,
+          path: activeBlocking ? path : undefined,
+          slotId: decision.slotId,
+          currentValue: decision.evidenceQuotes.join("；"),
+        });
+      }
+    }
   }
 
   const seenVisuals = new Map<string, number>();
@@ -369,6 +719,14 @@ export function evaluateBatchSegmentQuality(
 
   const minFullPromptLength = options.minFullPromptLength || 900;
   const fullPromptLength = compactLength(fullPromptText);
+  if (fullPromptLength === 0) {
+    findings.push({
+      severity: "blocking",
+      code: "empty_full_prompt",
+      message: "完整视频提示词为空",
+      path: "workflow.fullVideoPrompt",
+    });
+  }
   if (fullPromptLength > 0 && fullPromptLength < minFullPromptLength) {
     const storyboardSignal = storyboard.reduce((sum, shot) => (
       sum + compactLength(shot.visual) + compactLength(shot.videoPrompt) + compactLength(shot.firstFramePrompt) + compactLength(shot.lastFramePrompt)
@@ -383,41 +741,164 @@ export function evaluateBatchSegmentQuality(
     });
   }
 
+  const templateHits = GENERIC_BATCH_TEMPLATE_PHRASES.reduce(
+    (count, phrase) => count + fullPromptText.split(phrase).length - 1,
+    0,
+  );
+  if (templateHits >= 2) {
+    findings.push({
+      severity: "blocking",
+      code: "template_summary",
+      message: "提示词仍是模板化概要，没有生成具体镜头",
+      path: "workflow.fullVideoPrompt",
+    });
+  }
+
   const blockingFindings = findings.filter((finding) => finding.severity === "blocking");
   const patchableFindings = findings.filter((finding) => finding.severity === "patchable");
   const warningFindings = findings.filter((finding) => finding.severity === "warning");
   const riskFindings = findings.filter((finding) => finding.severity === "risk");
-  const score = Math.max(
+  const promptQualityScore = Math.max(
     0,
     100
       - blockingFindings.length * 30
       - patchableFindings.length * 8
-      - warningFindings.length * 3
-      - riskFindings.length * 5,
+      - warningFindings.length * 3,
   );
 
-  return { score, findings, blockingFindings, patchableFindings, warningFindings, riskFindings };
+  return {
+    score: promptQualityScore,
+    promptQualityScore,
+    complianceRisk: safetyAnalysis.highestRisk,
+    findings,
+    blockingFindings,
+    patchableFindings,
+    warningFindings,
+    riskFindings,
+  };
+}
+
+function normalizePatchPath(path: string | undefined) {
+  if (!path) return "";
+  if (path === "result") return "";
+  return path.startsWith("result.") ? path.slice("result.".length) : path;
+}
+
+function isPatchEligibleFinding(finding: BatchSegmentQualityFinding) {
+  return finding.severity === "patchable" || finding.severity === "risk";
+}
+
+function shotIndexFromPath(path: string) {
+  const match = path.match(/^storyboard\[(\d+)\]\.([A-Za-z0-9_]+)$/);
+  if (!match) return null;
+  return { index: Number(match[1]), field: match[2] };
+}
+
+function isImmutableNarrativeOrArchivePath(path: string) {
+  return path === "optimizedScript"
+    || /^storyboard\[\d+\]\.shotPurpose$/.test(path)
+    || /^workflow\.(sourceAnalysis|diagnosis|editingNotes|filmScript|screenplay|concisePrompt)$/.test(path);
+}
+
+function buildWorkflowPromptFallback(result: AnalysisResult) {
+  const workflow = (result.workflow || {}) as NonNullable<AnalysisResult["workflow"]>;
+  const storyboard = Array.isArray(result.storyboard) ? result.storyboard : [];
+  return [
+    cleanText(workflow.fullVideoPrompt),
+    cleanText(result.optimizedScript),
+    ...storyboard.flatMap((shot) => [
+      cleanText(shot.scene),
+      cleanText(shot.visual),
+      cleanText(shot.videoPrompt),
+      cleanText(shot.firstFramePrompt),
+      cleanText(shot.lastFramePrompt),
+    ]),
+  ].filter(Boolean).join("\n");
+}
+
+function patchStringValue(value: unknown, path: string) {
+  const text = sanitizeInternalPromptTokens(cleanText(value));
+  return isNegativePromptPath(path) ? normalizeNegativePrompt(text, path) : applyStringRules(text, path);
+}
+
+function patchValueForFinding(
+  result: AnalysisResult,
+  path: string,
+  finding: BatchSegmentQualityFinding,
+) {
+  const currentValue = getValueAtPath(result, path);
+  const shotTarget = shotIndexFromPath(path);
+  if (shotTarget && Array.isArray(result.storyboard)) {
+    const shot = result.storyboard[shotTarget.index];
+    if (shot && typeof shot === "object") {
+      const patchedShot = patchShot(shot, shotTarget.index) as Record<string, unknown>;
+      if (shotTarget.field in patchedShot) return patchedShot[shotTarget.field];
+    }
+  }
+
+  if (path === "workflow.fullNegativePrompt" || isNegativePromptPath(path)) {
+    return normalizeNegativePrompt(currentValue, path);
+  }
+
+  if (path === "workflow.fullVideoPrompt") {
+    const fallback = buildWorkflowPromptFallback(result);
+    const cleaned = patchStringValue(currentValue, path);
+    if (finding.code === "full_prompt_too_short" || finding.code === "empty_full_prompt") {
+      return ensureTargetLength(cleaned, 900, fallback);
+    }
+    return cleaned;
+  }
+
+  if (typeof currentValue === "string" || currentValue === undefined || currentValue === null) {
+    if (finding.code === "missing_required_field" && finding.field === "dialogue") return "无";
+    return patchStringValue(currentValue, path);
+  }
+
+  return currentValue;
+}
+
+export function applyDeterministicQualityPatchWithDiff<T extends AnalysisResult>(
+  result: T,
+  findings: BatchSegmentQualityFinding[] = [],
+): DeterministicQualityPatchResult<T> {
+  let patched = result;
+  const patchDiffs: QualityPatchDiff[] = [];
+  const seenPaths = new Set<string>();
+
+  for (const finding of findings) {
+    if (!isPatchEligibleFinding(finding)) continue;
+    const candidatePaths = finding.affectedPaths?.length ? finding.affectedPaths : [finding.path || ""];
+    for (const candidatePath of candidatePaths) {
+      const path = normalizePatchPath(candidatePath);
+      if (!path || seenPaths.has(path)) continue;
+      if (isImmutableNarrativeOrArchivePath(path)) continue;
+      seenPaths.add(path);
+
+      const before = getValueAtPath(patched, path);
+      const after = patchValueForFinding(patched, path, finding);
+      if (JSON.stringify(before) === JSON.stringify(after)) continue;
+
+      patched = setValueAtPath(patched, path, after);
+      patchDiffs.push({
+        path,
+        code: finding.code,
+        severity: finding.severity as Extract<BatchSegmentQualitySeverity, "patchable" | "risk">,
+        before,
+        after,
+        patchSource: "local",
+        reason: finding.message,
+      });
+    }
+  }
+
+  return { result: patched, patchDiffs };
 }
 
 export function applyDeterministicQualityPatch<T extends AnalysisResult>(
   result: T,
-  _findings: BatchSegmentQualityFinding[] = [],
+  findings: BatchSegmentQualityFinding[] = [],
 ): T {
-  const sanitized = rewriteStringsDeep(sanitizeInternalPromptTokensDeep(result)) as T;
-  const storyboard = Array.isArray(sanitized.storyboard)
-    ? sanitized.storyboard.map((shot, index) => patchShot(shot, index))
-    : [];
-  const workflow = sanitized.workflow
-    ? rewriteStringsDeep({
-        ...sanitized.workflow,
-        fullNegativePrompt: normalizeNegativePrompt(sanitized.workflow.fullNegativePrompt),
-      })
-    : sanitized.workflow;
-  return {
-    ...sanitized,
-    workflow,
-    storyboard,
-  };
+  return applyDeterministicQualityPatchWithDiff(result, findings).result;
 }
 
 export function shouldRepairWithCodex(gate: BatchSegmentQualityGate) {
